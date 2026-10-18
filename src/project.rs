@@ -8,6 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::automix::AutoMix;
 use crate::effects::{AutoFx, BlendMode, Effects, Preset};
 use crate::surface::{Mask, Warp};
 
@@ -24,6 +25,8 @@ pub struct LayerConfig {
     pub effects: Effects,
     /// Navigation automatique entre les effets.
     pub auto: AutoFx,
+    /// Mix auto entre plusieurs vidéos.
+    pub mix: AutoMix,
     pub warp: Warp,
     pub mask: Mask,
     /// Vidéo chargée sur ce calque (relancée à l'ouverture du projet).
@@ -39,6 +42,7 @@ impl Default for LayerConfig {
             blend: BlendMode::Normal,
             effects: Effects::default(),
             auto: AutoFx::default(),
+            mix: AutoMix::default(),
             warp: Warp::default(),
             mask: Mask::default(),
             clip: None,

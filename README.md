@@ -48,16 +48,22 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 **Calques** (panneau du bas, jusqu'à 8). Chaque calque a sa vidéo, son opacité, son mode de fusion (Normal, Addition, Écran, Produit, Éclaircir, Assombrir), ses effets et sa forme. Le calque du haut de la liste est au premier plan. **Tab** passe au calque suivant.
 
 **Effets** (onglet Effets). Ils s'appliquent au calque sélectionné.
-- 17 presets intégrés : Néon, Kaléido, Mandala, Miroir 4, Tunnel, Rétro VHS, Glitch, 8-bit, Pop art, Arc-en-ciel, Psyché, Rêve, Noir & blanc, Duotone rose, Bleu glacé, Négatif, Strobe.
+- 26 presets intégrés : Néon, Kaléido, Mandala, Miroir 4, Tunnel, Rétro VHS, Glitch, 8-bit, Pop art, Arc-en-ciel, Psyché, Rêve, Noir & blanc, Duotone rose, Bleu glacé, Négatif, Strobe, Vortex, Tunnel acide, Liquide, Acide, Mosaïque, Écho, Solarisé, Respiration, Trip.
+- Section **Psychédélique** : tourbillon, tunnel (coordonnées polaires qui défilent), mosaïque miroir, distorsion liquide, palette acide, arc-en-ciel spatial, solarisation, pulsation (zoom qui respire), écho (copies superposées).
 - « Aléatoire » tire une combinaison au hasard.
 - **Revenir sans effet** : « Aucun » (touche **0**) retire les effets du calque sélectionné et coupe son mode AUTO. « Sans effets » dans la barre du haut (touche **E**) affiche toutes les vidéos brutes, sur tous les calques, sans perdre les réglages : un second appui les rétablit.
 - La durée de « Transition » règle le passage en douceur d'un preset à l'autre.
 - « Mémoriser » crée vos propres presets (clic droit pour en supprimer un).
-- **AUTO** (touche **A**) : enchaîne automatiquement des effets tirés au hasard sur le calque sélectionné, sans répéter le même deux fois de suite. On règle l'intervalle entre deux changements, la durée du fondu et la part d'**effets inédits** : le pourcentage de changements qui inventent un nouvel effet au lieu de reprendre un preset (25 % par défaut ; « Mémoriser » permet de garder un effet inventé qui plaît). Le stroboscope est exclu par défaut. « Suivant » force un changement immédiat ; choisir un preset à la main le garde affiché un intervalle complet. Chaque calque a son propre mode Auto, enregistré dans le projet.
+- **AUTO** (touche **A**) : enchaîne automatiquement des effets tirés au hasard sur le calque sélectionné, sans répéter le même deux fois de suite. Un **thème** oriente les choix : Tout, Psychédélique, Couleur (sans déformer l'image), Vitesse, Géométrie, Glitch, Doux ; l'**intensité** dose les effets générés. On règle aussi l'intervalle entre deux changements, la durée du fondu et, pour le thème Tout, la part d'**effets inédits** : le pourcentage de changements qui inventent un nouvel effet au lieu de reprendre un preset (25 % par défaut ; « Mémoriser » permet de garder un effet inventé qui plaît). Le stroboscope est exclu par défaut. « Suivant » force un changement immédiat ; choisir un preset à la main le garde affiché un intervalle complet. Chaque calque a son propre mode Auto, enregistré dans le projet.
+
+**Mix auto** (onglet Mix) : cochez plusieurs vidéos (dans l'onglet ou avec l'icône de bobine sur chaque média), puis activez MIX AUTO. Le calque enchaîne alors des séquences de durée aléatoire : changement de vidéo ou saut à un autre moment, lecture à l'endroit ou **à l'envers**, vitesse variable, coupe franche ou fondu. Chaque réglage (durées, probabilités, vitesses, fondus) est ajustable et enregistré dans le projet ; chaque calque peut avoir son propre mix.
+
+**Lecture à l'envers** : bouton dans le panneau Lecture, ou touche **R**. La vidéo est décodée par petits morceaux de la fin vers le début (en 1280×720 au maximum).
 
 **Forme** (onglet Forme, touche **M** pour éditer sur l'aperçu ou directement sur la sortie) :
 - **Déformation** : une grille de 1×1 (4 coins en perspective) à 8×8 points pour suivre des surfaces courbes. « Aplatir » retire les courbures.
 - **Masque** : un polygone (rectangle, cercle, triangle, hexagone, étoile, ou forme libre) avec adoucissement des bords et inversion. Double-clic sur un bord pour ajouter un point, clic droit sur un point pour le supprimer.
+- **Masque SVG** : « Importer un SVG… » (ou glisser-déposer un `.svg` sur la fenêtre) reprend la forme d'un logo ou d'un pictogramme comme masque du calque sélectionné : plusieurs formes, trous, courbes et traits sont pris en charge. La forme est centrée sur la sortie, simplifiée (2 000 points au maximum), et ses points restent éditables. Les textes et images contenus dans le SVG sont ignorés : convertissez les textes en tracés dans votre logiciel de dessin.
 - **Maj** permet un réglage précis, la croix déplace toute la forme et **G** affiche une mire.
 
 **Jauge CPU** (en haut à droite) : la charge de l'app et de ses décodeurs ffmpeg, en pourcentage de la machine (vert, orange puis rouge). La partie grise montre la charge du reste de la machine. Le survol donne le détail (nombre de décodeurs, de cœurs).
@@ -71,6 +77,7 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 | Espace | Pause / lecture du calque sélectionné |
 | 1-9, ← → | Lancer un média sur le calque sélectionné |
 | Tab | Calque suivant |
+| R | Lecture à l'envers / à l'endroit (calque sélectionné) |
 | 0 | Retirer les effets du calque sélectionné (et couper AUTO) |
 | E | Tout afficher sans effets (contournement, réglages conservés) |
 | A | Mode Auto (effets aléatoires) sur le calque sélectionné |
@@ -84,6 +91,8 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - `src/video.rs` : décodage via un processus `ffmpeg` qui produit des images RGBA, cadencées par un thread (vitesse, pause, seek, boucle). Extraction des miniatures.
 - `src/renderer.rs` : composition OpenGL des calques (modes de fusion, fondus), rendu d'un maillage déformé et masque polygonal dans le shader, effets.
 - `src/surface.rs` : grille de déformation (perspective et splines de Catmull-Rom), masques, poignées d'édition.
+- `src/mask.rs` : import SVG des masques et rastérisation (tiny-skia) en texture.
+- `src/automix.rs` : tirage des séquences du mix auto.
 - `src/effects.rs` : paramètres d'effets, interpolation, presets intégrés et aléatoires.
 - `src/project.rs` : fichier projet `.ozmap`.
 - `src/thumbs.rs` : génération des miniatures en arrière-plan.

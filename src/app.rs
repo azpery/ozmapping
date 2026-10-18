@@ -9,12 +9,13 @@ use eframe::egui::{
 use eframe::glow;
 use serde::{Deserialize, Serialize};
 
+use crate::automix::{self, AutoMix};
 use crate::cpu::{self, CpuStats};
-use crate::effects::{self, BlendMode, Effects, Mirror, Preset};
+use crate::effects::{self, AutoTheme, BlendMode, Effects, Mirror, Preset};
 use crate::icons as ic;
 use crate::project::{self, LayerConfig, Project};
 use crate::renderer::{self, DrawParams, LayerDraw, MaskDraw, Phases, Renderer, SourceRef};
-use crate::surface::{self, ACCENT, MAX_GRID, MaskShape, Warp};
+use crate::surface::{self, ACCENT, MAX_GRID, Mask, MaskShape, Warp};
 use crate::theme::{self, BG, CARD, TEXT, TEXT_WEAK, WARN, with_icon};
 use crate::thumbs::Thumbnails;
 use crate::video::{self, VideoPlayer};
@@ -48,6 +49,7 @@ enum EditTarget {
 enum RightTab {
     Effects,
     Shape,
+    Mix,
 }
 
 /// Transition douce entre deux jeux d'effets (rappel de preset).
@@ -64,13 +66,21 @@ struct LayerRuntime {
     current: Option<VideoPlayer>,
     next: Option<VideoPlayer>,
     fade: f32,
+    /// Durée du fondu en cours, si elle diffère du réglage général (mix auto).
+    fade_secs: Option<f32>,
     fx_anim: Option<FxAnim>,
+    /// Mix auto : temps écoulé dans la séquence, durée prévue, séquence en cours.
+    mix_timer: f32,
+    mix_len: f32,
+    mix_seg: Option<automix::Segment>,
     /// Temps écoulé depuis le dernier changement du mode Auto.
     auto_timer: f32,
     /// Nom du dernier preset appliqué (pour le surligner, même pendant la transition).
     preset: Option<String>,
     phases: Phases,
     mesh: Option<(Warp, Arc<Vec<f32>>)>,
+    /// Dernière image du masque, avec ce qui a servi à la calculer.
+    mask_raster: Option<(Mask, (u32, u32), u32, MaskDraw)>,
 }
 
 impl LayerRuntime {
@@ -87,6 +97,28 @@ impl LayerRuntime {
         self.current = None;
         self.next = None;
         self.fade = 0.0;
+    }
+
+    /// Image du masque, recalculée seulement si la forme, la taille ou l'adoucissement changent.
+    fn mask(&mut self, mask: &Mask, size: (u32, u32), feather_px: f32) -> MaskDraw {
+        let feather_key = (feather_px * 4.0).round() as u32;
+        if let Some((m, s, f, draw)) = &self.mask_raster
+            && m == mask
+            && *s == size
+            && *f == feather_key
+        {
+            return draw.clone();
+        }
+        static NEXT_MASK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let draw = MaskDraw {
+            key: NEXT_MASK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            width: size.0,
+            height: size.1,
+            data: Arc::new(crate::mask::rasterize(mask, size.0, size.1, feather_px)),
+            invert: mask.invert,
+        };
+        self.mask_raster = Some((mask.clone(), size, feather_key, draw.clone()));
+        draw
     }
 
     fn mesh(&mut self, warp: &Warp) -> Arc<Vec<f32>> {
@@ -366,6 +398,22 @@ impl OzApp {
     }
 
     fn launch_on(&mut self, ctx: &egui::Context, layer: usize, path: &Path) {
+        let opts = video::PlayOptions::new(self.project.looping, video::OUTPUT_MAX);
+        self.launch_with(ctx, layer, path, opts, None, true);
+    }
+
+    /// Lance une vidéo sur un calque, en fondu depuis la vidéo actuelle.
+    /// `fade` remplace la durée de fondu générale ; `remember` l'enregistre comme vidéo du calque
+    /// dans le projet (pas pour le mix auto, qui change de vidéo en permanence).
+    fn launch_with(
+        &mut self,
+        ctx: &egui::Context,
+        layer: usize,
+        path: &Path,
+        opts: video::PlayOptions,
+        fade: Option<f32>,
+        remember: bool,
+    ) {
         let Some(rt) = self.layers.get_mut(layer) else {
             return;
         };
@@ -374,16 +422,78 @@ impl OzApp {
             rt.current = Some(next);
         }
         rt.fade = 0.0;
+        rt.fade_secs = fade;
         let repaint_ctx = ctx.clone();
-        match VideoPlayer::open(path, self.project.looping, video::OUTPUT_MAX, move || {
-            repaint_ctx.request_repaint()
-        }) {
+        match VideoPlayer::open(path, opts, move || repaint_ctx.request_repaint()) {
             Ok(player) => {
                 rt.next = Some(player);
-                self.project.layers[layer].clip = Some(path.to_path_buf());
+                if remember {
+                    self.project.layers[layer].clip = Some(path.to_path_buf());
+                }
                 self.status = None;
             }
             Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
+        }
+    }
+
+    /// Mix auto : passe le calque `i` à la séquence suivante.
+    fn mix_next(&mut self, ctx: &egui::Context, i: usize) {
+        let mix = self.project.layers[i].mix.clone();
+        let current = self.layers[i].active().map(|p| p.path.clone());
+        let mut seed = self.next_random();
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f32 / (1u64 << 53) as f32
+        };
+        let Some(seg) = automix::next_segment(&mix, current.as_deref(), &mut rnd) else {
+            return;
+        };
+        let rt = &mut self.layers[i];
+        rt.mix_timer = 0.0;
+        rt.mix_len = seg.length;
+        let duration = match video::probe(&seg.clip) {
+            Ok(info) => info.duration,
+            Err(e) => {
+                self.status = Some(format!("{} : {e:#}", file_name(&seg.clip)));
+                rt.mix_len = 0.5; // on réessaiera avec une autre vidéo
+                return;
+            }
+        };
+        // Point de départ : la séquence doit tenir dans la vidéo, dans un sens comme dans l'autre.
+        let span = (seg.length * seg.speed) as f64;
+        let (lo, hi) = if seg.reverse { (span, duration) } else { (0.0, duration - span) };
+        let start = if hi > lo { lo + (hi - lo) * seg.start } else { duration * seg.start };
+
+        match rt.active() {
+            Some(p) if seg.same_clip => {
+                p.set_reverse(seg.reverse);
+                p.set_speed(seg.speed);
+                p.seek(start);
+            }
+            _ => {
+                let opts = video::PlayOptions {
+                    looping: true,
+                    max_size: video::OUTPUT_MAX,
+                    start,
+                    reverse: seg.reverse,
+                    speed: seg.speed,
+                };
+                let clip = seg.clip.clone();
+                self.launch_with(ctx, i, &clip, opts, Some(seg.fade), false);
+            }
+        }
+        self.layers[i].mix_seg = Some(seg);
+    }
+
+    fn toggle_reverse(&mut self) {
+        let rt = &self.layers[self.sel()];
+        if let Some(active) = rt.active() {
+            let reverse = !active.is_reverse();
+            for p in rt.players() {
+                p.set_reverse(reverse);
+            }
         }
     }
 
@@ -425,7 +535,9 @@ impl OzApp {
             return;
         }
         let repaint_ctx = ctx.clone();
-        match VideoPlayer::open(path, true, video::PREVIEW_MAX, move || repaint_ctx.request_repaint()) {
+        match VideoPlayer::open(path, video::PlayOptions::new(true, video::PREVIEW_MAX), move || {
+            repaint_ctx.request_repaint()
+        }) {
             Ok(p) => self.cue = Some(p),
             Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
         }
@@ -532,8 +644,8 @@ impl OzApp {
             .cloned()
             .collect();
         let roll = self.next_random();
-        let choice = if use_random || candidates.is_empty() {
-            (None, Effects::random(roll))
+        let choice = if auto.theme != AutoTheme::All || use_random || candidates.is_empty() {
+            (None, Effects::themed(auto.theme, roll, auto.intensity, auto.strobe))
         } else {
             let p = &candidates[(roll % candidates.len() as u64) as usize];
             (Some(p.name.clone()), p.effects)
@@ -553,10 +665,12 @@ impl OzApp {
         for (rt, cfg) in self.layers.iter_mut().zip(&mut self.project.layers) {
             // Fondu enchaîné : démarre dès que la nouvelle vidéo a sa première image.
             if rt.next.as_ref().is_some_and(|n| n.has_frame()) {
-                rt.fade += if self.project.fade_secs <= 0.01 { 1.0 } else { dt / self.project.fade_secs };
+                let secs = rt.fade_secs.unwrap_or(self.project.fade_secs);
+                rt.fade += if secs <= 0.01 { 1.0 } else { dt / secs };
                 if rt.fade >= 1.0 {
                     rt.current = rt.next.take();
                     rt.fade = 0.0;
+                    rt.fade_secs = None;
                 }
             }
             if let Some(anim) = &mut rt.fx_anim {
@@ -583,6 +697,22 @@ impl OzApp {
                 if self.layers[i].auto_timer >= auto.interval.max(0.5) {
                     self.auto_next(i);
                 }
+            }
+        }
+
+        // Mix auto : séquence suivante quand la durée prévue est écoulée.
+        for i in 0..self.layers.len() {
+            let mix = &self.project.layers[i].mix;
+            if !mix.enabled || mix.clips.is_empty() {
+                continue;
+            }
+            let rt = &mut self.layers[i];
+            // Le temps ne compte qu'une fois l'image affichée (pas pendant l'ouverture du fichier).
+            if rt.active().is_some_and(VideoPlayer::has_frame) {
+                rt.mix_timer += dt;
+            }
+            if rt.active().is_none() || rt.mix_timer >= rt.mix_len {
+                self.mix_next(ctx, i);
             }
         }
 
@@ -622,6 +752,10 @@ impl OzApp {
 
     fn draw_params(&mut self) -> DrawParams {
         let mut layers = Vec::new();
+        // Le masque est rastérisé à 1024 px de large, aux proportions de la sortie.
+        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let mask_size = (1024u32, ((1024.0 / aspect).round() as u32).clamp(64, 4096));
+        let to_mask_px = mask_size.0 as f32 / self.output_size.x.max(1.0);
         for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
             if !cfg.visible || cfg.opacity <= 0.0 {
                 continue;
@@ -631,11 +765,10 @@ impl OzApp {
                 b: rt.next.as_ref().map(source),
                 mix: rt.fade.clamp(0.0, 1.0),
                 mesh: rt.mesh(&cfg.warp),
-                mask: cfg.mask.is_active().then(|| MaskDraw {
-                    points: cfg.mask.points.clone(),
-                    invert: cfg.mask.invert,
-                    feather: cfg.mask.feather,
-                }),
+                mask: cfg
+                    .mask
+                    .is_active()
+                    .then(|| rt.mask(&cfg.mask, mask_size, cfg.mask.feather * to_mask_px)),
                 effects: if self.bypass_fx { Effects::default() } else { cfg.effects },
                 opacity: cfg.opacity,
                 blend: cfg.blend,
@@ -680,6 +813,9 @@ impl OzApp {
         }
         if pressed(Key::G) {
             self.grid = !self.grid;
+        }
+        if pressed(Key::R) {
+            self.toggle_reverse();
         }
         if pressed(Key::E) {
             self.bypass_fx = !self.bypass_fx;
@@ -840,6 +976,8 @@ impl OzApp {
         let mut to_cue = None;
         let mut to_launch = None;
         let mut to_remove = None;
+        let mut to_toggle_mix = None;
+        let mix_clips = self.project.layers[self.sel()].mix.clips.clone();
         egui::ScrollArea::vertical()
             .id_salt("media")
             .max_height(ui.available_height() * 0.5)
@@ -865,6 +1003,7 @@ impl OzApp {
                         .map(|(k, _)| format!("C{}", k + 1))
                         .collect();
                     let is_cue = cue_path.as_deref() == Some(path.as_path());
+                    let in_mix = mix_clips.contains(path);
                     let thumb = self.thumbs.get(&ctx, path);
 
                     let playing = !on_layers.is_empty();
@@ -940,6 +1079,19 @@ impl OzApp {
                                     {
                                         to_remove = Some(i);
                                     }
+                                    let mix_icon = egui::RichText::new(ic::FILM_REEL)
+                                        .color(if in_mix { ACCENT } else { TEXT_WEAK });
+                                    if ui
+                                        .add(egui::Button::new(mix_icon).small().frame(false))
+                                        .on_hover_text(if in_mix {
+                                            "Dans le mix auto du calque sélectionné (cliquer pour retirer)"
+                                        } else {
+                                            "Ajouter au mix auto du calque sélectionné"
+                                        })
+                                        .clicked()
+                                    {
+                                        to_toggle_mix = Some(i);
+                                    }
                                 });
                             });
                             label
@@ -962,6 +1114,15 @@ impl OzApp {
         }
         if let Some(i) = to_launch {
             self.launch_media(&ctx, i);
+        }
+        if let Some(i) = to_toggle_mix {
+            let sel = self.sel();
+            let clips = &mut self.project.layers[sel].mix.clips;
+            if clips.contains(&media[i]) {
+                clips.retain(|p| *p != media[i]);
+            } else {
+                clips.push(media[i].clone());
+            }
         }
         if let Some(i) = to_remove {
             if cue_path.as_deref() == Some(media[i].as_path()) {
@@ -1216,11 +1377,20 @@ impl OzApp {
         let mut pos = player.position() as f32;
         let mut seek_to = None;
         let mut toggle = false;
+        let mut flip = false;
         ui.horizontal(|ui| {
             toggle = ui
                 .add(theme::icon_button(if paused { ic::PLAY } else { ic::PAUSE }))
                 .on_hover_text(if paused { "Lecture (Espace)" } else { "Pause (Espace)" })
                 .clicked();
+            let reverse = player.is_reverse();
+            if ui
+                .add(theme::icon_button(ic::REWIND).selected(reverse))
+                .on_hover_text("Lecture à l'envers (R)")
+                .clicked()
+            {
+                flip = true;
+            }
             if player.ended() {
                 ui.label(egui::RichText::new("terminé").small().color(TEXT_WEAK));
             }
@@ -1238,7 +1408,13 @@ impl OzApp {
         });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(ic::SPEEDOMETER).color(TEXT_WEAK)).on_hover_text("Vitesse de lecture");
-            ui.add(egui::Slider::new(&mut speed, 0.1..=4.0).logarithmic(true).suffix("×").text("Vitesse"));
+            ui.add(
+                egui::Slider::new(&mut speed, 0.1..=4.0)
+                    .logarithmic(true)
+                    .max_decimals(2)
+                    .suffix("×")
+                    .text("Vitesse"),
+            );
             if ui.small_button("1×").clicked() {
                 speed = 1.0;
             }
@@ -1251,12 +1427,22 @@ impl OzApp {
         if toggle {
             self.toggle_pause();
         }
+        if flip {
+            self.toggle_reverse();
+        }
+        if self.project.layers[i].mix.enabled {
+            ui.label(egui::RichText::new(with_icon(ic::FILM_REEL, "Mix auto actif sur ce calque")).small().color(ACCENT));
+        }
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            for (tab, icon, name) in [(RightTab::Effects, ic::SPARKLE, "Effets"), (RightTab::Shape, ic::POLYGON, "Forme")] {
+            for (tab, icon, name) in [
+                (RightTab::Effects, ic::SPARKLE, "Effets"),
+                (RightTab::Shape, ic::POLYGON, "Forme"),
+                (RightTab::Mix, ic::FILM_REEL, "Mix"),
+            ] {
                 let text = egui::RichText::new(with_icon(icon, name)).size(15.0).strong();
                 ui.selectable_value(&mut self.right_tab, tab, text);
             }
@@ -1274,6 +1460,7 @@ impl OzApp {
             .show(ui, |ui| match self.right_tab {
                 RightTab::Effects => self.effects_ui(ui),
                 RightTab::Shape => self.shape_ui(ui),
+                RightTab::Mix => self.mix_ui(ui),
             });
     }
 
@@ -1329,6 +1516,23 @@ impl OzApp {
             touched |= fx_slider(ui, "Ondulation", &mut fx.wave_amp, 0.0..=0.1, d.wave_amp);
             touched |= fx_slider(ui, "Fréquence onde", &mut fx.wave_freq, 0.5..=30.0, d.wave_freq);
             touched |= fx_slider(ui, "Vitesse onde", &mut fx.wave_speed, 0.0..=20.0, d.wave_speed);
+        });
+        egui::CollapsingHeader::new(with_icon(ic::SPIRAL, "Psychédélique")).default_open(true).show(ui, |ui| {
+            touched |= fx_slider(ui, "Tourbillon", &mut fx.swirl, -4.0..=4.0, d.swirl);
+            touched |= fx_slider(ui, "Oscillation tourbillon /s", &mut fx.swirl_speed, 0.0..=1.0, d.swirl_speed);
+            touched |= fx_slider(ui, "Tunnel", &mut fx.polar, 0.0..=1.0, d.polar);
+            touched |= fx_slider(ui, "Vitesse tunnel", &mut fx.tunnel_speed, -2.0..=2.0, d.tunnel_speed);
+            touched |= fx_slider(ui, "Mosaïque miroir", &mut fx.tiles, 1.0..=8.0, d.tiles);
+            touched |= fx_slider(ui, "Liquide", &mut fx.liquid, 0.0..=0.08, d.liquid);
+            touched |= fx_slider(ui, "Échelle liquide", &mut fx.liquid_scale, 1.0..=20.0, d.liquid_scale);
+            touched |= fx_slider(ui, "Vitesse liquide", &mut fx.liquid_speed, 0.0..=8.0, d.liquid_speed);
+            touched |= fx_slider(ui, "Palette acide", &mut fx.acid, 0.0..=1.0, d.acid);
+            touched |= fx_slider(ui, "Rotation acide /s", &mut fx.acid_speed, -1.0..=1.0, d.acid_speed);
+            touched |= fx_slider(ui, "Arc-en-ciel spatial", &mut fx.rainbow, 0.0..=3.0, d.rainbow);
+            touched |= fx_slider(ui, "Solarisation", &mut fx.solarize, 0.0..=1.0, d.solarize);
+            touched |= fx_slider(ui, "Pulsation", &mut fx.pulse, 0.0..=0.3, d.pulse);
+            touched |= fx_slider(ui, "Fréquence pulsation Hz", &mut fx.pulse_rate, 0.05..=5.0, d.pulse_rate);
+            touched |= fx_slider(ui, "Écho", &mut fx.echo, 0.0..=1.0, d.echo);
         });
         egui::CollapsingHeader::new(with_icon(ic::LIGHTNING, "Rythme")).default_open(true).show(ui, |ui| {
             touched |= fx_slider(ui, "Stroboscope Hz", &mut fx.strobe, 0.0..=20.0, d.strobe);
@@ -1456,6 +1660,7 @@ impl OzApp {
         );
 
         let sel = self.sel();
+        let mut import_svg = None;
         let cfg = &mut self.project.layers[sel];
         egui::CollapsingHeader::new(with_icon(ic::GRID_FOUR, "Déformation")).default_open(true).show(ui, |ui| {
             let (mut cols, mut rows) = (cfg.warp.cols, cfg.warp.rows);
@@ -1500,22 +1705,36 @@ impl OzApp {
             ui.horizontal_wrapped(|ui| {
                 for shape in MaskShape::ALL {
                     if ui.button(shape.label()).clicked() {
-                        cfg.mask.points = shape.points(aspect);
+                        cfg.mask.set_shape(shape.points(aspect));
                         cfg.mask.enabled = true;
                         self.edit_target = EditTarget::Mask;
                         self.edit_mapping = true;
                     }
                 }
+                if ui
+                    .button(with_icon(ic::FILE_PLUS, "Importer un SVG…"))
+                    .on_hover_text("Utiliser la forme d'un fichier SVG (logo, pictogramme…). Glisser-déposer un .svg marche aussi.")
+                    .clicked()
+                {
+                    import_svg = rfd::FileDialog::new().add_filter("Image SVG", &["svg"]).pick_file();
+                }
             });
+            let rings = cfg.mask.ring_count();
             ui.label(
                 egui::RichText::new(format!(
-                    "{} points · double-clic sur un bord : ajouter un point · clic droit sur un point : le supprimer",
-                    cfg.mask.points.len()
+                    "{} point(s){} · double-clic sur un bord : ajouter un point · clic droit sur un point : le supprimer",
+                    cfg.mask.total_points(),
+                    if rings > 1 { format!(" en {rings} contours") } else { String::new() },
                 ))
                 .small()
-                .weak(),
+                .color(TEXT_WEAK),
             );
         });
+        if let Some(path) = import_svg {
+            self.import_svg_mask(&path);
+            return;
+        }
+        let cfg = &mut self.project.layers[sel];
         ui.add_space(4.0);
         if ui.button(with_icon(ic::STACK, "Copier forme et masque vers tous les calques")).clicked() {
             let (warp, mask) = (cfg.warp.clone(), cfg.mask.clone());
@@ -1523,6 +1742,149 @@ impl OzApp {
                 l.warp = warp.clone();
                 l.mask = mask.clone();
             }
+        }
+    }
+
+    fn mix_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let sel = self.sel();
+        let (timer, len, seg) = {
+            let rt = &self.layers[sel];
+            (rt.mix_timer, rt.mix_len, rt.mix_seg.clone())
+        };
+        let media = self.project.media.clone();
+        let mut next = false;
+        let mut started = false;
+        let mix = &mut self.project.layers[sel].mix;
+
+        ui.horizontal(|ui| {
+            let label = egui::RichText::new(with_icon(ic::FILM_REEL, "MIX AUTO")).strong();
+            if ui
+                .toggle_value(&mut mix.enabled, label)
+                .on_hover_text("Enchaîne au hasard des séquences des vidéos cochées sur ce calque")
+                .changed()
+                && mix.enabled
+            {
+                started = true;
+            }
+            if ui
+                .add(theme::icon_button(ic::SKIP_FORWARD))
+                .on_hover_text("Séquence suivante tout de suite")
+                .clicked()
+            {
+                next = true;
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Découpe des séquences dans les vidéos cochées : changements de vidéo, sauts dans le temps, \
+                 lecture à l'envers, vitesse variable, coupes franches ou fondus.",
+            )
+            .small()
+            .color(TEXT_WEAK),
+        );
+        if mix.enabled {
+            ui.add(
+                egui::ProgressBar::new((timer / len.max(0.01)).clamp(0.0, 1.0))
+                    .desired_height(6.0)
+                    .fill(ACCENT.gamma_multiply(0.7)),
+            );
+            if let Some(seg) = &seg {
+                let dir = if seg.reverse { with_icon(ic::REWIND, "envers") } else { with_icon(ic::PLAY, "endroit") };
+                let cut = if seg.fade > 0.0 { format!("fondu {:.1} s", seg.fade) } else { "coupe".into() };
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{}  ·  {dir}  ·  ×{:.2}  ·  {cut}  ·  {:.1} s",
+                        file_name(&seg.clip),
+                        seg.speed,
+                        seg.length
+                    ))
+                    .small()
+                    .color(TEXT_WEAK),
+                );
+            }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("Vidéos du mix : {}", mix.clips.len())).strong().color(TEXT));
+            if ui.small_button("Toutes").clicked() {
+                mix.clips = media.clone();
+            }
+            if ui.small_button("Aucune").clicked() {
+                mix.clips.clear();
+            }
+        });
+        if media.is_empty() {
+            ui.label(egui::RichText::new("Ajoutez d'abord des vidéos dans la liste Médias.").small().color(TEXT_WEAK));
+        }
+        for path in &media {
+            let mut on = mix.clips.contains(path);
+            let icon = if on { ic::CHECK_SQUARE } else { ic::SQUARE };
+            let text = egui::RichText::new(with_icon(icon, &file_name(path))).color(if on { ACCENT } else { TEXT });
+            if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                on = !on;
+                if on {
+                    mix.clips.push(path.clone());
+                } else {
+                    mix.clips.retain(|p| p != path);
+                }
+            }
+        }
+        if mix.enabled && mix.clips.is_empty() {
+            ui.label(egui::RichText::new("Cochez au moins une vidéo.").color(WARN));
+        }
+
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(with_icon(ic::SCISSORS, "Séquences")).strong().color(TEXT));
+        ui.add(egui::Slider::new(&mut mix.seg_min, 0.3..=20.0).logarithmic(true).text("Durée min").suffix(" s"));
+        ui.add(egui::Slider::new(&mut mix.seg_max, 0.3..=20.0).logarithmic(true).text("Durée max").suffix(" s"));
+        percent_slider(ui, &mut mix.same_clip_chance, "Rester sur la même vidéo")
+            .on_hover_text("Sinon on passe à une autre vidéo cochée");
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(with_icon(ic::REWIND, "Sens et vitesse")).strong().color(TEXT));
+        percent_slider(ui, &mut mix.reverse_chance, "À l'envers");
+        percent_slider(ui, &mut mix.speed_chance, "Vitesse variable")
+            .on_hover_text("Part des séquences jouées à une autre vitesse que la normale");
+        ui.add(egui::Slider::new(&mut mix.speed_min, 0.1..=4.0).logarithmic(true).text("Vitesse min").suffix("×"));
+        ui.add(egui::Slider::new(&mut mix.speed_max, 0.1..=4.0).logarithmic(true).text("Vitesse max").suffix("×"));
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(with_icon(ic::SHUFFLE, "Transitions")).strong().color(TEXT));
+        percent_slider(ui, &mut mix.cut_chance, "Coupes franches").on_hover_text("Sinon fondu enchaîné");
+        ui.add(egui::Slider::new(&mut mix.fade, 0.05..=3.0).text("Durée des fondus").suffix(" s"));
+        if ui.small_button("Réglages par défaut").clicked() {
+            let (enabled, clips) = (mix.enabled, std::mem::take(&mut mix.clips));
+            *mix = AutoMix { enabled, clips, ..AutoMix::default() };
+        }
+
+        if started {
+            // Lit à l'avance la durée des vidéos, pour que les changements soient instantanés.
+            let clips = mix.clips.clone();
+            std::thread::spawn(move || {
+                for c in clips {
+                    let _ = video::probe(&c);
+                }
+            });
+        }
+        if (started || next) && !mix.clips.is_empty() {
+            self.mix_next(&ctx, sel);
+        }
+    }
+
+    /// Importe un SVG comme masque du calque sélectionné.
+    fn import_svg_mask(&mut self, path: &Path) {
+        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        match crate::mask::import_svg(path, aspect) {
+            Ok((rings, nonzero)) => {
+                let sel = self.sel();
+                let mask = &mut self.project.layers[sel].mask;
+                mask.set_rings(rings, nonzero);
+                mask.enabled = true;
+                self.edit_target = EditTarget::Mask;
+                self.right_tab = RightTab::Shape;
+                self.status = None;
+            }
+            Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
         }
     }
 
@@ -1642,6 +2004,9 @@ impl eframe::App for OzApp {
             if self.confirm_discard() {
                 self.load_project_file(&ctx, proj);
             }
+        } else if let Some(svg) = dropped.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"))) {
+            // Un SVG déposé devient le masque du calque sélectionné.
+            self.import_svg_mask(svg);
         } else if !dropped.is_empty() {
             self.add_media(dropped);
         }
@@ -1658,7 +2023,7 @@ impl eframe::App for OzApp {
                     } else {
                         ui.label(
                             egui::RichText::new(format!(
-                                "Espace pause  ·  0 sans effet  ·  E tout sans effets  ·  A auto  ·  B blackout  ·  M forme  ·  F plein écran  ·  {CMD}+S enregistrer"
+                                "Espace pause  ·  R envers  ·  0 sans effet  ·  E tout sans effets  ·  A auto  ·  B blackout  ·  M forme  ·  F plein écran  ·  {CMD}+S enregistrer"
                             ))
                             .small()
                             .color(TEXT_WEAK),
@@ -1768,16 +2133,42 @@ fn auto_ui(ui: &mut egui::Ui, auto: &mut effects::AutoFx, timer: f32, current: O
         let now = current.unwrap_or("effet inédit (« Mémoriser » pour le garder)");
         ui.label(egui::RichText::new(format!("En cours : {now}  ·  prochain dans {left:.0} s")).small().color(TEXT_WEAK));
     }
+    ui.horizontal(|ui| {
+        ui.label("Thème");
+        let before = auto.theme;
+        egui::ComboBox::from_id_salt("auto_theme")
+            .selected_text(auto.theme.label())
+            .width(140.0)
+            .show_ui(ui, |ui| {
+                for t in AutoTheme::ALL {
+                    ui.selectable_value(&mut auto.theme, t, t.label()).on_hover_text(t.description());
+                }
+            });
+        // Changer de thème en cours de route : effet du nouveau thème tout de suite.
+        if auto.enabled && auto.theme != before {
+            *next = true;
+        }
+    });
+    ui.label(egui::RichText::new(auto.theme.description()).small().color(TEXT_WEAK));
     ui.add(egui::Slider::new(&mut auto.interval, 1.0..=60.0).text("Changer toutes les").suffix(" s"));
     ui.add(egui::Slider::new(&mut auto.transition, 0.0..=10.0).text("Fondu").suffix(" s"));
+    ui.add(egui::Slider::new(&mut auto.intensity, 0.3..=1.5).text("Intensité"))
+        .on_hover_text("Dosage des effets générés : faible = subtil, fort = extrême");
+    if auto.theme == AutoTheme::All {
+        percent_slider(ui, &mut auto.novelty, "Effets inédits")
+            .on_hover_text("Part des changements qui inventent un nouvel effet au lieu de reprendre un preset");
+    }
+    ui.checkbox(&mut auto.strobe, "Autoriser le stroboscope").on_hover_text("Inclut les presets avec flashs");
+}
+
+/// Slider de pourcentage (valeur stockée entre 0 et 1).
+fn percent_slider(ui: &mut egui::Ui, value: &mut f32, label: &str) -> egui::Response {
     ui.add(
-        egui::Slider::new(&mut auto.novelty, 0.0..=1.0)
-            .text("Effets inédits")
+        egui::Slider::new(value, 0.0..=1.0)
+            .text(label)
             .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
             .custom_parser(|s| s.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)),
     )
-    .on_hover_text("Part des changements qui inventent un nouvel effet au lieu de reprendre un preset");
-    ui.checkbox(&mut auto.strobe, "Autoriser le stroboscope").on_hover_text("Inclut les presets avec flashs");
 }
 
 /// Slider d'effet avec bouton de remise à zéro. Renvoie true si l'utilisateur l'a modifié.

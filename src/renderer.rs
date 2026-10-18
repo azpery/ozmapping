@@ -11,7 +11,6 @@ use eframe::egui_glow;
 use eframe::glow::{self, HasContext as _};
 
 use crate::effects::{BlendMode, Effects};
-use crate::surface::{MAX_MASK_POINTS, Point};
 use crate::video::FrameSlot;
 
 /// Une source vidéo : clé de texture (uid du lecteur) + dernière frame partagée.
@@ -50,6 +49,12 @@ pub struct Phases {
     pub kaleido: f32,
     /// Phase de l'ondulation, en radians.
     pub wave: f32,
+    /// Oscillation du tourbillon, avancée du tunnel, liquide, palette acide, pulsation.
+    pub swirl: f32,
+    pub tunnel: f32,
+    pub liquid: f32,
+    pub acid: f32,
+    pub pulse: f32,
 }
 
 impl Phases {
@@ -75,14 +80,24 @@ impl Phases {
         self.rotate = step(self.rotate, fx.rotate_speed, 360.0);
         self.kaleido = step(self.kaleido, fx.kaleido_spin, 360.0);
         self.wave = step(self.wave, fx.wave_speed, WAVE_PERIOD);
+        let tau = std::f32::consts::TAU;
+        self.swirl = step(self.swirl, fx.swirl_speed * tau, tau);
+        self.tunnel = step(self.tunnel, fx.tunnel_speed, 1.0);
+        self.liquid = step(self.liquid, fx.liquid_speed, 200.0 * tau);
+        self.acid = step(self.acid, fx.acid_speed, 1.0);
+        self.pulse = step(self.pulse, fx.pulse_rate * tau, tau);
     }
 }
 
+/// Masque déjà rastérisé (niveaux de gris, en coordonnées de sortie).
+/// `key` change à chaque nouvelle image : c'est ce qui déclenche l'envoi au GPU.
 #[derive(Clone)]
 pub struct MaskDraw {
-    pub points: Vec<Point>,
+    pub key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub data: Arc<Vec<u8>>,
     pub invert: bool,
-    pub feather: f32,
 }
 
 /// Tout ce qu'il faut pour dessiner une image (copié dans le callback de peinture).
@@ -106,6 +121,7 @@ pub struct Renderer {
     vbo: glow::Buffer,
     black: glow::Texture,
     textures: HashMap<u64, VideoTexture>,
+    mask_textures: HashMap<u64, glow::Texture>,
 }
 
 const VERTEX_SHADER: &str = r#"
@@ -133,10 +149,9 @@ uniform int u_has_a;
 uniform int u_has_b;
 uniform float u_mix;
 uniform vec2 u_res;
-uniform vec2 u_mask[64];
-uniform int u_mask_n;
+uniform sampler2D u_mask_tex;
+uniform int u_has_mask;
 uniform int u_mask_invert;
-uniform float u_mask_feather;
 uniform float u_time;
 uniform vec2 u_tex_size;
 uniform int u_grid;
@@ -168,6 +183,21 @@ uniform float u_wave_amp;
 uniform float u_wave_freq;
 uniform float u_wave_phase;
 uniform float u_strobe;
+uniform float u_swirl;
+uniform float u_swirl_phase;
+uniform float u_polar;
+uniform float u_tunnel_phase;
+uniform float u_tiles;
+uniform float u_liquid;
+uniform float u_liquid_scale;
+uniform float u_liquid_phase;
+uniform float u_acid;
+uniform float u_acid_phase;
+uniform float u_rainbow;
+uniform float u_solarize;
+uniform float u_pulse;
+uniform float u_pulse_phase;
+uniform float u_echo;
 
 const float PI = 3.14159265359;
 
@@ -183,24 +213,10 @@ void emit(vec3 col, float a) {
     }
 }
 
-// Masque polygonal (règle pair-impair) avec bords adoucis, en pixels de sortie.
+// Masque : image pré-calculée (bords adoucis compris), lue en coordonnées de sortie.
 float mask_value() {
-    if (u_mask_n < 3) return 1.0;
-    vec2 p = v_pos * u_res;
-    bool inside = false;
-    float dmin = 1e9;
-    for (int i = 0, j = u_mask_n - 1; i < u_mask_n; j = i++) {
-        vec2 a = u_mask[i] * u_res;
-        vec2 b = u_mask[j] * u_res;
-        if (((a.y > p.y) != (b.y > p.y)) && (p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x)) {
-            inside = !inside;
-        }
-        vec2 pa = p - a, ba = b - a;
-        float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
-        dmin = min(dmin, length(pa - ba * h));
-    }
-    float edge = u_mask_feather > 0.5 ? smoothstep(0.0, u_mask_feather, dmin) : 1.0;
-    float m = inside ? edge : 0.0;
+    if (u_has_mask == 0) return 1.0;
+    float m = texture(u_mask_tex, v_pos).r;
     return u_mask_invert == 1 ? 1.0 - m : m;
 }
 
@@ -242,6 +258,10 @@ void main() {
     vec2 uv = quad_uv;
 
     // 2. Géométrie
+    if (u_tiles > 1.0) {
+        // Mosaïque en miroir : chaque tuile est le reflet de sa voisine (pas de couture).
+        uv = 1.0 - abs(1.0 - mod(uv * u_tiles, 2.0));
+    }
     if (u_flip_x == 1) uv.x = 1.0 - uv.x;
     if (u_flip_y == 1) uv.y = 1.0 - uv.y;
     if (u_mirror == 1 || u_mirror == 3) uv.x = 0.5 - abs(uv.x - 0.5);
@@ -252,7 +272,15 @@ void main() {
     c.x *= aspect;
     float ca = cos(u_rotate), sa = sin(u_rotate);
     c = mat2(ca, -sa, sa, ca) * c;
-    c /= max(u_zoom, 0.01);
+    c /= max(u_zoom * (1.0 + u_pulse * sin(u_pulse_phase)), 0.01);
+
+    if (u_swirl != 0.0) {
+        // Tourbillon : rotation d'autant plus forte qu'on est près du centre.
+        float r = length(c);
+        float s = u_swirl * (0.6 + 0.4 * sin(u_swirl_phase)) * exp(-r * 2.5);
+        float cs = cos(s), sn = sin(s);
+        c = mat2(cs, -sn, sn, cs) * c;
+    }
 
     if (u_kaleido >= 2.0) {
         float r = length(c);
@@ -262,13 +290,32 @@ void main() {
         a = abs(a - seg * 0.5);
         c = r * vec2(cos(a), sin(a));
     }
+    // Tunnel : coordonnées polaires (angle, 1/distance) qui défilent vers le centre.
+    float tunnel_fade = 1.0;
+    vec2 polar_uv = uv;
+    if (u_polar > 0.0) {
+        float r = length(c);
+        polar_uv = vec2(atan(c.y, c.x) / (2.0 * PI) + 0.5, fract(0.12 / max(r, 0.02) + u_tunnel_phase));
+        tunnel_fade = mix(1.0, smoothstep(0.02, 0.25, r), u_polar);
+    }
     c.x /= aspect;
     uv = c + 0.5;
+    if (u_polar > 0.0) {
+        uv = mix(uv, polar_uv, u_polar);
+    }
 
     // 3. Distorsions
     if (u_wave_amp > 0.0) {
         uv.x += sin(uv.y * u_wave_freq * 2.0 * PI + u_wave_phase) * u_wave_amp;
         uv.y += cos(uv.x * u_wave_freq * 2.0 * PI + u_wave_phase * 0.8) * u_wave_amp * 0.5;
+    }
+    if (u_liquid > 0.0) {
+        // Liquide : somme d'ondulations croisées qui dérivent dans le temps.
+        vec2 p = uv * u_liquid_scale;
+        float ph = u_liquid_phase;
+        vec2 o = vec2(sin(p.y + ph) + sin(p.x * 1.7 - ph * 1.3), cos(p.x * 1.3 + ph * 0.7) + cos(p.y * 2.1 - ph));
+        o += 0.5 * vec2(sin(p.x * 3.1 + p.y * 1.7 + ph * 1.9), cos(p.y * 2.7 - p.x * 1.3 + ph * 1.5));
+        uv += o * u_liquid * 0.4;
     }
     if (u_pixelate > 0.0) {
         float cells = mix(320.0, 6.0, u_pixelate);
@@ -283,6 +330,15 @@ void main() {
         col = vec3(fetch(uv + off).r, fetch(uv).g, fetch(uv - off).b);
     } else {
         col = fetch(uv);
+    }
+
+    if (u_echo > 0.0) {
+        // Écho : copies de plus en plus petites, superposées en mode « écran ».
+        for (int k = 1; k <= 3; k++) {
+            vec2 e = 0.5 + (uv - 0.5) * (1.0 - 0.08 * float(k));
+            vec3 ec = fetch(e) * (u_echo * (1.0 - 0.22 * float(k)));
+            col = 1.0 - (1.0 - col) * (1.0 - ec);
+        }
     }
 
     if (u_edge > 0.0) {
@@ -301,10 +357,21 @@ void main() {
     col = (col - 0.5) * u_contrast + 0.5;
     float l = luma(col);
     col = mix(vec3(l), col, u_saturation);
-    if (u_hue != 0.0) {
+    float hue_shift = u_hue + u_rainbow * (quad_uv.x * 0.6 + quad_uv.y * 0.4);
+    if (hue_shift != 0.0) {
         vec3 hsv = rgb2hsv(clamp(col, 0.0, 1.0));
-        hsv.x = fract(hsv.x + u_hue);
+        hsv.x = fract(hsv.x + hue_shift);
         col = hsv2rgb(hsv);
+    }
+    if (u_acid > 0.0) {
+        // Palette acide : la luminosité est remplacée par un arc-en-ciel qui tourne.
+        float t = luma(clamp(col, 0.0, 1.0)) * 1.5 + u_acid_phase;
+        vec3 pal = 0.5 + 0.5 * cos(2.0 * PI * (t + vec3(0.0, 0.33, 0.67)));
+        col = mix(col, pal, u_acid);
+    }
+    if (u_solarize > 0.0) {
+        vec3 sol = mix(col, 1.0 - col, step(0.5, col)) * 2.0;
+        col = mix(col, sol, u_solarize);
     }
     if (u_posterize >= 2.0) {
         col = floor(col * u_posterize) / (u_posterize - 1.0);
@@ -316,6 +383,7 @@ void main() {
         float d = length(quad_uv - 0.5) * 1.4142;
         col *= 1.0 - smoothstep(1.0 - u_vignette, 1.0 + 0.0001, d) * clamp(u_vignette * 1.5, 0.0, 1.0);
     }
+    col *= tunnel_fade;
     if (u_strobe > 0.0 && fract(u_time * u_strobe) > 0.5) {
         col = vec3(0.0);
     }
@@ -387,6 +455,7 @@ impl Renderer {
                 vbo,
                 black,
                 textures: HashMap::new(),
+                mask_textures: HashMap::new(),
             })
         }
     }
@@ -424,6 +493,39 @@ impl Renderer {
             for (_, t) in self.textures.drain() {
                 gl.delete_texture(t.texture);
             }
+            for (_, t) in self.mask_textures.drain() {
+                gl.delete_texture(t);
+            }
+        }
+    }
+
+    /// Texture du masque (créée et envoyée au GPU à la première utilisation de cette image).
+    fn mask_texture(&mut self, gl: &glow::Context, m: &MaskDraw) -> Option<glow::Texture> {
+        if let Some(t) = self.mask_textures.get(&m.key) {
+            return Some(*t);
+        }
+        unsafe {
+            let t = gl.create_texture().ok()?;
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::R8 as i32,
+                m.width as i32,
+                m.height as i32,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&m.data)),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            self.mask_textures.insert(m.key, t);
+            Some(t)
         }
     }
 
@@ -495,6 +597,14 @@ impl Renderer {
             }
             keep
         });
+        let masks: HashSet<u64> = p.layers.iter().filter_map(|l| l.mask.as_ref()).map(|m| m.key).collect();
+        self.mask_textures.retain(|key, t| {
+            let keep = masks.contains(key);
+            if !keep {
+                unsafe { gl.delete_texture(*t) };
+            }
+            keep
+        });
     }
 
     pub fn paint(&mut self, gl: &glow::Context, info: &egui::PaintCallbackInfo, p: &DrawParams) {
@@ -541,6 +651,8 @@ impl Renderer {
                 gl.draw_arrays(glow::TRIANGLES, 0, 6);
             }
 
+            gl.active_texture(glow::TEXTURE2);
+            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE0);
@@ -554,6 +666,7 @@ impl Renderer {
     unsafe fn paint_layer(&mut self, gl: &glow::Context, layer: &LayerDraw, time: f32) {
         let a = layer.a.as_ref().and_then(|s| self.upload(gl, s));
         let b = layer.b.as_ref().and_then(|s| self.upload(gl, s));
+        let mask = layer.mask.as_ref().and_then(|m| Some((m.invert, self.mask_texture(gl, m)?)));
         if a.is_none() && b.is_none() && !layer.grid {
             return;
         }
@@ -576,15 +689,16 @@ impl Renderer {
             i("u_has_b", b.is_some() as i32);
             // Tant que B n'a pas d'image on reste sur A ; sans A : fondu depuis le noir.
             f("u_mix", if b.is_some() { layer.mix } else { 0.0 });
-            match &layer.mask {
-                Some(m) if m.points.len() >= 3 => {
-                    let flat: Vec<f32> = m.points.iter().take(MAX_MASK_POINTS).flatten().copied().collect();
-                    gl.uniform_2_f32_slice(loc("u_mask").as_ref(), &flat);
-                    i("u_mask_n", (flat.len() / 2) as i32);
-                    i("u_mask_invert", m.invert as i32);
-                    f("u_mask_feather", m.feather);
+            match mask {
+                Some((invert, tex)) => {
+                    gl.active_texture(glow::TEXTURE2);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                    gl.active_texture(glow::TEXTURE0);
+                    i("u_mask_tex", 2);
+                    i("u_has_mask", 1);
+                    i("u_mask_invert", invert as i32);
                 }
-                _ => i("u_mask_n", 0),
+                None => i("u_has_mask", 0),
             }
             f("u_time", time);
             gl.uniform_2_f32(loc("u_tex_size").as_ref(), tex_size.0 as f32, tex_size.1 as f32);
@@ -615,6 +729,22 @@ impl Renderer {
             f("u_wave_freq", fx.wave_freq);
             f("u_wave_phase", layer.phases.wave);
             f("u_strobe", fx.strobe);
+            let ph = &layer.phases;
+            f("u_swirl", fx.swirl);
+            f("u_swirl_phase", ph.swirl);
+            f("u_polar", fx.polar.clamp(0.0, 1.0));
+            f("u_tunnel_phase", ph.tunnel);
+            f("u_tiles", fx.tiles.max(1.0));
+            f("u_liquid", fx.liquid);
+            f("u_liquid_scale", fx.liquid_scale);
+            f("u_liquid_phase", ph.liquid);
+            f("u_acid", fx.acid.clamp(0.0, 1.0));
+            f("u_acid_phase", ph.acid);
+            f("u_rainbow", fx.rainbow);
+            f("u_solarize", fx.solarize.clamp(0.0, 1.0));
+            f("u_pulse", fx.pulse);
+            f("u_pulse_phase", ph.pulse);
+            f("u_echo", fx.echo.clamp(0.0, 1.0));
 
             let (src, dst, eq) = match layer.blend {
                 BlendMode::Normal => (glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA, glow::FUNC_ADD),

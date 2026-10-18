@@ -2,9 +2,11 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod automix;
 mod cpu;
 mod effects;
 mod icons;
+mod mask;
 mod project;
 mod renderer;
 mod surface;

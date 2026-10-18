@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 pub type Point = [f32; 2];
 
 pub const MAX_GRID: usize = 8;
-pub const MAX_MASK_POINTS: usize = 64;
+/// Nombre total de points d'un masque (tous contours confondus).
+pub const MAX_MASK_POINTS: usize = 2000;
 
 // ------------------------------------------------------------------ homographie
 
@@ -282,7 +283,8 @@ impl MaskShape {
     }
 }
 
-/// Masque polygonal en coordonnées de sortie : seul l'intérieur du calque est visible.
+/// Masque en coordonnées de sortie : seul l'intérieur du calque est visible.
+/// Un ou plusieurs contours (formes séparées, trous), par exemple importés d'un SVG.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Mask {
@@ -290,7 +292,13 @@ pub struct Mask {
     pub invert: bool,
     /// Adoucissement des bords, en pixels de sortie.
     pub feather: f32,
+    /// Premier contour.
     pub points: Vec<Point>,
+    /// Contours supplémentaires.
+    pub rings: Vec<Vec<Point>>,
+    /// Règle de remplissage « non nul » (celle du SVG d'origine) ; sinon pair-impair :
+    /// un contour à l'intérieur d'un autre fait alors un trou.
+    pub nonzero: bool,
 }
 
 impl Default for Mask {
@@ -300,6 +308,8 @@ impl Default for Mask {
             invert: false,
             feather: 0.0,
             points: MaskShape::Rectangle.points(16.0 / 9.0),
+            rings: Vec::new(),
+            nonzero: false,
         }
     }
 }
@@ -310,10 +320,47 @@ impl Mask {
     }
 
     pub fn sanitize(&mut self) {
-        self.points.truncate(MAX_MASK_POINTS);
+        self.rings.retain(|r| r.len() >= 3);
         if self.points.len() < 3 {
             self.points = MaskShape::Rectangle.points(16.0 / 9.0);
         }
+    }
+
+    /// Remplace la forme (un seul contour).
+    pub fn set_shape(&mut self, points: Vec<Point>) {
+        self.points = points;
+        self.rings.clear();
+        self.nonzero = false;
+    }
+
+    /// Remplace la forme par plusieurs contours (le premier doit exister).
+    pub fn set_rings(&mut self, mut rings: Vec<Vec<Point>>, nonzero: bool) {
+        if rings.is_empty() {
+            return;
+        }
+        self.points = rings.remove(0);
+        self.rings = rings;
+        self.nonzero = nonzero;
+    }
+
+    pub fn ring_count(&self) -> usize {
+        1 + self.rings.len()
+    }
+
+    pub fn ring(&self, k: usize) -> &[Point] {
+        if k == 0 { &self.points } else { &self.rings[k - 1] }
+    }
+
+    pub fn ring_mut(&mut self, k: usize) -> &mut Vec<Point> {
+        if k == 0 { &mut self.points } else { &mut self.rings[k - 1] }
+    }
+
+    pub fn all_rings(&self) -> impl Iterator<Item = &[Point]> {
+        (0..self.ring_count()).map(|k| self.ring(k))
+    }
+
+    pub fn total_points(&self) -> usize {
+        self.all_rings().map(<[Point]>::len).sum()
     }
 }
 
@@ -446,62 +493,82 @@ pub fn edit_warp(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, salt: &str) {
 }
 
 /// Poignées du masque : glisser = déplacer, double-clic sur un bord = ajouter un point,
-/// clic droit sur un point = le supprimer.
+/// clic droit sur un point = le supprimer. Tous les contours sont éditables.
 pub fn edit_mask(ui: &mut egui::Ui, rect: Rect, mask: &mut Mask, salt: &str) {
     let base_id = ui.scope_id().with(("mask", salt));
-    let pts: Vec<Pos2> = mask.points.iter().map(|p| to_screen(rect, *p)).collect();
-    ui.painter().add(Shape::closed_line(pts.clone(), Stroke::new(1.5, MASK_COLOR)));
+    let screen: Vec<Vec<Pos2>> = mask.all_rings().map(|r| r.iter().map(|p| to_screen(rect, *p)).collect()).collect();
+    for ring in &screen {
+        ui.painter().add(Shape::closed_line(ring.clone(), Stroke::new(1.5, MASK_COLOR)));
+    }
+    let total = mask.total_points();
+    // Beaucoup de points (SVG importé) : poignées plus petites pour rester lisible.
+    let dense = total > 80;
 
     // Double-clic près d'un bord : insertion d'un point.
     let edge_hit = ui.interact(rect, base_id.with("edges"), Sense::click());
     if edge_hit.double_clicked()
-        && mask.points.len() < MAX_MASK_POINTS
+        && total < MAX_MASK_POINTS
         && let Some(pointer) = edge_hit.interact_pointer_pos()
     {
-        let mut best = (f32::MAX, 0, Pos2::ZERO);
-        for i in 0..pts.len() {
-            let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
-            let ab = b - a;
-            let t = ((pointer - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
-            let proj = a + ab * t;
-            let dist = proj.distance(pointer);
-            if dist < best.0 {
-                best = (dist, i, proj);
+        let mut best = (f32::MAX, 0, 0, Pos2::ZERO);
+        for (k, pts) in screen.iter().enumerate() {
+            for i in 0..pts.len() {
+                let (a, b) = (pts[i], pts[(i + 1) % pts.len()]);
+                let ab = b - a;
+                let t = ((pointer - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+                let proj = a + ab * t;
+                let dist = proj.distance(pointer);
+                if dist < best.0 {
+                    best = (dist, k, i, proj);
+                }
             }
         }
         if best.0 < 20.0 {
-            let p = best.2;
+            let p = best.3;
             let n = [(p.x - rect.min.x) / rect.width(), (p.y - rect.min.y) / rect.height()];
-            mask.points.insert(best.1 + 1, n);
+            mask.ring_mut(best.1).insert(best.2 + 1, n);
             return;
         }
     }
 
-    let n = mask.points.len() as f32;
-    let centroid = mask.points.iter().fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n]);
+    let n = total.max(1) as f32;
+    let centroid = mask
+        .all_rings()
+        .flatten()
+        .fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n]);
     let d = center_handle(ui, rect, base_id.with("center"), to_screen(rect, centroid), MASK_COLOR);
     if d != [0.0, 0.0] {
-        for p in &mut mask.points {
-            p[0] += d[0];
-            p[1] += d[1];
+        for k in 0..mask.ring_count() {
+            for p in mask.ring_mut(k) {
+                p[0] += d[0];
+                p[1] += d[1];
+            }
         }
     }
 
     let mut remove = None;
-    for i in 0..mask.points.len() {
-        let pos = to_screen(rect, mask.points[i]);
-        let (resp, d) = handle(ui, rect, base_id.with(i), pos, 16.0);
-        let resp = resp.on_hover_text("Glisser : déplacer · Clic droit : supprimer");
-        if resp.secondary_clicked() && mask.points.len() > 3 {
-            remove = Some(i);
+    for k in 0..mask.ring_count() {
+        let ring_len = mask.ring(k).len();
+        for i in 0..ring_len {
+            let pos = to_screen(rect, mask.ring(k)[i]);
+            let (resp, d) = handle(ui, rect, base_id.with((k, i)), pos, if dense { 10.0 } else { 16.0 });
+            let resp = resp.on_hover_text("Glisser : déplacer · Clic droit : supprimer");
+            if resp.secondary_clicked() && ring_len > 3 {
+                remove = Some((k, i));
+            }
+            let p = &mut mask.ring_mut(k)[i];
+            p[0] = (p[0] + d[0]).clamp(-0.5, 1.5);
+            p[1] = (p[1] + d[1]).clamp(-0.5, 1.5);
+            let active = resp.hovered() || resp.dragged();
+            if dense && !active {
+                ui.painter().circle_filled(pos, 2.5, MASK_COLOR);
+            } else {
+                draw_point(ui, pos, MASK_COLOR, active, false, None);
+            }
         }
-        let p = &mut mask.points[i];
-        p[0] = (p[0] + d[0]).clamp(-0.5, 1.5);
-        p[1] = (p[1] + d[1]).clamp(-0.5, 1.5);
-        draw_point(ui, pos, MASK_COLOR, resp.hovered() || resp.dragged(), false, None);
     }
-    if let Some(i) = remove {
-        mask.points.remove(i);
+    if let Some((k, i)) = remove {
+        mask.ring_mut(k).remove(i);
     }
 }
 
