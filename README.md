@@ -15,6 +15,15 @@ cargo run --release -- clip1.mp4 clip2.mov   # ajoute les vidéos et lance la pr
 cargo run --release -- spectacle.ozmap       # ouvre un projet
 ```
 
+## Application macOS
+
+```sh
+scripts/build-macos.sh              # Mac de cette architecture (Apple Silicon ici)
+scripts/build-macos.sh --universal  # Apple Silicon + Intel
+```
+
+Le script produit `dist/OZ Mapping.app` (avec son icône) et `dist/OZ-Mapping-<version>.dmg`. L'app reçoit une signature ad hoc, pas une signature Apple Developer : sur un autre Mac, il faut faire la première fois clic droit sur l'app puis « Ouvrir ». ffmpeg doit être installé sur la machine (`brew install ffmpeg`).
+
 ## Utilisation
 
 **Médias.** Bouton « + Ajouter… » ou glisser-déposer (mp4, mkv, mov, avi, webm…). Chaque média a une miniature.
