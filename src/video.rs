@@ -39,20 +39,41 @@ pub struct VideoInfo {
     pub duration: f64,
 }
 
-/// Trouve un exécutable ffmpeg/ffprobe, y compris quand l'app est lancée hors d'un shell
-/// (sur macOS le PATH ne contient alors pas Homebrew).
+/// Trouve un exécutable ffmpeg/ffprobe : d'abord à côté de l'app (version livrée avec elle),
+/// puis dans les dossiers d'installation courants, sinon dans le PATH.
+/// (Lancée depuis le Finder, l'app n'a pas Homebrew dans son PATH.)
 pub fn tool_path(name: &str) -> PathBuf {
-    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-        let p = Path::new(dir).join(name);
-        if p.exists() {
-            return p;
-        }
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(exe_dir) = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf)) {
+        dirs.push(exe_dir.join("ffmpeg").join("bin"));
+        dirs.push(exe_dir.join("ffmpeg"));
+        dirs.push(exe_dir);
     }
-    PathBuf::from(name)
+    if !cfg!(windows) {
+        dirs.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"].map(PathBuf::from));
+    }
+    dirs.into_iter()
+        .map(|d| d.join(&file))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from(file))
+}
+
+/// Commande pour ffmpeg/ffprobe. Sous Windows, sans ouvrir de fenêtre de console.
+pub fn tool_command(name: &str) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(tool_path(name));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 pub fn probe(path: &Path) -> Result<VideoInfo> {
-    let out = Command::new(tool_path("ffprobe"))
+    let out = tool_command("ffprobe")
         .args([
             "-v",
             "error",
@@ -237,7 +258,7 @@ impl Drop for VideoPlayer {
 }
 
 fn spawn_ffmpeg(path: &Path, start: f64, fps: f64, w: u32, h: u32) -> Result<Child> {
-    let mut cmd = Command::new(tool_path("ffmpeg"));
+    let mut cmd = tool_command("ffmpeg");
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-hwaccel", "auto"]);
     if start > 0.0 {
         cmd.args(["-ss", &format!("{start:.3}")]);
@@ -381,7 +402,7 @@ fn kill_child(shared: &Shared) {
 pub fn thumbnail(path: &Path, w: u32, h: u32) -> Result<Vec<u8>> {
     let info = probe(path)?;
     let at = info.duration * 0.1;
-    let out = Command::new(tool_path("ffmpeg"))
+    let out = tool_command("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-ss", &format!("{at:.3}")])
         .arg("-i")
         .arg(path)

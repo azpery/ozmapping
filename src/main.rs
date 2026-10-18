@@ -1,3 +1,6 @@
+// Sous Windows, pas de fenêtre de console derrière l'app (en build release).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod cpu;
 mod effects;

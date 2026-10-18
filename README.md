@@ -24,6 +24,10 @@ scripts/build-macos.sh --universal  # Apple Silicon + Intel
 
 Le script produit `dist/OZ Mapping.app` (avec son icône) et `dist/OZ-Mapping-<version>.dmg`. L'app reçoit une signature ad hoc, pas une signature Apple Developer : sur un autre Mac, il faut faire la première fois clic droit sur l'app puis « Ouvrir ». ffmpeg doit être installé sur la machine (`brew install ffmpeg`).
 
+## Windows
+
+Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Actions** > **Build** > **Run workflow**, ou en poussant un tag `v*`, qui publie aussi une release. Le fichier `OZ-Mapping-<version>-windows-x64.zip` contient `OZ Mapping.exe` et ffmpeg (dans `ffmpeg/bin`, build GPL de [BtbN](https://github.com/BtbN/FFmpeg-Builds)) : il suffit de dézipper et de lancer l'exe. Le même workflow produit le .dmg macOS universel.
+
 ## Utilisation
 
 **Médias.** Bouton « + Ajouter… » ou glisser-déposer (mp4, mkv, mov, avi, webm…). Chaque média a une miniature.
@@ -53,8 +57,8 @@ Le script produit `dist/OZ Mapping.app` (avec son icône) et `dist/OZ-Mapping-<v
 
 | Raccourci | Action |
 |-----------|--------|
-| Cmd+N / Cmd+O | Nouveau projet / ouvrir un projet |
-| Cmd+S / Maj+Cmd+S | Enregistrer / enregistrer sous |
+| Cmd+N / Cmd+O (Ctrl sous Windows) | Nouveau projet / ouvrir un projet |
+| Cmd+S / Maj+Cmd+S (Ctrl sous Windows) | Enregistrer / enregistrer sous |
 | Espace | Pause / lecture du calque sélectionné |
 | 1-9, ← → | Lancer un média sur le calque sélectionné |
 | Tab | Calque suivant |

@@ -23,6 +23,8 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "m4v", "mkv", "mov", "avi", "webm", "mpg", "mpeg", "wmv", "flv", "ts", "mts", "m2ts", "ogv", "gif", "hap",
 ];
 const MAX_LAYERS: usize = 8;
+/// Touche de commande affichée dans les libellés (les raccourcis utilisent Ctrl hors macOS).
+const CMD: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
 
 fn output_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("oz_output")
@@ -161,12 +163,16 @@ impl OzApp {
                 None
             }
         };
-        if std::process::Command::new(video::tool_path("ffmpeg"))
+        if video::tool_command("ffmpeg")
             .arg("-version")
             .output()
             .is_err()
         {
-            status = Some("ffmpeg introuvable : installez-le (brew install ffmpeg)".into());
+            status = Some(if cfg!(windows) {
+                "ffmpeg introuvable : placez ffmpeg.exe et ffprobe.exe à côté de l'app, ou installez ffmpeg (winget install ffmpeg)".into()
+            } else {
+                "ffmpeg introuvable : installez-le (brew install ffmpeg)".into()
+            });
         }
         theme::apply(&cc.egui_ctx);
 
@@ -222,7 +228,7 @@ impl OzApp {
         if let Some(proj) = args.iter().find(|p| is_project_file(p)) {
             app.load_project_file(ctx, proj);
         } else if let Some(first) = args.first() {
-            let first = std::fs::canonicalize(first).unwrap_or_else(|_| first.clone());
+            let first = std::path::absolute(first).unwrap_or_else(|_| first.clone());
             app.add_media(args);
             app.launch_on(ctx, app.sel(), &first);
         }
@@ -350,7 +356,9 @@ impl OzApp {
 
     fn add_media(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for p in paths {
-            let p = std::fs::canonicalize(&p).unwrap_or(p);
+            // `absolute` plutôt que `canonicalize` : sous Windows ce dernier produit des chemins
+            // « \\?\C:\… » que ffmpeg gère mal.
+            let p = std::path::absolute(&p).unwrap_or(p);
             if is_video_file(&p) && !self.project.media.contains(&p) {
                 self.project.media.push(p);
             }
@@ -738,20 +746,20 @@ impl OzApp {
             ui.label(egui::RichText::new("OZ Mapping").size(18.0).strong().color(TEXT));
             ui.add_space(6.0);
             ui.menu_button(with_icon(ic::FOLDER_OPEN, "Projet"), |ui| {
-                if ui.button(with_icon(ic::FILE_PLUS, "Nouveau          Cmd+N")).clicked() {
+                if ui.button(with_icon(ic::FILE_PLUS, &format!("Nouveau          {CMD}+N"))).clicked() {
                     ui.close();
                     self.new_project(&ctx);
                 }
-                if ui.button(with_icon(ic::FOLDER_OPEN, "Ouvrir…           Cmd+O")).clicked() {
+                if ui.button(with_icon(ic::FOLDER_OPEN, &format!("Ouvrir…           {CMD}+O"))).clicked() {
                     ui.close();
                     self.open_project(&ctx);
                 }
                 ui.separator();
-                if ui.button(with_icon(ic::FLOPPY_DISK, "Enregistrer       Cmd+S")).clicked() {
+                if ui.button(with_icon(ic::FLOPPY_DISK, &format!("Enregistrer       {CMD}+S"))).clicked() {
                     ui.close();
                     self.save(false);
                 }
-                if ui.button(with_icon(ic::FLOPPY_DISK, "Enregistrer sous…  Maj+Cmd+S")).clicked() {
+                if ui.button(with_icon(ic::FLOPPY_DISK, &format!("Enregistrer sous…  Maj+{CMD}+S"))).clicked() {
                     ui.close();
                     self.save(true);
                 }
@@ -1649,9 +1657,9 @@ impl eframe::App for OzApp {
                         ui.label(egui::RichText::new(with_icon(ic::PROHIBIT, s)).color(theme::DANGER));
                     } else {
                         ui.label(
-                            egui::RichText::new(
-                                "Espace pause  ·  0 sans effet  ·  E tout sans effets  ·  A auto  ·  B blackout  ·  M forme  ·  F plein écran  ·  Cmd+S enregistrer",
-                            )
+                            egui::RichText::new(format!(
+                                "Espace pause  ·  0 sans effet  ·  E tout sans effets  ·  A auto  ·  B blackout  ·  M forme  ·  F plein écran  ·  {CMD}+S enregistrer"
+                            ))
                             .small()
                             .color(TEXT_WEAK),
                         );

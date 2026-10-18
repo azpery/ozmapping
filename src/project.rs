@@ -125,10 +125,13 @@ fn resolve(p: &Path, base: &Path) -> PathBuf {
 }
 
 /// Chemin relatif si le média est dans le dossier du projet (ou un sous-dossier).
+/// Toujours avec des « / », compris par macOS comme par Windows : un projet reste
+/// utilisable d'un système à l'autre.
 fn relative_to(p: &Path, base: &Path) -> PathBuf {
     match p.strip_prefix(base) {
         Ok(rel) if !base.as_os_str().is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_))) => {
-            rel.to_path_buf()
+            let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            PathBuf::from(parts.join("/"))
         }
         _ => p.to_path_buf(),
     }
@@ -143,8 +146,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ozmap-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("show.ozmap");
-        let inside = dir.join("clips/a.mp4");
-        let outside = PathBuf::from("/elsewhere/b.mov");
+        let inside = dir.join("clips").join("a.mp4");
+        let outside = std::env::temp_dir().join("ailleurs").join("b.mov");
 
         let mut p = Project::default();
         p.media = vec![inside.clone(), outside.clone()];
@@ -153,11 +156,14 @@ mod tests {
 
         let raw = std::fs::read_to_string(&file).unwrap();
         assert!(raw.contains("\"clips/a.mp4\""), "{raw}");
-        assert!(raw.contains("/elsewhere/b.mov"));
+        assert!(!raw.contains("\"b.mov\""), "le média hors du dossier doit rester absolu : {raw}");
 
         let loaded = Project::load(&file).unwrap();
-        assert_eq!(loaded.media, vec![inside.clone(), outside]);
-        assert_eq!(loaded.layers[0].clip, Some(inside));
+        // Comparaison composant par composant (sous Windows, « / » et « \\ » sont équivalents).
+        let same = |a: &Path, b: &Path| a.components().eq(b.components());
+        assert!(same(&loaded.media[0], &inside), "{:?}", loaded.media[0]);
+        assert!(same(&loaded.media[1], &outside));
+        assert!(same(loaded.layers[0].clip.as_deref().unwrap(), &inside));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
