@@ -1,0 +1,62 @@
+//! Icônes Phosphor (https://phosphoricons.com, licence MIT : assets/Phosphor-LICENSE-MIT.txt).
+//! Seules les icônes utilisées par l'app sont listées ; la police complète est dans assets/Phosphor.ttf.
+
+#![allow(dead_code)]
+
+pub const PLAY: &str = "\u{E3D0}";
+pub const PAUSE: &str = "\u{E39E}";
+pub const STOP: &str = "\u{E46C}";
+pub const FOLDER_OPEN: &str = "\u{E256}";
+pub const FLOPPY_DISK: &str = "\u{E248}";
+pub const FILE_PLUS: &str = "\u{E236}";
+pub const PLUS: &str = "\u{E3D4}";
+pub const X: &str = "\u{E4F6}";
+pub const MONITOR: &str = "\u{E32E}";
+pub const CORNERS_OUT: &str = "\u{E1D0}";
+pub const MOON: &str = "\u{E330}";
+pub const GRID_FOUR: &str = "\u{E296}";
+pub const POLYGON: &str = "\u{E6D0}";
+pub const SLIDERS_HORIZONTAL: &str = "\u{E434}";
+pub const SHUFFLE: &str = "\u{E422}";
+pub const SKIP_FORWARD: &str = "\u{E5A6}";
+pub const MAGIC_WAND: &str = "\u{E6B6}";
+pub const STACK: &str = "\u{E466}";
+pub const EYE: &str = "\u{E220}";
+pub const EYE_SLASH: &str = "\u{E224}";
+pub const CARET_UP: &str = "\u{E13C}";
+pub const CARET_DOWN: &str = "\u{E136}";
+pub const TRASH: &str = "\u{E4A6}";
+pub const FILM_STRIP: &str = "\u{E792}";
+pub const FILM_SLATE: &str = "\u{E8C2}";
+pub const PALETTE: &str = "\u{E6C8}";
+pub const SPARKLE: &str = "\u{E6A2}";
+pub const CPU: &str = "\u{E610}";
+pub const ARROW_COUNTER_CLOCKWISE: &str = "\u{E038}";
+pub const PROHIBIT: &str = "\u{E3DE}";
+pub const LIGHTNING: &str = "\u{E2DE}";
+pub const WAVES: &str = "\u{E6DE}";
+pub const SHAPES: &str = "\u{EC5E}";
+pub const CIRCLE: &str = "\u{E18A}";
+pub const BOOKMARK_SIMPLE: &str = "\u{E0EA}";
+pub const ARROW_RIGHT: &str = "\u{E06C}";
+pub const VIDEO: &str = "\u{E740}";
+pub const PAPER_PLANE_RIGHT: &str = "\u{E396}";
+pub const CROSSHAIR: &str = "\u{E1D6}";
+pub const SPEEDOMETER: &str = "\u{EE74}";
+pub const REPEAT: &str = "\u{E3F6}";
+pub const FRAME_CORNERS: &str = "\u{E626}";
+pub const IMAGE: &str = "\u{E2CA}";
+pub const STAR: &str = "\u{E46A}";
+pub const TIMER: &str = "\u{E492}";
+pub const LIST: &str = "\u{E2F0}";
+pub const DOTS_THREE_OUTLINE_VERTICAL: &str = "\u{E206}";
+pub const PENCIL_SIMPLE: &str = "\u{E3B4}";
+pub const ARROWS_OUT_CARDINAL: &str = "\u{E0A4}";
+pub const SUN: &str = "\u{E472}";
+pub const DROP: &str = "\u{E210}";
+pub const SQUARES_FOUR: &str = "\u{E464}";
+pub const ARROWS_CLOCKWISE: &str = "\u{E094}";
+pub const MAGNIFYING_GLASS: &str = "\u{E30C}";
+pub const CHART_BAR: &str = "\u{E150}";
+pub const PROJECTOR_SCREEN: &str = "\u{E658}";
+pub const FILE: &str = "\u{E230}";
