@@ -4,7 +4,9 @@
 mod app;
 mod automix;
 mod cpu;
+mod cutout;
 mod effects;
+mod generator;
 mod icons;
 mod mask;
 mod project;

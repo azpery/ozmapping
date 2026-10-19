@@ -11,12 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::automix::{self, AutoMix};
 use crate::cpu::{self, CpuStats};
-use crate::effects::{self, AutoTheme, BlendMode, Effects, Mirror, Preset};
+use crate::cutout::{self, Cutout};
+use crate::effects::{self, AutoTheme, BlendMode, Effects, Mirror, Preset, Shatter};
+use crate::generator::{Palette, Pattern};
 use crate::icons as ic;
 use crate::project::{self, LayerConfig, Project};
 use crate::rhythm::{self, Rhythm};
 use crate::screens;
-use crate::renderer::{self, DrawParams, LayerDraw, MaskDraw, Phases, Renderer, SourceRef};
+use crate::renderer::{self, DrawParams, GenDraw, LayerDraw, MaskDraw, Phases, Renderer, ShapeDraw, SourceRef};
 use crate::surface::{self, ACCENT, MAX_GRID, Mask, MaskShape, Warp};
 use crate::theme::{self, BG, CARD, TEXT, TEXT_WEAK, WARN, with_icon};
 use crate::thumbs::Thumbnails;
@@ -46,6 +48,20 @@ struct Session {
     bpm: Option<f32>,
 }
 
+/// Détourage d'une photo en cours (fenêtre « Masque depuis une photo »).
+struct CutoutEditor {
+    cut: Cutout,
+    name: String,
+    tex: Option<egui::TextureHandle>,
+    dirty: bool,
+    /// Début du cadre en cours de tracé (pixels de l'image de travail).
+    drag_from: Option<egui::Pos2>,
+    /// Coin de l'image projetée en cours de déplacement.
+    drag_corner: Option<usize>,
+    /// La sortie affiche un écran blanc (pour photographier l'image projetée).
+    white: bool,
+}
+
 /// Déplacement de la fenêtre de sortie vers un autre écran, en plusieurs temps
 /// (sortir du plein écran, déplacer, repasser en plein écran).
 struct OutputMove {
@@ -63,6 +79,7 @@ enum EditTarget {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RightTab {
     Effects,
+    Visuals,
     Shape,
     Mix,
     Rhythm,
@@ -101,7 +118,26 @@ struct LayerRuntime {
     mesh: Option<(Warp, Arc<Vec<f32>>)>,
     /// Dernière image du masque, avec ce qui a servi à la calculer.
     mask_raster: Option<(Mask, (u32, u32), u32, MaskDraw)>,
+    /// Dernier champ de forme du masque (animations de forme), avec la forme qui l'a produit.
+    shape_field: Option<(Mask, (u32, u32), ShapeDraw)>,
+    /// Générateur : temps d'animation et rotation de la palette (intégrés image par image).
+    gen_time: f32,
+    gen_hue: f32,
+    /// Motif affiché, motif d'où part le fondu en cours, avancement du fondu (1 = fini).
+    gen_shown: (Pattern, Palette),
+    gen_from: (Pattern, Palette),
+    gen_fade: f32,
+    gen_fade_secs: f32,
+    /// Durée imposée au prochain fondu (mode auto) ; sinon fondu court d'un changement manuel.
+    gen_next_secs: Option<f32>,
+    /// Temps écoulé depuis le dernier changement automatique de motif.
+    gen_timer: f32,
+    /// Destruction déclenchée à la main (« Casser ! ») : avancement du cycle (0..1).
+    shatter_shot: Option<f32>,
 }
+
+/// Durée d'une destruction déclenchée à la main (cassure, pause, reconstruction).
+const SHATTER_SHOT_SECS: f32 = 5.0;
 
 impl LayerRuntime {
     /// Le clip principal (celui qui arrive s'il y a un fondu).
@@ -139,6 +175,28 @@ impl LayerRuntime {
         };
         self.mask_raster = Some((mask.clone(), size, feather_key, draw.clone()));
         draw
+    }
+
+    /// Champ de forme du masque, recalculé seulement si les contours ou la taille changent.
+    fn shape(&mut self, mask: &Mask, size: (u32, u32), feather: f32) -> ShapeDraw {
+        // Seuls les contours comptent (l'inversion et l'adoucissement sont appliqués au rendu).
+        let outline = Mask { enabled: true, invert: false, feather: 0.0, ..mask.clone() };
+        let draw = match &self.shape_field {
+            Some((m, s, draw)) if *m == outline && *s == size => draw.clone(),
+            _ => {
+                static NEXT_SHAPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let draw = ShapeDraw {
+                    key: NEXT_SHAPE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    width: size.0,
+                    height: size.1,
+                    data: Arc::new(crate::mask::shape_field(&outline, size.0, size.1)),
+                    feather: 0.0,
+                };
+                self.shape_field = Some((outline, size, draw.clone()));
+                draw
+            }
+        };
+        ShapeDraw { feather, ..draw }
     }
 
     fn mesh(&mut self, warp: &Warp) -> Arc<Vec<f32>> {
@@ -185,9 +243,12 @@ pub struct OzApp {
     screens: Vec<screens::Screen>,
     screens_at: f64,
     rhythm: Rhythm,
+    cutout: Option<CutoutEditor>,
 
     blackout: bool,
     blackout_level: f32,
+    /// Sortie en blanc plein (pour photographier l'image projetée, régler le projecteur).
+    white_screen: bool,
     grid: bool,
     /// Contournement global : affiche les vidéos sans effets, sans perdre les réglages.
     bypass_fx: bool,
@@ -252,8 +313,10 @@ impl OzApp {
             screens: screens::list(),
             screens_at: 0.0,
             rhythm: Rhythm::default(),
+            cutout: None,
             blackout: false,
             blackout_level: 0.0,
+            white_screen: false,
             grid: false,
             bypass_fx: false,
             edit_mapping: false,
@@ -642,11 +705,20 @@ impl OzApp {
         // Immédiat et complet : effets neutres et animations (rotation, teinte…) remises à zéro,
         // pour retrouver tout de suite l'image d'origine, dans le bon sens.
         self.apply_preset_to(i, None, Effects::default(), 0.0);
-        self.layers[i].phases = Phases::default();
+        let shape = self.layers[i].phases;
+        self.layers[i].phases = Phases {
+            shape_ripple: shape.shape_ripple,
+            shape_trace: shape.shape_trace,
+            shape_breathe: shape.shape_breathe,
+            shatter: shape.shatter,
+            ..Phases::default()
+        };
         self.layers[i].auto_timer = 0.0;
     }
 
+    /// Applique des effets au calque `i`, sans toucher à ses animations de forme du masque.
     fn apply_preset_to(&mut self, i: usize, name: Option<String>, fx: Effects, secs: f32) {
+        let fx = fx.with_shape_of(&self.project.layers[i].effects);
         self.layers[i].preset = name;
         if secs <= 0.01 {
             self.project.layers[i].effects = fx;
@@ -671,6 +743,24 @@ impl OzApp {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
+    }
+
+    /// Générateur : passe le calque `i` sur un autre motif (et souvent une autre palette) au hasard.
+    fn generator_next(&mut self, i: usize) {
+        let g = self.project.layers[i].generator;
+        let patterns: Vec<Pattern> = Pattern::ALL.into_iter().filter(|p| *p != Pattern::Off && *p != g.pattern).collect();
+        let pattern = patterns[(self.next_random() % patterns.len() as u64) as usize];
+        let palette = if self.next_random() % 10 < 7 {
+            Palette::ALL[(self.next_random() % Palette::ALL.len() as u64) as usize]
+        } else {
+            g.palette
+        };
+        let cfg = &mut self.project.layers[i].generator;
+        cfg.pattern = pattern;
+        cfg.palette = palette;
+        let rt = &mut self.layers[i];
+        rt.gen_timer = 0.0;
+        rt.gen_next_secs = Some(g.transition);
     }
 
     /// Mode Auto : passe le calque `i` sur un effet tiré au hasard.
@@ -719,17 +809,47 @@ impl OzApp {
             }
             if let Some(anim) = &mut rt.fx_anim {
                 anim.t += dt / anim.secs.max(0.01);
-                cfg.effects = Effects::lerp(&anim.from, &anim.to, anim.t);
+                // Les animations de forme restent celles du calque (réglables pendant la transition).
+                cfg.effects = Effects::lerp(&anim.from, &anim.to, anim.t).with_shape_of(&cfg.effects);
                 if anim.t >= 1.0 {
-                    cfg.effects = anim.to;
+                    cfg.effects = anim.to.with_shape_of(&cfg.effects);
                     rt.fx_anim = None;
                 }
             }
             rt.phases.advance(&cfg.effects, dt);
+
+            // Générateur : animation, puis fondu si le motif ou la palette viennent de changer.
+            let g = &cfg.generator;
+            rt.gen_time = (rt.gen_time + g.speed * dt).rem_euclid(10_000.0);
+            rt.gen_hue = (rt.gen_hue + g.color_speed * dt).rem_euclid(1.0);
+            if (g.pattern, g.palette) != rt.gen_shown {
+                rt.gen_from = rt.gen_shown;
+                rt.gen_shown = (g.pattern, g.palette);
+                rt.gen_fade = 0.0;
+                rt.gen_fade_secs = rt.gen_next_secs.take().unwrap_or(0.8);
+            }
+            rt.gen_fade = if rt.gen_fade_secs <= 0.01 { 1.0 } else { (rt.gen_fade + dt / rt.gen_fade_secs).min(1.0) };
+            if g.auto && g.is_active() {
+                rt.gen_timer += dt;
+            }
+            if let Some(t) = &mut rt.shatter_shot {
+                *t += dt / SHATTER_SHOT_SECS;
+                if *t >= 1.0 {
+                    rt.shatter_shot = None;
+                }
+            }
+
             for p in rt.players() {
                 if let Some(e) = p.error() {
                     self.status = Some(format!("{} : {e}", file_name(&p.path)));
                 }
+            }
+        }
+
+        for i in 0..self.layers.len() {
+            let g = self.project.layers[i].generator;
+            if g.auto && g.is_active() && self.layers[i].gen_timer >= g.interval.max(1.0) {
+                self.generator_next(i);
             }
         }
 
@@ -842,10 +962,20 @@ impl OzApp {
         let to_mask_px = mask_size.0 as f32 / self.output_size.x.max(1.0);
         let rhythm_on = self.rhythm.active();
         let pulse = self.rhythm.pulse;
+        // Champ de forme : moitié de la définition du masque (il varie en douceur).
+        let shape_size = (mask_size.0 / 2, mask_size.1 / 2);
         for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
             if !cfg.visible || cfg.opacity <= 0.0 {
                 continue;
             }
+            let effects = if self.bypass_fx {
+                Effects::default()
+            } else if cfg.react.enabled && rhythm_on {
+                cfg.react.apply(&cfg.effects, &pulse, &rt.beat)
+            } else {
+                cfg.effects
+            };
+            let feather = cfg.mask.feather / self.output_size.y.max(1.0) / 2.0;
             layers.push(LayerDraw {
                 a: rt.current.as_ref().map(source),
                 b: rt.next.as_ref().map(source),
@@ -855,13 +985,28 @@ impl OzApp {
                     .mask
                     .is_active()
                     .then(|| rt.mask(&cfg.mask, mask_size, cfg.mask.feather * to_mask_px)),
-                effects: if self.bypass_fx {
-                    Effects::default()
-                } else if cfg.react.enabled && rhythm_on {
-                    cfg.react.apply(&cfg.effects, &pulse, &rt.beat)
-                } else {
-                    cfg.effects
+                shape: (cfg.mask.is_active() && effects.uses_shape())
+                    .then(|| rt.shape(&cfg.mask, shape_size, feather)),
+                generator: GenDraw {
+                    from: rt.gen_from.0,
+                    from_palette: rt.gen_from.1,
+                    to: rt.gen_shown.0,
+                    to_palette: rt.gen_shown.1,
+                    fade: rt.gen_fade,
+                    mix: cfg.generator.mix,
+                    time: rt.gen_time,
+                    hue: cfg.generator.hue + rt.gen_hue,
+                    scale: cfg.generator.scale,
+                    detail: cfg.generator.detail,
+                    aspect,
                 },
+                // Destruction : réglage manuel, boucle ou « Casser ! », le plus avancé des trois.
+                shatter: effects
+                    .shatter_amount
+                    .max(Effects::shatter_cycle(rt.phases.shatter))
+                    .max(rt.shatter_shot.map_or(0.0, Effects::shatter_cycle)),
+                shatter_center: if cfg.mask.is_active() { cfg.mask.centroid() } else { [0.5, 0.5] },
+                effects,
                 opacity: cfg.opacity,
                 blend: cfg.blend,
                 grid: self.grid,
@@ -872,6 +1017,7 @@ impl OzApp {
             layers,
             time: self.start.elapsed().as_secs_f32(),
             master: self.project.master * (1.0 - self.blackout_level),
+            white: self.white_screen || self.cutout.as_ref().is_some_and(|ed| ed.white),
         }
     }
 
@@ -902,6 +1048,9 @@ impl OzApp {
         }
         if pressed(Key::B) {
             self.blackout = !self.blackout;
+        }
+        if pressed(Key::W) {
+            self.white_screen = !self.white_screen;
         }
         if pressed(Key::G) {
             self.grid = !self.grid;
@@ -998,6 +1147,159 @@ impl OzApp {
     }
 
     /// Onglet Rythme : source (son ou tempo) et réaction du calque sélectionné.
+    fn generator_ui(&mut self, ui: &mut egui::Ui) {
+        let sel = self.sel();
+        let has_video = self.layers[sel].active().is_some();
+        let timer = self.layers[sel].gen_timer;
+        let mut next = false;
+        let g = &mut self.project.layers[sel].generator;
+        let d = crate::generator::Generator::default();
+        ui.label(
+            egui::RichText::new(
+                "Visuels psychédéliques générés en direct, sans vidéo. Les effets, le masque et la déformation \
+                 s'appliquent dessus comme sur une vidéo : essayez-les avec le kaléidoscope ou le tourbillon.",
+            )
+            .small()
+            .color(TEXT_WEAK),
+        );
+        egui::CollapsingHeader::new(with_icon(ic::SPIRAL, "Motif")).default_open(true).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for p in Pattern::ALL {
+                    let resp = ui.selectable_label(g.pattern == p, p.label()).on_hover_text(p.description());
+                    if resp.clicked() {
+                        g.pattern = p;
+                    }
+                }
+            });
+        });
+        egui::CollapsingHeader::new(with_icon(ic::PALETTE, "Couleurs")).default_open(true).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for p in Palette::ALL {
+                    if ui.selectable_label(g.palette == p, p.label()).clicked() {
+                        g.palette = p;
+                    }
+                }
+            });
+            fx_slider(ui, "Décalage des couleurs", &mut g.hue, 0.0..=1.0, d.hue);
+            fx_slider(ui, "Rotation des couleurs /s", &mut g.color_speed, -1.0..=1.0, d.color_speed);
+        });
+        egui::CollapsingHeader::new(with_icon(ic::SLIDERS_HORIZONTAL, "Réglages")).default_open(true).show(ui, |ui| {
+            fx_slider(ui, "Vitesse", &mut g.speed, -3.0..=3.0, d.speed);
+            fx_slider(ui, "Taille du motif", &mut g.scale, 0.2..=5.0, d.scale);
+            fx_slider(ui, "Détail", &mut g.detail, 0.0..=1.0, d.detail);
+            ui.add_enabled_ui(has_video, |ui| {
+                fx_slider(ui, "Mélange avec la vidéo", &mut g.mix, 0.0..=1.0, d.mix);
+            })
+            .response
+            .on_disabled_hover_text("Sans vidéo sur ce calque, le visuel est affiché entier");
+        });
+        egui::CollapsingHeader::new(with_icon(ic::SHUFFLE, "Enchaînement")).default_open(true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut g.auto, "Changer de motif automatiquement");
+                if ui
+                    .button(with_icon(ic::DICE_FIVE, "Au hasard"))
+                    .on_hover_text("Passer tout de suite à un autre motif et une autre palette")
+                    .clicked()
+                {
+                    next = true;
+                }
+            });
+            ui.add(egui::Slider::new(&mut g.interval, 2.0..=120.0).text("Durée d'un motif").suffix(" s"));
+            ui.add(egui::Slider::new(&mut g.transition, 0.0..=10.0).text("Fondu").suffix(" s"));
+            if g.auto && g.is_active() {
+                ui.add(egui::ProgressBar::new((timer / g.interval.max(1.0)).clamp(0.0, 1.0)).desired_height(4.0));
+            }
+        });
+        if next {
+            self.generator_next(sel);
+        }
+        self.shape_fx_ui(ui);
+    }
+
+    /// Animations qui suivent le contour du masque (réglages d'effets du calque).
+    fn shape_fx_ui(&mut self, ui: &mut egui::Ui) {
+        let i = self.sel();
+        let has_mask = self.project.layers[i].mask.is_active();
+        let fx = &mut self.project.layers[i].effects;
+        let d = Effects::default();
+        egui::CollapsingHeader::new(with_icon(ic::SHAPES, "Sur la forme du masque")).default_open(true).show(ui, |ui| {
+            if !has_mask {
+                ui.label(
+                    egui::RichText::new(
+                        "Ces animations suivent le contour du masque : activez un masque (onglet Forme) pour les voir.",
+                    )
+                    .small()
+                    .color(TEXT_WEAK),
+                );
+            }
+            ui.label(egui::RichText::new("Lumières").strong().color(TEXT));
+            ui.horizontal(|ui| {
+                let mut color = fx.shape_color;
+                if ui.color_edit_button_rgb(&mut color).on_hover_text("Couleur des lumières").changed() {
+                    fx.shape_color = color;
+                }
+                fx_slider(ui, "Arc-en-ciel", &mut fx.shape_rainbow, 0.0..=1.0, d.shape_rainbow);
+            });
+            fx_slider(ui, "Néon contour", &mut fx.shape_glow, 0.0..=2.0, d.shape_glow);
+            fx_slider(ui, "Largeur néon", &mut fx.shape_width, 0.001..=0.05, d.shape_width);
+            fx_slider(ui, "Lueur intérieure", &mut fx.shape_inner, 0.0..=1.5, d.shape_inner);
+
+            ui.label(egui::RichText::new("Le long du contour").strong().color(TEXT));
+            fx_slider(ui, "Comètes", &mut fx.shape_trace, 0.0..=2.0, d.shape_trace);
+            fx_slider(ui, "Nombre de comètes", &mut fx.shape_trace_count, 1.0..=12.0, d.shape_trace_count);
+            fx_slider(ui, "Pointillés", &mut fx.shape_dashes, 0.0..=2.0, d.shape_dashes);
+            fx_slider(ui, "Nombre de pointillés", &mut fx.shape_dash_count, 4.0..=120.0, d.shape_dash_count);
+            fx_slider(ui, "Vitesse tours/s", &mut fx.shape_trace_speed, -1.0..=1.0, d.shape_trace_speed);
+
+            ui.label(egui::RichText::new("Ondes").strong().color(TEXT));
+            fx_slider(ui, "Lignes concentriques", &mut fx.shape_ripple, 0.0..=1.0, d.shape_ripple);
+            fx_slider(ui, "Échos extérieurs", &mut fx.shape_echo, 0.0..=1.5, d.shape_echo);
+            fx_slider(ui, "Onde de forme", &mut fx.shape_wave, 0.0..=0.05, d.shape_wave);
+            fx_slider(ui, "Densité des lignes", &mut fx.shape_ripple_freq, 2.0..=60.0, d.shape_ripple_freq);
+            fx_slider(ui, "Vitesse lignes /s", &mut fx.shape_ripple_speed, -3.0..=3.0, d.shape_ripple_speed);
+
+            ui.label(egui::RichText::new("Mouvement").strong().color(TEXT));
+            fx_slider(ui, "Respiration", &mut fx.shape_breathe, -0.15..=0.15, d.shape_breathe);
+            fx_slider(ui, "Fréquence respiration Hz", &mut fx.shape_breathe_rate, 0.05..=4.0, d.shape_breathe_rate);
+        });
+        let mut shot = false;
+        egui::CollapsingHeader::new(with_icon(ic::LIGHTNING, "Destruction")).default_open(true).show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(
+                    "La forme se casse depuis le centre du masque (ou du calque, sans masque) et laisse voir \
+                     les calques du dessous, puis se reconstruit. Les fissures prennent la couleur des lumières.",
+                )
+                .small()
+                .color(TEXT_WEAK),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for st in Shatter::ALL {
+                    if ui.selectable_label(fx.shatter == st, st.label()).on_hover_text(st.description()).clicked() {
+                        fx.shatter = st;
+                    }
+                }
+            });
+            ui.add_enabled_ui(fx.shatter != Shatter::Off, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(with_icon(ic::LIGHTNING, "Casser !"))
+                        .on_hover_text("Casse la forme une fois, puis la reconstruit (5 s)")
+                        .clicked()
+                    {
+                        shot = true;
+                    }
+                });
+                fx_slider(ui, "Avancement", &mut fx.shatter_amount, 0.0..=1.0, d.shatter_amount);
+                fx_slider(ui, "Boucle cycles/s", &mut fx.shatter_speed, 0.0..=1.0, d.shatter_speed);
+                fx_slider(ui, "Morceaux par hauteur", &mut fx.shatter_size, 3.0..=40.0, d.shatter_size);
+                fx_slider(ui, "Lueur des fissures", &mut fx.shatter_glow, 0.0..=2.0, d.shatter_glow);
+            });
+        });
+        if shot {
+            self.layers[i].shatter_shot = Some(0.0);
+        }
+    }
+
     fn rhythm_ui(&mut self, ui: &mut egui::Ui) {
         theme::section(ui, ic::WAVES, "Source du rythme");
         let current = match &self.rhythm.source {
@@ -1261,6 +1563,12 @@ impl OzApp {
                 .on_hover_text("Fondu au noir (B)");
             if self.blackout {
                 bo.highlight();
+            }
+            let white = ui
+                .toggle_value(&mut self.white_screen, with_icon(ic::SUN, "Blanc"))
+                .on_hover_text("Projeter un écran blanc (W) : pour photographier l'image projetée ou régler le projecteur");
+            if self.white_screen {
+                white.highlight();
             }
             let bypass = ui
                 .toggle_value(&mut self.bypass_fx, with_icon(ic::PROHIBIT, "Sans effets"))
@@ -1784,6 +2092,7 @@ impl OzApp {
         ui.horizontal(|ui| {
             for (tab, icon, name) in [
                 (RightTab::Effects, ic::SPARKLE, "Effets"),
+                (RightTab::Visuals, ic::SUN, "Visuels"),
                 (RightTab::Shape, ic::POLYGON, "Forme"),
                 (RightTab::Mix, ic::FILM_REEL, "Mix"),
                 (RightTab::Rhythm, ic::WAVES, "Rythme"),
@@ -1804,6 +2113,7 @@ impl OzApp {
             .auto_shrink([false, false])
             .show(ui, |ui| match self.right_tab {
                 RightTab::Effects => self.effects_ui(ui),
+                RightTab::Visuals => self.generator_ui(ui),
                 RightTab::Shape => self.shape_ui(ui),
                 RightTab::Mix => self.mix_ui(ui),
                 RightTab::Rhythm => self.rhythm_ui(ui),
@@ -1897,7 +2207,7 @@ impl OzApp {
         // Surligné : le preset appliqué en dernier sur ce calque, sinon celui qui correspond aux réglages.
         let is_active = |p: &Preset| match &active {
             Some(name) => *name == p.name,
-            None => p.effects == current,
+            None => p.effects.with_shape_of(&current) == current,
         };
         let mut apply: Option<(Option<String>, Effects)> = None;
         let mut auto_next = false;
@@ -2065,11 +2375,11 @@ impl OzApp {
                     import_shape = rfd::FileDialog::new().add_filter("Image SVG", &["svg"]).pick_file();
                 }
                 if ui
-                    .button(with_icon(ic::IMAGE, "Depuis une image…"))
+                    .button(with_icon(ic::IMAGE, "Depuis une photo…"))
                     .on_hover_text(
-                        "Détoure une image (PNG, JPG…) : la transparence, ou ce qui se détache du fond, devient le masque. \
-                         L'image est ajustée à la sortie : une photo du support projeté s'y superpose. \
-                         Glisser-déposer une image marche aussi.",
+                        "Détoure automatiquement le sujet d'une photo (ou d'une image PNG, JPG, HEIC…) pour en faire le masque, \
+                         avec retouches à la baguette magique. La photo est ajustée à la sortie : prise depuis le \
+                         projecteur, le masque tombe pile sur le support. Glisser-déposer une image marche aussi.",
                     )
                     .clicked()
                 {
@@ -2231,12 +2541,18 @@ impl OzApp {
     /// Importe un SVG, ou la forme détourée d'une image, comme masque du calque sélectionné.
     fn import_mask(&mut self, path: &Path) {
         let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
-        let imported = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
-            crate::mask::import_svg(path, aspect)
-        } else {
-            crate::mask::import_image(path, aspect)
-        };
-        match imported {
+        if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
+            // Photo ou image : détourage automatique, à vérifier et retoucher avant d'appliquer.
+            match Cutout::open(path) {
+                Ok(cut) => {
+                    self.cutout = Some(CutoutEditor { cut, name: file_name(path), tex: None, dirty: true, drag_from: None, drag_corner: None, white: false });
+                    self.status = None;
+                }
+                Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
+            }
+            return;
+        }
+        match crate::mask::import_svg(path, aspect) {
             Ok((rings, nonzero)) => {
                 let sel = self.sel();
                 let mask = &mut self.project.layers[sel].mask;
@@ -2247,6 +2563,243 @@ impl OzApp {
                 self.status = None;
             }
             Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
+        }
+    }
+
+    /// Applique un masque (contours en coordonnées de sortie) au calque sélectionné.
+    fn apply_mask_rings(&mut self, rings: Vec<Vec<surface::Point>>, nonzero: bool) {
+        let sel = self.sel();
+        let mask = &mut self.project.layers[sel].mask;
+        mask.set_rings(rings, nonzero);
+        mask.enabled = true;
+        self.edit_target = EditTarget::Mask;
+        self.right_tab = RightTab::Shape;
+    }
+
+    /// Fenêtre de détourage d'une photo.
+    fn cutout_window(&mut self, ctx: &egui::Context) {
+        let Some(ed) = &mut self.cutout else { return };
+        if ed.dirty {
+            ed.dirty = false;
+            let a = ACCENT;
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [ed.cut.width, ed.cut.height],
+                &ed.cut.preview([a.r(), a.g(), a.b()]),
+            );
+            match &mut ed.tex {
+                Some(t) => t.set(image, egui::TextureOptions::LINEAR),
+                None => ed.tex = Some(ctx.load_texture("cutout", image, egui::TextureOptions::LINEAR)),
+            }
+        }
+        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let mut close = false;
+        let mut apply = None;
+        egui::Modal::new(egui::Id::unique("cutout")).show(ctx, |ui| {
+            let ed = self.cutout.as_mut().unwrap();
+            ui.set_max_width(820.0);
+            theme::section(ui, ic::IMAGE, &format!("Masque depuis une photo · {}", ed.name));
+            ui.label(
+                egui::RichText::new(
+                    "Le sujet détecté est en clair, le fond assombri. Glisser : encadrer l'objet voulu (Maj : un cadre de plus) · \
+                     clic : ajouter une zone · clic droit (ou Alt+clic) : la retirer.",
+                )
+                .small()
+                .color(TEXT_WEAK),
+            );
+            if let Some(tex) = &ed.tex {
+                let (w, h) = (ed.cut.width as f32, ed.cut.height as f32);
+                let scale = (800.0 / w).min(480.0 / h);
+                let size = Vec2::new(w * scale, h * scale);
+                let resp = ui.add(egui::Image::new((tex.id(), size)).sense(Sense::click_and_drag()));
+                let resp = resp.on_hover_cursor(egui::CursorIcon::Crosshair);
+                let to_px = |pos: egui::Pos2| ((pos - resp.rect.min) / scale).to_pos2();
+                let remove = resp.secondary_clicked() || (resp.clicked() && ui.input(|i| i.modifiers.alt));
+                if (resp.clicked() || resp.secondary_clicked())
+                    && let Some(pos) = resp.interact_pointer_pos()
+                {
+                    let p = to_px(pos);
+                    ed.cut.wand(p.x.max(0.0) as usize, p.y.max(0.0) as usize, !remove);
+                    ed.dirty = true;
+                }
+                let painter = ui.painter_at(resp.rect);
+                let to_screen = |p: egui::Pos2| resp.rect.min + p.to_vec2() * scale;
+                // Coins de l'image projetée : on les attrape avant de tracer un cadre.
+                if resp.drag_started_by(egui::PointerButton::Primary)
+                    && let (Some(q), Some(pos)) = (ed.cut.projection, resp.interact_pointer_pos())
+                {
+                    ed.drag_corner = (0..4)
+                        .map(|k| (k, to_screen(egui::pos2(q[k][0], q[k][1])).distance(pos)))
+                        .filter(|&(_, d)| d < 14.0)
+                        .min_by(|a, b| a.1.total_cmp(&b.1))
+                        .map(|(k, _)| k);
+                }
+                if let Some(k) = ed.drag_corner {
+                    if let (Some(q), Some(pos)) = (&mut ed.cut.projection, resp.interact_pointer_pos()) {
+                        let p = to_px(pos);
+                        q[k] = [p.x.clamp(0.0, ed.cut.width as f32), p.y.clamp(0.0, ed.cut.height as f32)];
+                    }
+                    if resp.drag_stopped() {
+                        ed.drag_corner = None;
+                    }
+                } else if resp.drag_started_by(egui::PointerButton::Primary) {
+                    // Cadrage : glisser pour encadrer l'objet voulu.
+                    ed.drag_from = resp.interact_pointer_pos().map(to_px);
+                }
+                if let Some(q) = ed.cut.projection {
+                    let pts: Vec<egui::Pos2> = q.iter().map(|p| to_screen(egui::pos2(p[0], p[1]))).collect();
+                    let gold = Color32::from_rgb(255, 200, 40);
+                    painter.add(egui::Shape::closed_line(pts.clone(), Stroke::new(2.0, gold)));
+                    for (k, p) in pts.iter().enumerate() {
+                        painter.circle(*p, 6.0, gold.gamma_multiply(0.4), Stroke::new(2.0, gold));
+                        let label = ["1", "2", "3", "4"][k];
+                        painter.text(*p + Vec2::new(9.0, -9.0), egui::Align2::LEFT_BOTTOM, label, egui::FontId::proportional(11.0), gold);
+                    }
+                }
+                for &[x0, y0, x1, y1] in ed.cut.frames() {
+                    let r = Rect::from_min_max(
+                        to_screen(egui::pos2(x0 as f32, y0 as f32)),
+                        to_screen(egui::pos2(x1 as f32, y1 as f32)),
+                    );
+                    painter.rect_stroke(r, 0.0, Stroke::new(1.0, ACCENT.gamma_multiply(0.6)), egui::StrokeKind::Inside);
+                }
+                if let (Some(from), Some(pos)) = (ed.drag_from, resp.interact_pointer_pos()) {
+                    let to = to_px(pos);
+                    let r = Rect::from_two_pos(to_screen(from), to_screen(to));
+                    painter.rect_stroke(r, 0.0, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
+                    if resp.drag_stopped() {
+                        let r = Rect::from_two_pos(from, to);
+                        let add = ui.input(|i| i.modifiers.shift);
+                        ed.cut.add_frame(
+                            [r.min.x.max(0.0) as usize, r.min.y.max(0.0) as usize, r.max.x.max(0.0) as usize, r.max.y.max(0.0) as usize],
+                            add,
+                        );
+                        ed.drag_from = None;
+                        ed.dirty = true;
+                    }
+                } else if resp.drag_stopped() {
+                    ed.drag_from = None;
+                }
+            }
+            ui.horizontal(|ui| {
+                let mut on = ed.cut.projection.is_some();
+                if ui
+                    .checkbox(&mut on, "Caler sur l'image projetée visible sur la photo")
+                    .on_hover_text(
+                        "Pour une photo prise de côté où l'on voit le rectangle projeté : ses 4 coins (en jaune, \
+                         déplaçables) servent de repère, le masque tombe pile à sa place malgré la perspective.",
+                    )
+                    .changed()
+                {
+                    if on {
+                        if !ed.cut.enable_projection() {
+                            self.status = Some("Image projetée non trouvée : placez les 4 coins à la main.".into());
+                        }
+                    } else {
+                        ed.cut.projection = None;
+                    }
+                }
+                if ed.cut.projection.is_some()
+                    && ui.button(with_icon(ic::CROSSHAIR, "Redétecter")).on_hover_text("Chercher de nouveau les coins").clicked()
+                    && !ed.cut.enable_projection()
+                {
+                    self.status = Some("Image projetée non trouvée : placez les 4 coins à la main.".into());
+                }
+                ui.toggle_value(&mut ed.white, with_icon(ic::SUN, "Projeter du blanc"))
+                    .on_hover_text("La sortie affiche un écran blanc : idéal pour prendre la photo (bords nets, détection fiable)");
+            });
+            if ed.cut.projection.is_some() {
+                ui.label(
+                    egui::RichText::new("Coins dans l'ordre : 1 haut-gauche, 2 haut-droit, 3 bas-droit, 4 bas-gauche de l'image projetée.")
+                        .small()
+                        .color(TEXT_WEAK),
+                );
+            }
+            if !ed.cut.has_alpha() {
+                ui.horizontal(|ui| {
+                    ui.label("Méthode");
+                    for m in cutout::Method::ALL {
+                        if ui.selectable_label(ed.cut.method == m, m.label()).on_hover_text(m.description()).clicked()
+                            && ed.cut.method != m
+                        {
+                            ed.cut.method = m;
+                            ed.cut.retune(true);
+                            ed.dirty = true;
+                        }
+                    }
+                });
+                if ed.cut.method == cutout::Method::Subject {
+                    if let Some(e) = &ed.cut.model_error {
+                        ui.colored_label(WARN, format!("Détection du sujet indisponible ({e}) : détourage par les couleurs."));
+                    } else {
+                        let resp = percent_slider(ui, &mut ed.cut.sensitivity, "Sensibilité")
+                            .on_hover_text("Plus haut : sujet plus large (inclut les parties moins évidentes)");
+                        if resp.changed() || resp.drag_stopped() {
+                            ed.cut.retune(resp.drag_started() || !resp.dragged());
+                            ed.dirty = true;
+                        }
+                    }
+                }
+            } else {
+                ui.label(egui::RichText::new("Image déjà détourée : sa transparence est utilisée.").small().color(TEXT_WEAK));
+            }
+            ui.horizontal(|ui| {
+                if ui.button(with_icon(ic::MAGIC_WAND, "Auto")).on_hover_text("Refaire le détourage automatique").clicked() {
+                    ed.cut.auto();
+                    ed.dirty = true;
+                }
+                if !ed.cut.frames().is_empty()
+                    && ui
+                        .button(with_icon(ic::CORNERS_OUT, "Toute l'image"))
+                        .on_hover_text("Retirer les cadres : chercher le sujet dans toute l'image")
+                        .clicked()
+                {
+                    ed.cut.clear_frames();
+                    ed.dirty = true;
+                }
+                let undo = ui.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Z)));
+                if ui
+                    .add_enabled(ed.cut.can_undo(), egui::Button::new(with_icon(ic::ARROW_COUNTER_CLOCKWISE, "Annuler")))
+                    .on_hover_text(format!("{CMD}+Z"))
+                    .clicked()
+                    || undo
+                {
+                    ed.cut.undo();
+                    ed.dirty = true;
+                }
+                if ui.button(with_icon(ic::ARROWS_CLOCKWISE, "Inverser")).on_hover_text("Échanger sujet et fond").clicked() {
+                    ed.cut.invert();
+                    ed.dirty = true;
+                }
+                let mut fill = ed.cut.fill_holes;
+                if ui.checkbox(&mut fill, "Boucher les trous").changed() {
+                    ed.cut.set_fill_holes(fill);
+                    ed.dirty = true;
+                }
+                ui.label(
+                    egui::RichText::new(format!("Sujet : {:.0} % de l'image", ed.cut.coverage() * 100.0)).small().color(TEXT_WEAK),
+                );
+            });
+            ui.add(egui::Slider::new(&mut ed.cut.tolerance, 4.0..=60.0).text("Tolérance de la baguette").max_decimals(0))
+                .on_hover_text("Écart de couleur accepté autour du point cliqué");
+            percent_slider(ui, &mut ed.cut.smooth, "Lissage du contour");
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                if ui.add(theme::primary_button(with_icon(ic::CHECK_SQUARE, "Appliquer au calque"))).clicked() {
+                    apply = Some(ed.cut.rings(aspect));
+                }
+                if ui.button("Fermer").clicked() {
+                    close = true;
+                }
+            });
+        });
+        match apply {
+            Some(Ok((rings, nonzero))) => {
+                self.apply_mask_rings(rings, nonzero);
+                self.cutout = None;
+            }
+            Some(Err(e)) => self.status = Some(format!("Détourage : {e:#}")),
+            None if close => self.cutout = None,
+            None => {}
         }
     }
 
@@ -2295,6 +2848,9 @@ impl OzApp {
         let mut tags = Vec::new();
         if self.blackout {
             tags.push(with_icon(ic::MOON, "BLACKOUT"));
+        }
+        if self.white_screen {
+            tags.push(with_icon(ic::SUN, "BLANC"));
         }
         if self.bypass_fx {
             tags.push(with_icon(ic::PROHIBIT, "SANS EFFETS"));
@@ -2353,7 +2909,9 @@ impl eframe::App for OzApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.tick(&ctx);
-        self.handle_shortcuts(&ctx);
+        if self.cutout.is_none() {
+            self.handle_shortcuts(&ctx);
+        }
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -2413,6 +2971,8 @@ impl eframe::App for OzApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| self.preview(ui));
+
+        self.cutout_window(&ctx);
 
         if self.output_open {
             ctx.show_viewport_immediate(

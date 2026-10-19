@@ -50,6 +50,9 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 **Effets** (onglet Effets). Ils s'appliquent au calque sélectionné.
 - 26 presets intégrés : Néon, Kaléido, Mandala, Miroir 4, Tunnel, Rétro VHS, Glitch, 8-bit, Pop art, Arc-en-ciel, Psyché, Rêve, Noir & blanc, Duotone rose, Bleu glacé, Négatif, Strobe, Vortex, Tunnel acide, Liquide, Acide, Mosaïque, Écho, Solarisé, Respiration, Trip.
 - Section **Psychédélique** : tourbillon, tunnel (coordonnées polaires qui défilent), mosaïque miroir, distorsion liquide, palette acide, arc-en-ciel spatial, solarisation, pulsation (zoom qui respire), écho (copies superposées).
+- Onglet **Visuels** : 22 visuels psychédéliques générés en direct, sans vidéo : plasma, spirale hypnotique, tunnel infini, fractale, mandala, moiré, lampe à lave, nuages fractals, cristaux, op art, hyperespace, soleil rayonnant, ruche, caustiques, aurore boréale, quasicristal, galaxie, labyrinthe, grille rétro, flammes, électricité, gouttes. 8 palettes, vitesse, taille, détail et rotation des couleurs. Ils remplacent la vidéo du calque ou s'y mélangent, et passent par tous les effets, le masque et la déformation. Un enchaînement automatique change de motif et de palette au hasard, avec un fondu.
+- Dans le même onglet, **Sur la forme du masque** : animations qui épousent le contour du masque du calque — néon (couleur unique ou arc-en-ciel qui tourne), lueur intérieure, comètes et pointillés qui font le tour du contour, lignes concentriques qui avancent vers l'intérieur, échos qui s'éloignent à l'extérieur, onde qui pousse l'image depuis les bords, respiration (la forme grossit et rétrécit). Elles marchent avec toutes les formes, y compris les SVG et les masques détourés d'une photo, et réagissent au rythme comme les autres effets.
+- **Destruction** (onglet Visuels) : la forme du masque se casse et laisse voir les calques du dessous — mur qui s'écroule brique par brique, verre brisé en éclats, combustion en braises, désintégration en poussière, tuiles qui se retournent. Des fissures lumineuses annoncent la cassure, qui part du centre du masque. Réglage manuel de l'avancement, boucle automatique (cassure, pause, reconstruction) ou bouton « Casser ! » pour un coup unique en live. Sans masque, c'est tout le calque qui se casse.
 - « Aléatoire » tire une combinaison au hasard.
 - **Revenir sans effet** : « Aucun » (touche **0**) retire les effets du calque sélectionné et coupe son mode AUTO. « Sans effets » dans la barre du haut (touche **E**) affiche toutes les vidéos brutes, sur tous les calques, sans perdre les réglages : un second appui les rétablit.
 - La durée de « Transition » règle le passage en douceur d'un preset à l'autre.
@@ -64,7 +67,14 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - **Déformation** : une grille de 1×1 (4 coins en perspective) à 8×8 points pour suivre des surfaces courbes. « Aplatir » retire les courbures.
 - **Masque** : un polygone (rectangle, cercle, triangle, hexagone, étoile, ou forme libre) avec adoucissement des bords et inversion. Double-clic sur un bord pour ajouter un point, clic droit sur un point pour le supprimer.
 - **Masque SVG** : « Importer un SVG… » (ou glisser-déposer un `.svg` sur la fenêtre) reprend la forme d'un logo ou d'un pictogramme comme masque du calque sélectionné : plusieurs formes, trous, courbes et traits sont pris en charge. La forme est centrée sur la sortie, simplifiée (2 000 points au maximum), et ses points restent éditables. Les textes et images contenus dans le SVG sont ignorés : convertissez les textes en tracés dans votre logiciel de dessin.
-- **Masque depuis une image** : « Depuis une image… » (ou glisser-déposer un PNG, JPG, WebP, BMP ou TIFF) détoure l'image et en fait un masque vectoriel éditable. La forme vient de la transparence si l'image en a, sinon de ce qui se détache du fond (logo noir sur blanc ou blanc sur noir, silhouette…) ; les trous sont conservés et les petites taches ignorées. L'image entière est ajustée à la sortie : prenez une photo du support depuis le projecteur, détourez-la (fond noir, sujet blanc) et le masque tombe pile dessus. « Inverser » garde l'extérieur au lieu de la forme.
+- **Masque depuis une photo** : « Depuis une photo… » (ou glisser-déposer une image PNG, JPG, HEIC, WebP, BMP ou TIFF) ouvre le détourage. Les photos HEIC (iPhone) sont lues par macOS ou par ffmpeg 7.1+ ; l'orientation des photos de téléphone est respectée.
+  - **Sujet (IA)** : un petit réseau de neurones (U²-Net, intégré à l'app, sans connexion) trouve le sujet principal de la photo : bâtiment, objet, personne… Le curseur **Sensibilité** l'élargit ou le resserre.
+  - **Cadrer l'objet** : sur une photo chargée (pièce encombrée…), glissez sur l'image pour encadrer ce que vous voulez (un poêle et son conduit, une statue…) ; la détection ne cherche plus que dans le cadre. Maj+glisser ajoute un cadre (plusieurs objets, ou un objet en deux morceaux), « Toute l'image » retire les cadres.
+  - **Photo prise de côté** : cochez « Caler sur l'image projetée visible sur la photo ». L'app repère le rectangle projeté (ses 4 coins jaunes restent déplaçables) et place le masque par rapport à lui, perspective corrigée : inutile de photographier depuis le projecteur. « Projeter du blanc » affiche un écran blanc sur la sortie pour prendre la photo.
+  - **Couleur du fond** : garde ce qui se distingue de la couleur des bords, idéal pour un logo sur fond uni.
+  - Une image déjà détourée (PNG transparent) est prise telle quelle.
+  - Retouches : clic pour ajouter une zone de couleur proche (baguette magique), clic droit ou Alt+clic pour la retirer, annuler, inverser, boucher les trous, lisser le contour.
+  - **Appliquer au calque** en fait un masque vectoriel éditable. La photo entière est ajustée à la sortie : prise depuis le projecteur, le masque tombe pile sur le support.
 - **Maj** permet un réglage précis, la croix déplace toute la forme et **G** affiche une mire.
 
 **Rythme** (onglet Rythme) : les effets réagissent au son ou à un tempo.
@@ -94,6 +104,7 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 | E | Tout afficher sans effets (contournement, réglages conservés) |
 | A | Mode Auto (effets aléatoires) sur le calque sélectionné |
 | B | Blackout progressif |
+| W | Écran blanc (photo de l'image projetée, réglage du projecteur) |
 | G | Mire de calibration |
 | M | Édition de la forme |
 | F / Échap | Plein écran de la sortie / quitter le plein écran |
@@ -103,7 +114,8 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - `src/video.rs` : décodage via un processus `ffmpeg` qui produit des images RGBA, cadencées par un thread (vitesse, pause, seek, boucle). Extraction des miniatures.
 - `src/renderer.rs` : composition OpenGL des calques (modes de fusion, fondus), rendu d'un maillage déformé et masque polygonal dans le shader, effets.
 - `src/surface.rs` : grille de déformation (perspective et splines de Catmull-Rom), masques, poignées d'édition.
-- `src/mask.rs` : import SVG et détourage d'images (carrés marchants) des masques, rastérisation (tiny-skia) en texture.
+- `src/cutout.rs` : détourage des photos (U²-Net via tract, modèle de couleurs, baguette magique).
+- `src/mask.rs` : import SVG, contours d'une image détourée (carrés marchants), rastérisation (tiny-skia) en texture.
 - `src/rhythm.rs` : écoute audio (cpal), détection des temps dans les graves, tap tempo, réactions des calques.
 - `src/screens.rs` : liste des écrans pour placer la sortie.
 - `src/automix.rs` : tirage des séquences du mix auto.
@@ -112,6 +124,7 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - `src/thumbs.rs` : génération des miniatures en arrière-plan.
 - `src/cpu.rs` : mesure de la charge CPU (app + ffmpeg, machine).
 - `src/theme.rs`, `src/icons.rs` : apparence (palette, composants) et icônes [Phosphor](https://phosphoricons.com) (police dans `assets/`, licence MIT).
+- `assets/models/u2netp.onnx` : modèle [U²-Net](https://github.com/xuebinqin/U-2-Net) de détection du sujet (licence Apache 2.0, `assets/models/LICENSE-U2Net.txt`).
 - `src/app.rs` : interface egui (fenêtre de contrôle et fenêtre de sortie).
 
 Limites : pas de son ; les vidéos sont décodées en 1920×1080 au maximum.

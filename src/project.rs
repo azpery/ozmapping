@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::automix::AutoMix;
 use crate::effects::{AutoFx, BlendMode, Effects, Preset};
+use crate::generator::Generator;
 use crate::surface::{Mask, Warp};
 
 pub const EXTENSION: &str = "ozmap";
@@ -30,6 +31,8 @@ pub struct LayerConfig {
     pub mix: AutoMix,
     /// Réaction au rythme (son ou tempo tapé).
     pub react: React,
+    /// Visuel généré (utilisable sans vidéo).
+    pub generator: Generator,
     pub warp: Warp,
     pub mask: Mask,
     /// Vidéo chargée sur ce calque (relancée à l'ouverture du projet).
@@ -47,6 +50,7 @@ impl Default for LayerConfig {
             auto: AutoFx::default(),
             mix: AutoMix::default(),
             react: React::default(),
+            generator: Generator::default(),
             warp: Warp::default(),
             mask: Mask::default(),
             clip: None,

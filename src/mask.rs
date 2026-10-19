@@ -149,40 +149,14 @@ fn flatten(path: &tsp::Path, transform: tsp::Transform, rings: &mut Vec<Vec<[f64
 // ------------------------------------------------------------------ import d'image
 
 /// Extensions d'images acceptées pour créer un masque.
-pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "heic", "heif", "webp", "bmp", "gif", "tif", "tiff"];
 
-/// Taille maximale (plus grand côté, en pixels) de l'image analysée.
-const TRACE_MAX: u32 = 720;
-
-/// Contours de la forme d'une image. L'image entière est ajustée à la sortie (centrée,
-/// proportions conservées) : une image aux proportions de la sortie s'y superpose exactement.
-pub fn import_image(path: &Path, aspect: f32) -> Result<(Vec<Vec<Point>>, bool)> {
-    let img = image::open(path).with_context(|| format!("lecture de {}", path.display()))?;
-    image_to_rings(&img, aspect)
-}
-
-/// La forme est déduite de la transparence si l'image en a, sinon de ce qui se détache du
-/// fond (couleur des bords) : un logo noir sur blanc ou blanc sur noir donne le logo.
-pub fn image_to_rings(img: &image::DynamicImage, aspect: f32) -> Result<(Vec<Vec<Point>>, bool)> {
-    let rgba = img.to_rgba8();
-    let (w0, h0) = rgba.dimensions();
-    if w0 < 2 || h0 < 2 {
-        bail!("image trop petite");
-    }
-    let scale = (TRACE_MAX as f32 / w0.max(h0) as f32).min(1.0);
-    let rgba = if scale < 1.0 {
-        let (w, h) = (((w0 as f32 * scale).round() as u32).max(2), ((h0 as f32 * scale).round() as u32).max(2));
-        image::imageops::resize(&rgba, w, h, image::imageops::FilterType::Triangle)
-    } else {
-        rgba
-    };
-    let (w, h) = rgba.dimensions();
-    let field = coverage(&rgba);
-
+/// Contours de la zone `field >= 0,5` d'une image `w`×`h`, l'image entière étant ajustée à la
+/// sortie (centrée, proportions conservées).
+pub fn field_to_rings(field: &[f32], w: usize, h: usize, aspect: f32) -> Result<(Vec<Vec<Point>>, bool)> {
     // Les petites taches (bruit, poussières) sont ignorées.
     let min_area = (w as f64 * h as f64 * 0.0002).max(6.0);
-    let rings: Vec<Vec<[f64; 2]>> =
-        trace(&field, w as usize, h as usize).into_iter().filter(|r| ring_area(r).abs() >= min_area).collect();
+    let rings: Vec<Vec<[f64; 2]>> = trace(field, w, h).into_iter().filter(|r| ring_area(r).abs() >= min_area).collect();
     if rings.is_empty() {
         bail!("aucune forme détectée dans cette image (il faut un sujet qui se détache du fond)");
     }
@@ -190,59 +164,24 @@ pub fn image_to_rings(img: &image::DynamicImage, aspect: f32) -> Result<(Vec<Vec
     Ok((limit_points(place(&rings, [0.0, 0.0], [w as f64, h as f64], 1.0, aspect)), false))
 }
 
-/// Appartenance de chaque pixel à la forme (0–1, seuil à 0,5).
-fn coverage(img: &image::RgbaImage) -> Vec<f32> {
-    let total = img.pixels().len();
-    let transparent = img.pixels().filter(|p| p[3] < 128).count();
-    if transparent > total / 200 && transparent < total {
-        return img.pixels().map(|p| p[3] as f32 / 255.0).collect();
-    }
-
-    // Luminance (sur fond blanc pour les pixels semi-transparents), seuil d'Otsu.
-    let lum: Vec<f32> = img
-        .pixels()
-        .map(|p| {
-            let a = p[3] as f32 / 255.0;
-            let l = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
-            l * a + 255.0 * (1.0 - a)
-        })
+/// Contours de la zone `field >= 0,5`, placés sur la sortie par `map` (pixels de l'image →
+/// coordonnées de sortie normalisées).
+pub fn field_to_rings_mapped(
+    field: &[f32],
+    w: usize,
+    h: usize,
+    map: impl Fn([f64; 2]) -> [f64; 2],
+) -> Result<(Vec<Vec<Point>>, bool)> {
+    let min_area = (w as f64 * h as f64 * 0.0002).max(6.0);
+    let rings: Vec<Vec<Point>> = trace(field, w, h)
+        .into_iter()
+        .filter(|r| ring_area(r).abs() >= min_area)
+        .map(|r| r.into_iter().map(|p| map(p).map(|v| v as f32)).collect())
         .collect();
-    let threshold = otsu(&lum);
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    let border: Vec<f32> = (0..w)
-        .flat_map(|x| [lum[x], lum[(h - 1) * w + x]])
-        .chain((0..h).flat_map(|y| [lum[y * w], lum[y * w + w - 1]]))
-        .collect();
-    let light_background = border.iter().filter(|&&l| l > threshold).count() * 2 >= border.len();
-    // Valeur continue autour du seuil : des contours lisses plutôt qu'en escalier.
-    let sign = if light_background { 1.0 } else { -1.0 };
-    lum.iter().map(|l| (0.5 + sign * (threshold - l) / 64.0).clamp(0.0, 1.0)).collect()
-}
-
-/// Seuil séparant au mieux les deux populations de luminance (méthode d'Otsu).
-fn otsu(lum: &[f32]) -> f32 {
-    let mut hist = [0u64; 256];
-    for l in lum {
-        hist[l.clamp(0.0, 255.0) as usize] += 1;
+    if rings.is_empty() {
+        bail!("aucune forme détectée dans cette image (il faut un sujet qui se détache du fond)");
     }
-    let total = lum.len() as f64;
-    let sum: f64 = hist.iter().enumerate().map(|(i, &n)| i as f64 * n as f64).sum();
-    let (mut sum_b, mut w_b, mut best, mut threshold) = (0.0, 0.0, -1.0, 127.5);
-    for (i, &n) in hist.iter().enumerate() {
-        w_b += n as f64;
-        let w_f = total - w_b;
-        if w_b == 0.0 || w_f == 0.0 {
-            continue;
-        }
-        sum_b += i as f64 * n as f64;
-        let (m_b, m_f) = (sum_b / w_b, (sum - sum_b) / w_f);
-        let between = w_b * w_f * (m_b - m_f).powi(2);
-        if between > best {
-            best = between;
-            threshold = i as f32 + 0.5;
-        }
-    }
-    threshold
+    Ok((limit_points(rings), false))
 }
 
 /// Contours fermés de la zone `field >= 0,5` (carrés marchants), en pixels de l'image.
@@ -440,8 +379,144 @@ pub fn rasterize(mask: &Mask, width: u32, height: u32, feather_px: f32) -> Vec<u
     out
 }
 
+// ------------------------------------------------------------------ champ de forme
+
+/// Segment d'un contour, en hauteurs de sortie (x de 0 à `aspect`), avec sa position le long
+/// du contour (0..1 sur un tour).
+struct Segment {
+    a: [f32; 2],
+    b: [f32; 2],
+    s0: f32,
+    s1: f32,
+}
+
+impl Segment {
+    /// Distance au carré de `p` au segment, et paramètre (0..1) du point le plus proche.
+    fn closest(&self, p: [f32; 2]) -> (f32, f32) {
+        let ab = [self.b[0] - self.a[0], self.b[1] - self.a[1]];
+        let ap = [p[0] - self.a[0], p[1] - self.a[1]];
+        let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+        let t = if len2 > 0.0 { ((ap[0] * ab[0] + ap[1] * ab[1]) / len2).clamp(0.0, 1.0) } else { 0.0 };
+        let (dx, dy) = (ap[0] - ab[0] * t, ap[1] - ab[1] * t);
+        (dx * dx + dy * dy, t)
+    }
+}
+
+/// Champ de forme pour les animations qui suivent le masque, `width`×`height` pixels en
+/// coordonnées de sortie (une ligne après l'autre en partant du haut), 4 valeurs par pixel :
+/// distance signée au contour le plus proche (en hauteurs de sortie, positive à l'intérieur),
+/// cosinus et sinus de la position sur ce contour (un tour complet = tout le contour), 0.
+///
+/// Chaque pixel retient le segment le plus proche, propagé depuis ses voisins en deux passes
+/// (comme une transformée de distance) : la distance reste exacte, sans parcourir tous les
+/// segments pour chaque pixel.
+pub fn shape_field(mask: &Mask, width: u32, height: u32) -> Vec<f32> {
+    let (w, h) = (width.max(1) as usize, height.max(1) as usize);
+    let aspect = w as f32 / h as f32;
+    let mut segments = Vec::new();
+    for ring in mask.all_rings().filter(|r| r.len() >= 3) {
+        let pts: Vec<[f32; 2]> = ring.iter().map(|p| [p[0] * aspect, p[1]]).collect();
+        let n = pts.len();
+        let len = |i: usize| {
+            let (a, b) = (pts[i], pts[(i + 1) % n]);
+            ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt()
+        };
+        let total = (0..n).map(len).sum::<f32>().max(1e-9);
+        let mut s = 0.0;
+        for i in 0..n {
+            let s1 = s + len(i) / total;
+            segments.push(Segment { a: pts[i], b: pts[(i + 1) % n], s0: s, s1 });
+            s = s1;
+        }
+    }
+    let mut out = vec![0.0f32; w * h * 4];
+    if segments.is_empty() {
+        return out;
+    }
+
+    // Centre du pixel (x, y), dans le même repère que les segments.
+    let center = |x: usize, y: usize| [(x as f32 + 0.5) / h as f32, (y as f32 + 0.5) / h as f32];
+    let mut best = vec![u32::MAX; w * h];
+    let mut dist = vec![f32::INFINITY; w * h];
+    let try_seg = |best: &mut [u32], dist: &mut [f32], x: usize, y: usize, seg: u32| {
+        let k = y * w + x;
+        if best[k] == seg {
+            return;
+        }
+        let (d, _) = segments[seg as usize].closest(center(x, y));
+        if d < dist[k] {
+            dist[k] = d;
+            best[k] = seg;
+        }
+    };
+
+    // Amorce : les pixels traversés par chaque segment (pas d'un demi-pixel).
+    for (i, sg) in segments.iter().enumerate() {
+        let steps = ((sg.b[0] - sg.a[0]).abs().max((sg.b[1] - sg.a[1]).abs()) * h as f32 * 2.0).ceil() as usize + 1;
+        for k in 0..=steps {
+            let t = k as f32 / steps as f32;
+            let px = (sg.a[0] + (sg.b[0] - sg.a[0]) * t) * h as f32;
+            let py = (sg.a[1] + (sg.b[1] - sg.a[1]) * t) * h as f32;
+            if px >= 0.0 && py >= 0.0 && (px as usize) < w && (py as usize) < h {
+                try_seg(&mut best, &mut dist, px as usize, py as usize, i as u32);
+            }
+        }
+    }
+    // Forme entièrement hors de la sortie : on part de son premier segment.
+    if best.iter().all(|&b| b == u32::MAX) {
+        try_seg(&mut best, &mut dist, 0, 0, 0);
+    }
+
+    // Propagation : vers le bas puis vers le haut, chaque ligne dans les deux sens.
+    let from = |best: &mut [u32], dist: &mut [f32], x: usize, y: usize, nx: isize, ny: isize| {
+        if nx < 0 || ny < 0 || nx as usize >= w || ny as usize >= h {
+            return;
+        }
+        let seg = best[ny as usize * w + nx as usize];
+        if seg != u32::MAX {
+            try_seg(best, dist, x, y, seg);
+        }
+    };
+    for y in 0..h {
+        let yi = y as isize;
+        for x in 0..w {
+            let xi = x as isize;
+            for (dx, dy) in [(-1, 0), (-1, -1), (0, -1), (1, -1)] {
+                from(&mut best, &mut dist, x, y, xi + dx, yi + dy);
+            }
+        }
+        for x in (0..w).rev() {
+            from(&mut best, &mut dist, x, y, x as isize + 1, yi);
+        }
+    }
+    for y in (0..h).rev() {
+        let yi = y as isize;
+        for x in (0..w).rev() {
+            let xi = x as isize;
+            for (dx, dy) in [(1, 0), (1, 1), (0, 1), (-1, 1)] {
+                from(&mut best, &mut dist, x, y, xi + dx, yi + dy);
+            }
+        }
+        for x in 0..w {
+            from(&mut best, &mut dist, x, y, x as isize - 1, yi);
+        }
+    }
+
+    // Signe : intérieur d'après la forme remplie (même règle de remplissage que le masque).
+    let inside = rasterize(mask, w as u32, h as u32, 0.0);
+    for (k, px) in out.chunks_exact_mut(4).enumerate() {
+        let sg = &segments[best[k] as usize];
+        let (d, t) = sg.closest(center(k % w, k / w));
+        let angle = (sg.s0 + (sg.s1 - sg.s0) * t) * std::f32::consts::TAU;
+        px[0] = if inside[k] >= 128 { d.sqrt() } else { -d.sqrt() };
+        px[1] = angle.cos();
+        px[2] = angle.sin();
+    }
+    out
+}
+
 /// Flou boîte séparable (horizontal puis vertical), en place.
-fn box_blur(img: &mut [u8], w: usize, h: usize, r: usize) {
+pub fn box_blur(img: &mut [u8], w: usize, h: usize, r: usize) {
     let mut line = Vec::new();
     let blur_line = |get: &dyn Fn(usize) -> u8, n: usize, line: &mut Vec<u8>| {
         line.clear();
@@ -537,7 +612,7 @@ mod tests {
     #[test]
     fn image_shape_is_traced_with_its_hole() {
         for dark_on_light in [true, false] {
-            let (rings, nonzero) = image_to_rings(&ring_image(dark_on_light), 2.0).unwrap();
+            let (rings, nonzero) = crate::cutout::Cutout::new(&ring_image(dark_on_light)).rings(2.0).unwrap();
             assert!(!nonzero);
             assert_eq!(rings.len(), 2, "contour extérieur + trou, sans le pixel isolé");
             let mut mask = Mask::default();
@@ -559,18 +634,36 @@ mod tests {
             let inside = (30..70).contains(&x) && (20..80).contains(&y);
             image::Rgba([255, 255, 255, if inside { 255 } else { 0 }])
         });
-        let (rings, _) = image_to_rings(&image::DynamicImage::ImageRgba8(img), 1.0).unwrap();
+        let (rings, _) = crate::cutout::Cutout::new(&image::DynamicImage::ImageRgba8(img)).rings(1.0).unwrap();
         assert_eq!(rings.len(), 1);
         let xs: Vec<f32> = rings[0].iter().map(|p| p[0]).collect();
         let min = xs.iter().cloned().fold(f32::MAX, f32::min);
         let max = xs.iter().cloned().fold(f32::MIN, f32::max);
         assert!((min - 0.3).abs() < 0.01 && (max - 0.7).abs() < 0.01, "{min} {max}");
-        assert!(rings[0].len() <= 10, "un rectangle reste simple : {}", rings[0].len());
+        assert!(rings[0].len() <= 32, "un rectangle reste simple (coins adoucis) : {}", rings[0].len());
+    }
+
+    #[test]
+    fn shape_field_measures_distance_and_runs_along_the_contour() {
+        let mut mask = Mask::default();
+        mask.set_shape(crate::surface::MaskShape::Circle.points(2.0));
+        let (w, h) = (200usize, 100usize);
+        let field = shape_field(&mask, w as u32, h as u32);
+        let at = |x: usize, y: usize| &field[(y * w + x) * 4..(y * w + x) * 4 + 4];
+        // Cercle de rayon 0,4 hauteur, centré : 0,4 au centre, négatif dehors.
+        assert!((at(100, 50)[0] - 0.4).abs() < 0.01, "{}", at(100, 50)[0]);
+        assert!((at(5, 50)[0] + (0.945 - 0.4)).abs() < 0.01, "{}", at(5, 50)[0]);
+        assert!(at(100, 50 - 38)[0].abs() < 0.03, "près du bord");
+        // Position sur le contour : un quart de tour entre la droite et le bas du cercle.
+        let angle = |p: &[f32]| p[2].atan2(p[1]);
+        let (right, bottom) = (angle(at(100 + 38, 50)), angle(at(100, 50 + 38)));
+        let quarter = (bottom - right).rem_euclid(std::f32::consts::TAU);
+        assert!((quarter - std::f32::consts::FRAC_PI_2).abs() < 0.1, "{quarter}");
     }
 
     #[test]
     fn plain_image_is_rejected() {
         let img = image::RgbaImage::from_pixel(50, 50, image::Rgba([128, 128, 128, 255]));
-        assert!(image_to_rings(&image::DynamicImage::ImageRgba8(img), 1.0).is_err());
+        assert!(crate::cutout::Cutout::new(&image::DynamicImage::ImageRgba8(img)).rings(1.0).is_err());
     }
 }

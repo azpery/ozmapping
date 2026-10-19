@@ -42,7 +42,7 @@ jobs:
           $src = (Get-ChildItem ffmpeg-src -Directory | Select-Object -First 1).FullName
           Copy-Item "$src/bin/ffmpeg.exe", "$src/bin/ffprobe.exe" "$dir/ffmpeg/bin/"
           Copy-Item "$src/LICENSE.txt" "$dir/ffmpeg/LICENSE.txt"
-          Copy-Item README.md, assets/Phosphor-LICENSE-MIT.txt $dir
+          Copy-Item README.md, assets/Phosphor-LICENSE-MIT.txt, assets/models/LICENSE-U2Net.txt $dir
           $zip = "dist/OZ-Mapping-$version-windows-x64.zip"
           Compress-Archive -Path $dir -DestinationPath $zip
           "ZIP=$zip" >> $env:GITHUB_ENV

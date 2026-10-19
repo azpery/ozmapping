@@ -66,6 +66,13 @@ fn apply(m: &Mat3, p: [f64; 2]) -> [f64; 2] {
     if w.abs() < 1e-12 { [x, y] } else { [x / w, y / w] }
 }
 
+/// Transformation qui ramène le quad `c` (haut-gauche, haut-droit, bas-droit, bas-gauche) sur le
+/// carré unité : la perspective d'une photo prise de biais est corrigée.
+pub fn quad_to_unit(c: &[Point; 4]) -> Option<impl Fn([f64; 2]) -> [f64; 2] + use<>> {
+    let inv = invert3(square_to_quad(c))?;
+    Some(move |p| apply(&inv, p))
+}
+
 /// Spline de Catmull-Rom entre p1 et p2.
 fn catmull_rom(p0: [f64; 2], p1: [f64; 2], p2: [f64; 2], p3: [f64; 2], t: f64) -> [f64; 2] {
     let (t2, t3) = (t * t, t * t * t);
@@ -362,6 +369,12 @@ impl Mask {
     pub fn total_points(&self) -> usize {
         self.all_rings().map(<[Point]>::len).sum()
     }
+
+    /// Moyenne des points de tous les contours.
+    pub fn centroid(&self) -> Point {
+        let n = self.total_points().max(1) as f32;
+        self.all_rings().flatten().fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n])
+    }
 }
 
 // ------------------------------------------------------------------ édition
@@ -531,11 +544,7 @@ pub fn edit_mask(ui: &mut egui::Ui, rect: Rect, mask: &mut Mask, salt: &str) {
         }
     }
 
-    let n = total.max(1) as f32;
-    let centroid = mask
-        .all_rings()
-        .flatten()
-        .fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n]);
+    let centroid = mask.centroid();
     let d = center_handle(ui, rect, base_id.with("center"), to_screen(rect, centroid), MASK_COLOR);
     if d != [0.0, 0.0] {
         for k in 0..mask.ring_count() {

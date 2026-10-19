@@ -14,7 +14,12 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sysinfo = "0.39.6"
 tiny-skia = "0.12.0"
+tract-onnx = "0.23.9"
 usvg = { version = "0.48.1", default-features = false }
 
 [build-dependencies]
 winresource = "0.1.34"
+
+[profile.release]
+# Binaire plus léger (sans symboles de débogage).
+strip = true

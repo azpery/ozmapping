@@ -573,6 +573,9 @@ impl React {
         fx.liquid *= 1.0 + 1.5 * d;
         fx.swirl *= 1.0 + d;
         fx.saturation *= 1.0 + 0.6 * d;
+        // Lumières de la forme : elles s'allument sur les temps (si elles sont déjà utilisées).
+        fx.shape_glow *= 1.0 + 1.5 * self.flash * env + d;
+        fx.shape_ripple *= 1.0 + d;
         fx.hue += state.hue;
         fx.rotate += state.spin;
 

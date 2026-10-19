@@ -47,6 +47,7 @@ for s in 16 32 128 256 512; do
     sips -z $d $d "$ICONSET/icon_512x512@2x.png" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+cp "$ROOT/assets/Phosphor-LICENSE-MIT.txt" "$ROOT/assets/models/LICENSE-U2Net.txt" "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

@@ -22,6 +22,45 @@ impl Mirror {
     }
 }
 
+/// Destruction du masque : la forme se casse et laisse voir les calques du dessous.
+/// L'ordre (numéro envoyé au shader) ne doit pas changer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Shatter {
+    #[default]
+    Off,
+    Bricks,
+    Glass,
+    Burn,
+    Dust,
+    Flip,
+}
+
+impl Shatter {
+    pub const ALL: [Shatter; 6] = [Shatter::Off, Shatter::Bricks, Shatter::Glass, Shatter::Burn, Shatter::Dust, Shatter::Flip];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Shatter::Off => "Aucune",
+            Shatter::Bricks => "Mur qui s'écroule",
+            Shatter::Glass => "Verre brisé",
+            Shatter::Burn => "Combustion",
+            Shatter::Dust => "Désintégration",
+            Shatter::Flip => "Tuiles qui se retournent",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Shatter::Off => "La forme reste intacte",
+            Shatter::Bricks => "Le mur se fissure puis les briques tombent une à une",
+            Shatter::Glass => "La forme se fend en éclats qui volent et retombent",
+            Shatter::Burn => "La forme brûle et part en braises depuis le point d'impact",
+            Shatter::Dust => "La forme s'effrite en poussière emportée par le vent",
+            Shatter::Flip => "La forme est découpée en tuiles qui pivotent et disparaissent",
+        }
+    }
+}
+
 /// Tous les paramètres d'effets envoyés au shader. Les valeurs par défaut = aucun effet.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -80,6 +119,42 @@ pub struct Effects {
     pub pulse_rate: f32,
     /// Écho : copies zoomées superposées (0..1).
     pub echo: f32,
+    // Forme du masque (sans effet tant que le calque n'a pas de masque actif)
+    /// Couleur des lumières dessinées sur la forme.
+    pub shape_color: [f32; 3],
+    /// Néon le long du contour (0..1), et sa largeur (en hauteurs de sortie).
+    pub shape_glow: f32,
+    pub shape_width: f32,
+    /// Lignes concentriques qui épousent la forme (0..1), leur nombre par hauteur de sortie,
+    /// et leur vitesse (lignes/s, positive = vers l'intérieur).
+    pub shape_ripple: f32,
+    pub shape_ripple_freq: f32,
+    pub shape_ripple_speed: f32,
+    /// Ondulation de l'image depuis les bords de la forme (mêmes lignes que ci-dessus).
+    pub shape_wave: f32,
+    /// Comètes qui parcourent le contour (0..1), leur nombre, leur vitesse (tours/s).
+    pub shape_trace: f32,
+    pub shape_trace_count: f32,
+    pub shape_trace_speed: f32,
+    /// Respiration : la forme grossit et rétrécit (amplitude en hauteurs de sortie), fréquence (Hz).
+    pub shape_breathe: f32,
+    pub shape_breathe_rate: f32,
+    /// Couleurs arc-en-ciel qui tournent le long du contour, au lieu de la couleur unique (0..1).
+    pub shape_rainbow: f32,
+    /// Échos du contour qui s'éloignent à l'extérieur (0..1), avec la densité et la vitesse des lignes.
+    pub shape_echo: f32,
+    /// Lueur intérieure : la couleur monte depuis les bords (0..1).
+    pub shape_inner: f32,
+    /// Pointillés qui défilent sur le contour (0..1), et leur nombre (à la vitesse des comètes).
+    pub shape_dashes: f32,
+    pub shape_dash_count: f32,
+    /// Destruction : style, avancement manuel (0..1), boucle automatique (cycles/s, 0 = manuel),
+    /// taille des morceaux (par hauteur de sortie), lueur des fissures.
+    pub shatter: Shatter,
+    pub shatter_amount: f32,
+    pub shatter_speed: f32,
+    pub shatter_size: f32,
+    pub shatter_glow: f32,
     // Rythme
     pub strobe: f32,
 }
@@ -126,6 +201,28 @@ impl Default for Effects {
             pulse: 0.0,
             pulse_rate: 0.5,
             echo: 0.0,
+            shape_color: [0.3, 0.85, 1.0],
+            shape_glow: 0.0,
+            shape_width: 0.008,
+            shape_ripple: 0.0,
+            shape_ripple_freq: 12.0,
+            shape_ripple_speed: 0.5,
+            shape_wave: 0.0,
+            shape_trace: 0.0,
+            shape_trace_count: 2.0,
+            shape_trace_speed: 0.2,
+            shape_breathe: 0.0,
+            shape_breathe_rate: 0.3,
+            shape_rainbow: 0.0,
+            shape_echo: 0.0,
+            shape_inner: 0.0,
+            shape_dashes: 0.0,
+            shape_dash_count: 30.0,
+            shatter: Shatter::Off,
+            shatter_amount: 0.0,
+            shatter_speed: 0.0,
+            shatter_size: 10.0,
+            shatter_glow: 0.8,
             strobe: 0.0,
         }
     }
@@ -180,8 +277,95 @@ impl Effects {
             pulse: l(a.pulse, b.pulse),
             pulse_rate: l(a.pulse_rate, b.pulse_rate),
             echo: l(a.echo, b.echo),
+            shape_color: [
+                l(a.shape_color[0], b.shape_color[0]),
+                l(a.shape_color[1], b.shape_color[1]),
+                l(a.shape_color[2], b.shape_color[2]),
+            ],
+            shape_glow: l(a.shape_glow, b.shape_glow),
+            shape_width: l(a.shape_width, b.shape_width),
+            shape_ripple: l(a.shape_ripple, b.shape_ripple),
+            shape_ripple_freq: l(a.shape_ripple_freq, b.shape_ripple_freq),
+            shape_ripple_speed: l(a.shape_ripple_speed, b.shape_ripple_speed),
+            shape_wave: l(a.shape_wave, b.shape_wave),
+            shape_trace: l(a.shape_trace, b.shape_trace),
+            shape_trace_count: pick(a.shape_trace_count, b.shape_trace_count, t),
+            shape_trace_speed: l(a.shape_trace_speed, b.shape_trace_speed),
+            shape_breathe: l(a.shape_breathe, b.shape_breathe),
+            shape_breathe_rate: l(a.shape_breathe_rate, b.shape_breathe_rate),
+            shape_rainbow: l(a.shape_rainbow, b.shape_rainbow),
+            shape_echo: l(a.shape_echo, b.shape_echo),
+            shape_inner: l(a.shape_inner, b.shape_inner),
+            shape_dashes: l(a.shape_dashes, b.shape_dashes),
+            shape_dash_count: pick(a.shape_dash_count, b.shape_dash_count, t),
+            shatter: pick(a.shatter, b.shatter, t),
+            shatter_amount: l(a.shatter_amount, b.shatter_amount),
+            shatter_speed: l(a.shatter_speed, b.shatter_speed),
+            shatter_size: l(a.shatter_size, b.shatter_size),
+            shatter_glow: l(a.shatter_glow, b.shatter_glow),
             strobe: pick(a.strobe, b.strobe, t),
         }
+    }
+
+    /// Avancement de la destruction (0 = intacte, 1 = détruite) pour une phase de boucle (0..1) :
+    /// intacte, cassure, reste détruite un moment, puis se reconstruit.
+    pub fn shatter_cycle(phase: f32) -> f32 {
+        let smooth = |x: f32| {
+            let x = x.clamp(0.0, 1.0);
+            x * x * (3.0 - 2.0 * x)
+        };
+        let p = phase.rem_euclid(1.0);
+        if p < 0.1 {
+            0.0
+        } else if p < 0.55 {
+            smooth((p - 0.1) / 0.45)
+        } else if p < 0.7 {
+            1.0
+        } else {
+            1.0 - smooth((p - 0.7) / 0.3)
+        }
+    }
+
+    /// Ces effets, avec les animations de forme du masque de `other`. Les animations de forme se
+    /// règlent à part (onglet Visuels) : presets, mode Auto et « Aucun » ne les touchent pas.
+    pub fn with_shape_of(self, other: &Effects) -> Effects {
+        Effects {
+            shape_color: other.shape_color,
+            shape_glow: other.shape_glow,
+            shape_width: other.shape_width,
+            shape_ripple: other.shape_ripple,
+            shape_ripple_freq: other.shape_ripple_freq,
+            shape_ripple_speed: other.shape_ripple_speed,
+            shape_wave: other.shape_wave,
+            shape_trace: other.shape_trace,
+            shape_trace_count: other.shape_trace_count,
+            shape_trace_speed: other.shape_trace_speed,
+            shape_breathe: other.shape_breathe,
+            shape_breathe_rate: other.shape_breathe_rate,
+            shape_rainbow: other.shape_rainbow,
+            shape_echo: other.shape_echo,
+            shape_inner: other.shape_inner,
+            shape_dashes: other.shape_dashes,
+            shape_dash_count: other.shape_dash_count,
+            shatter: other.shatter,
+            shatter_amount: other.shatter_amount,
+            shatter_speed: other.shatter_speed,
+            shatter_size: other.shatter_size,
+            shatter_glow: other.shatter_glow,
+            ..self
+        }
+    }
+
+    /// Vrai si une animation suit la forme du masque (il faut alors calculer son champ).
+    pub fn uses_shape(&self) -> bool {
+        self.shape_glow > 0.0
+            || self.shape_ripple > 0.0
+            || self.shape_wave > 0.0
+            || self.shape_trace > 0.0
+            || self.shape_breathe != 0.0
+            || self.shape_echo > 0.0
+            || self.shape_inner > 0.0
+            || self.shape_dashes > 0.0
     }
 
     /// Combinaison aléatoire de 2 à 4 effets (tous thèmes), pour l'improvisation.
@@ -719,6 +903,32 @@ mod tests {
                 && !fx.flip_y;
             assert!(geometry_untouched, "{fx:?}");
         }
+    }
+
+    #[test]
+    fn shape_settings_survive_other_effects() {
+        let mine = Effects { shape_glow: 1.2, shape_trace: 0.8, shape_color: [1.0, 0.0, 0.5], ..Effects::default() };
+        for seed in 1..50u64 {
+            let fx = Effects::themed(AutoTheme::All, seed * 13, 1.0, true).with_shape_of(&mine);
+            assert_eq!(fx.with_shape_of(&Effects::default()), Effects::themed(AutoTheme::All, seed * 13, 1.0, true));
+            assert_eq!(Effects::default().with_shape_of(&fx), Effects::default().with_shape_of(&mine));
+        }
+    }
+
+    #[test]
+    fn shatter_cycle_breaks_holds_and_rebuilds() {
+        assert_eq!(Effects::shatter_cycle(0.0), 0.0);
+        assert_eq!(Effects::shatter_cycle(0.6), 1.0);
+        assert!(Effects::shatter_cycle(0.3) > 0.0 && Effects::shatter_cycle(0.3) < 1.0);
+        assert!(Effects::shatter_cycle(0.999) < 0.01);
+        // Sans à-coups : petites variations entre deux images.
+        for k in 0..1000 {
+            let (a, b) = (k as f32 / 1000.0, (k + 1) as f32 / 1000.0);
+            assert!((Effects::shatter_cycle(a) - Effects::shatter_cycle(b)).abs() < 0.01);
+        }
+        // La destruction fait partie des effets de masque : le mode Auto n'y touche pas.
+        let mine = Effects { shatter: Shatter::Glass, shatter_speed: 0.2, ..Effects::default() };
+        assert_eq!(Effects::random(42).with_shape_of(&mine).shatter, Shatter::Glass);
     }
 
     #[test]
