@@ -43,7 +43,7 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - **Clic** : pré-visualisation dans le moniteur de gauche, sans toucher à la sortie.
 - **Double-clic**, **GO**, touches **1-9** ou **← →** : envoie le média sur le calque sélectionné, avec un fondu enchaîné.
 
-**Sortie.** La fenêtre « Sortie » s'ouvre au démarrage. Déplacez-la sur le projecteur, puis appuyez sur **F** ou double-cliquez dessus pour le plein écran.
+**Sortie.** La fenêtre « Sortie » s'ouvre au démarrage. Choisissez l'écran du projecteur dans le menu **Écran** de la barre du haut : la sortie s'y place en plein écran. L'écran choisi est retenu pour les prochains lancements. Sinon, déplacez la fenêtre à la main et appuyez sur **F** ou double-cliquez dessus pour le plein écran.
 
 **Calques** (panneau du bas, jusqu'à 8). Chaque calque a sa vidéo, son opacité, son mode de fusion (Normal, Addition, Écran, Produit, Éclaircir, Assombrir), ses effets et sa forme. Le calque du haut de la liste est au premier plan. **Tab** passe au calque suivant.
 
@@ -64,7 +64,18 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - **Déformation** : une grille de 1×1 (4 coins en perspective) à 8×8 points pour suivre des surfaces courbes. « Aplatir » retire les courbures.
 - **Masque** : un polygone (rectangle, cercle, triangle, hexagone, étoile, ou forme libre) avec adoucissement des bords et inversion. Double-clic sur un bord pour ajouter un point, clic droit sur un point pour le supprimer.
 - **Masque SVG** : « Importer un SVG… » (ou glisser-déposer un `.svg` sur la fenêtre) reprend la forme d'un logo ou d'un pictogramme comme masque du calque sélectionné : plusieurs formes, trous, courbes et traits sont pris en charge. La forme est centrée sur la sortie, simplifiée (2 000 points au maximum), et ses points restent éditables. Les textes et images contenus dans le SVG sont ignorés : convertissez les textes en tracés dans votre logiciel de dessin.
+- **Masque depuis une image** : « Depuis une image… » (ou glisser-déposer un PNG, JPG, WebP, BMP ou TIFF) détoure l'image et en fait un masque vectoriel éditable. La forme vient de la transparence si l'image en a, sinon de ce qui se détache du fond (logo noir sur blanc ou blanc sur noir, silhouette…) ; les trous sont conservés et les petites taches ignorées. L'image entière est ajustée à la sortie : prenez une photo du support depuis le projecteur, détourez-la (fond noir, sujet blanc) et le masque tombe pile dessus. « Inverser » garde l'extérieur au lieu de la forme.
 - **Maj** permet un réglage précis, la croix déplace toute la forme et **G** affiche une mire.
+
+**Rythme** (onglet Rythme) : les effets réagissent au son ou à un tempo.
+- **Source** : une entrée audio (micro, carte son) ou un tempo tapé. Pour le son joué par l'ordinateur lui-même, passez par une entrée virtuelle (BlackHole sur Mac, « Mixage stéréo » sous Windows). Le tempo se donne en tapant en rythme sur **TAP** (barre du haut) ou la touche **T**. On peut aussi le saisir, ou le diviser et le doubler.
+- **Bande** (entrée audio) : les temps sont détectés dans les **basses** (par défaut : grosse caisse et basse, le plus franc et le plus réactif), sur **tout** le son ou dans les **aigus** (charleston, cymbales). L'analyse se fait toutes les 5 ms, avec un petit tampon audio pour limiter la latence.
+- **Tap tempo** : chaque tap donne un temps immédiatement ; le BPM s'affine au fil des taps.
+- **Réactions toutes prêtes** : Pulsation, Club, Stroboscope, Glitch, Rotation, Miroir, Négatif, Onde de choc, Kaléido, Arc-en-ciel, Douceur.
+- **Réaction du calque**, à doser :
+  - sur chaque temps : coup de zoom, flash, secousse RVB, saut de teinte, négatif, stroboscope (noir entre les temps), glitch, onde de choc, kaléidoscope, rotation, miroir un temps sur deux ;
+  - avec l'intensité de la bande choisie : déformations et saturation qui s'amplifient.
+- **Enchaînements sur les temps** : le mode AUTO et le mix auto peuvent changer tous les N temps au lieu d'une durée en secondes.
 
 **Jauge CPU** (en haut à droite) : la charge de l'app et de ses décodeurs ffmpeg, en pourcentage de la machine (vert, orange puis rouge). La partie grise montre la charge du reste de la machine. Le survol donne le détail (nombre de décodeurs, de cœurs).
 
@@ -77,6 +88,7 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 | Espace | Pause / lecture du calque sélectionné |
 | 1-9, ← → | Lancer un média sur le calque sélectionné |
 | Tab | Calque suivant |
+| T | Tap tempo (BPM) |
 | R | Lecture à l'envers / à l'endroit (calque sélectionné) |
 | 0 | Retirer les effets du calque sélectionné (et couper AUTO) |
 | E | Tout afficher sans effets (contournement, réglages conservés) |
@@ -91,7 +103,9 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 - `src/video.rs` : décodage via un processus `ffmpeg` qui produit des images RGBA, cadencées par un thread (vitesse, pause, seek, boucle). Extraction des miniatures.
 - `src/renderer.rs` : composition OpenGL des calques (modes de fusion, fondus), rendu d'un maillage déformé et masque polygonal dans le shader, effets.
 - `src/surface.rs` : grille de déformation (perspective et splines de Catmull-Rom), masques, poignées d'édition.
-- `src/mask.rs` : import SVG des masques et rastérisation (tiny-skia) en texture.
+- `src/mask.rs` : import SVG et détourage d'images (carrés marchants) des masques, rastérisation (tiny-skia) en texture.
+- `src/rhythm.rs` : écoute audio (cpal), détection des temps dans les graves, tap tempo, réactions des calques.
+- `src/screens.rs` : liste des écrans pour placer la sortie.
 - `src/automix.rs` : tirage des séquences du mix auto.
 - `src/effects.rs` : paramètres d'effets, interpolation, presets intégrés et aléatoires.
 - `src/project.rs` : fichier projet `.ozmap`.

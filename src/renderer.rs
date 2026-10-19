@@ -82,7 +82,7 @@ impl Phases {
         self.wave = step(self.wave, fx.wave_speed, WAVE_PERIOD);
         let tau = std::f32::consts::TAU;
         self.swirl = step(self.swirl, fx.swirl_speed * tau, tau);
-        self.tunnel = step(self.tunnel, fx.tunnel_speed, 1.0);
+        self.tunnel = step(self.tunnel, fx.tunnel_speed, 2.0); // profondeur répétée en miroir
         self.liquid = step(self.liquid, fx.liquid_speed, 200.0 * tau);
         self.acid = step(self.acid, fx.acid_speed, 1.0);
         self.pulse = step(self.pulse, fx.pulse_rate * tau, tau);
@@ -291,17 +291,24 @@ void main() {
         c = r * vec2(cos(a), sin(a));
     }
     // Tunnel : coordonnées polaires (angle, 1/distance) qui défilent vers le centre.
+    // Angle et profondeur sont répétés en miroir (pas de couture), et le fond du tunnel
+    // laisse voir l'image d'origine au lieu de converger vers un point noir.
     float tunnel_fade = 1.0;
     vec2 polar_uv = uv;
+    float tunnel = 0.0;
     if (u_polar > 0.0) {
         float r = length(c);
-        polar_uv = vec2(atan(c.y, c.x) / (2.0 * PI) + 0.5, fract(0.12 / max(r, 0.02) + u_tunnel_phase));
-        tunnel_fade = mix(1.0, smoothstep(0.02, 0.25, r), u_polar);
+        float turn = atan(c.y, c.x) / (2.0 * PI) + 0.5;
+        float depth = 0.18 / max(r, 0.03) + u_tunnel_phase;
+        polar_uv = vec2(1.0 - abs(1.0 - 2.0 * turn), 1.0 - abs(1.0 - mod(depth, 2.0)));
+        tunnel = u_polar * smoothstep(0.04, 0.16, r);
+        // Légère pénombre vers le fond, pour la profondeur.
+        tunnel_fade = mix(1.0, 0.55 + 0.45 * smoothstep(0.04, 0.45, r), tunnel);
     }
     c.x /= aspect;
     uv = c + 0.5;
-    if (u_polar > 0.0) {
-        uv = mix(uv, polar_uv, u_polar);
+    if (tunnel > 0.0) {
+        uv = mix(uv, polar_uv, tunnel);
     }
 
     // 3. Distorsions

@@ -14,6 +14,8 @@ use crate::cpu::{self, CpuStats};
 use crate::effects::{self, AutoTheme, BlendMode, Effects, Mirror, Preset};
 use crate::icons as ic;
 use crate::project::{self, LayerConfig, Project};
+use crate::rhythm::{self, Rhythm};
+use crate::screens;
 use crate::renderer::{self, DrawParams, LayerDraw, MaskDraw, Phases, Renderer, SourceRef};
 use crate::surface::{self, ACCENT, MAX_GRID, Mask, MaskShape, Warp};
 use crate::theme::{self, BG, CARD, TEXT, TEXT_WEAK, WARN, with_icon};
@@ -37,6 +39,19 @@ fn output_viewport_id() -> ViewportId {
 struct Session {
     project: Option<Project>,
     project_path: Option<PathBuf>,
+    /// Écran choisi pour la sortie.
+    output_screen: Option<String>,
+    rhythm_source: rhythm::Source,
+    rhythm_band: rhythm::Band,
+    bpm: Option<f32>,
+}
+
+/// Déplacement de la fenêtre de sortie vers un autre écran, en plusieurs temps
+/// (sortir du plein écran, déplacer, repasser en plein écran).
+struct OutputMove {
+    screen: screens::Screen,
+    stage: u8,
+    at: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +65,7 @@ enum RightTab {
     Effects,
     Shape,
     Mix,
+    Rhythm,
 }
 
 /// Transition douce entre deux jeux d'effets (rappel de preset).
@@ -75,6 +91,10 @@ struct LayerRuntime {
     mix_seg: Option<automix::Segment>,
     /// Temps écoulé depuis le dernier changement du mode Auto.
     auto_timer: f32,
+    /// Rythme : temps comptés pour AUTO et le mix, état des réactions.
+    auto_beats: u32,
+    mix_beats: u32,
+    beat: rhythm::BeatState,
     /// Nom du dernier preset appliqué (pour le surligner, même pendant la transition).
     preset: Option<String>,
     phases: Phases,
@@ -160,6 +180,11 @@ pub struct OzApp {
     output_open: bool,
     output_fullscreen: bool,
     output_size: Vec2,
+    output_screen: Option<String>,
+    output_move: Option<OutputMove>,
+    screens: Vec<screens::Screen>,
+    screens_at: f64,
+    rhythm: Rhythm,
 
     blackout: bool,
     blackout_level: f32,
@@ -222,6 +247,11 @@ impl OzApp {
             output_open: true,
             output_fullscreen: false,
             output_size: Vec2::new(1920.0, 1080.0),
+            output_screen: None,
+            output_move: None,
+            screens: screens::list(),
+            screens_at: 0.0,
+            rhythm: Rhythm::default(),
             blackout: false,
             blackout_level: 0.0,
             grid: false,
@@ -244,6 +274,20 @@ impl OzApp {
             .storage
             .and_then(|st| eframe::get_value(st, eframe::APP_KEY))
             .unwrap_or_default();
+        // La sortie retourne sur son écran (en plein écran s'il ne s'agit pas de l'écran principal).
+        if let Some(screen) = app.screens.iter().find(|s| Some(&s.key) == session.output_screen.as_ref()) {
+            if !screen.primary {
+                app.output_move = Some(OutputMove { screen: screen.clone(), stage: 0, at: 0.0 });
+            }
+            app.output_screen = session.output_screen.clone();
+        }
+        if let Some(bpm) = session.bpm {
+            app.rhythm.tempo.bpm = bpm;
+        }
+        app.rhythm.band = session.rhythm_band;
+        if session.rhythm_source != rhythm::Source::Off {
+            app.rhythm.set_source(session.rhythm_source.clone());
+        }
         if let Some(mut project) = session.project {
             project.sanitize();
             let saved = session
@@ -689,10 +733,43 @@ impl OzApp {
             }
         }
 
-        // Mode Auto : changement d'effet à intervalle régulier.
+        // Rythme : réactions sur les temps.
+        let pulse = self.rhythm.update(self.clock());
+        let rhythm_on = self.rhythm.active();
+        for i in 0..self.layers.len() {
+            let (react, auto_on, mix_on) = {
+                let cfg = &self.project.layers[i];
+                (cfg.react, cfg.auto.enabled, cfg.mix.enabled && !cfg.mix.clips.is_empty())
+            };
+            let rt = &mut self.layers[i];
+            if !react.enabled || !rhythm_on {
+                rt.beat = rhythm::BeatState::default();
+                continue;
+            }
+            rt.beat.step(&react, pulse.beat, dt);
+            if pulse.beat {
+                if auto_on && react.auto_beats > 0 {
+                    rt.auto_beats += 1;
+                    if rt.auto_beats >= react.auto_beats {
+                        rt.auto_beats = 0;
+                        self.auto_next(i);
+                    }
+                }
+                let rt = &mut self.layers[i];
+                if mix_on && react.mix_beats > 0 {
+                    rt.mix_beats += 1;
+                    if rt.mix_beats >= react.mix_beats {
+                        rt.mix_beats = 0;
+                        self.mix_next(ctx, i);
+                    }
+                }
+            }
+        }
+
+        // Mode Auto : changement d'effet à intervalle régulier (ou sur les temps, plus haut).
         for i in 0..self.layers.len() {
             let auto = self.project.layers[i].auto;
-            if auto.enabled {
+            if auto.enabled && !self.on_beats(i, |r| r.auto_beats) {
                 self.layers[i].auto_timer += dt;
                 if self.layers[i].auto_timer >= auto.interval.max(0.5) {
                     self.auto_next(i);
@@ -711,7 +788,8 @@ impl OzApp {
             if rt.active().is_some_and(VideoPlayer::has_frame) {
                 rt.mix_timer += dt;
             }
-            if rt.active().is_none() || rt.mix_timer >= rt.mix_len {
+            let timed_out = rt.mix_timer >= rt.mix_len && !self.on_beats(i, |r| r.mix_beats);
+            if self.layers[i].active().is_none() || timed_out {
                 self.mix_next(ctx, i);
             }
         }
@@ -750,12 +828,20 @@ impl OzApp {
         ctx.request_repaint();
     }
 
+    /// Le calque `i` change sur les temps (AUTO ou mix, selon `n`) plutôt qu'à la durée.
+    fn on_beats(&self, i: usize, n: impl Fn(&rhythm::React) -> u32) -> bool {
+        let react = &self.project.layers[i].react;
+        react.enabled && n(react) > 0 && self.rhythm.active()
+    }
+
     fn draw_params(&mut self) -> DrawParams {
         let mut layers = Vec::new();
         // Le masque est rastérisé à 1024 px de large, aux proportions de la sortie.
         let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
         let mask_size = (1024u32, ((1024.0 / aspect).round() as u32).clamp(64, 4096));
         let to_mask_px = mask_size.0 as f32 / self.output_size.x.max(1.0);
+        let rhythm_on = self.rhythm.active();
+        let pulse = self.rhythm.pulse;
         for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
             if !cfg.visible || cfg.opacity <= 0.0 {
                 continue;
@@ -769,7 +855,13 @@ impl OzApp {
                     .mask
                     .is_active()
                     .then(|| rt.mask(&cfg.mask, mask_size, cfg.mask.feather * to_mask_px)),
-                effects: if self.bypass_fx { Effects::default() } else { cfg.effects },
+                effects: if self.bypass_fx {
+                    Effects::default()
+                } else if cfg.react.enabled && rhythm_on {
+                    cfg.react.apply(&cfg.effects, &pulse, &rt.beat)
+                } else {
+                    cfg.effects
+                },
                 opacity: cfg.opacity,
                 blend: cfg.blend,
                 grid: self.grid,
@@ -816,6 +908,13 @@ impl OzApp {
         }
         if pressed(Key::R) {
             self.toggle_reverse();
+        }
+        // Sans la répétition automatique : garder T enfoncé ne compte qu'un tap.
+        let tapped = ctx.input(|i| {
+            i.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::T, pressed: true, repeat: false, .. }))
+        });
+        if tapped {
+            self.tap();
         }
         if pressed(Key::E) {
             self.bypass_fx = !self.bypass_fx;
@@ -867,6 +966,248 @@ impl OzApp {
         }
     }
 
+    /// Horloge du rythme (secondes depuis le lancement).
+    fn clock(&self) -> f64 {
+        self.start.elapsed().as_secs_f64()
+    }
+
+    /// Tap tempo : passe en mode tempo si aucun rythme n'est actif.
+    fn tap(&mut self) {
+        let now = self.clock();
+        self.rhythm.tap(now);
+    }
+
+    /// Voyant de temps + bouton TAP (barre du haut).
+    fn tap_widget(&mut self, ui: &mut egui::Ui) {
+        let pulse = self.rhythm.pulse;
+        let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+        let on = self.rhythm.active();
+        let color = if on { ACCENT.gamma_multiply(0.25 + 0.75 * pulse.env) } else { theme::BORDER };
+        ui.painter().circle_filled(rect.center(), 5.0, color);
+        let label = match self.rhythm.source {
+            rhythm::Source::Audio(_) if on => "SON".to_owned(),
+            _ => format!("{:.0} BPM", self.rhythm.tempo.bpm),
+        };
+        if ui
+            .button(with_icon(ic::WAVES, &format!("TAP (T) · {label}")))
+            .on_hover_text("Taper en rythme pour donner le tempo (T). Réglages dans l'onglet Rythme.")
+            .clicked()
+        {
+            self.tap();
+        }
+    }
+
+    /// Onglet Rythme : source (son ou tempo) et réaction du calque sélectionné.
+    fn rhythm_ui(&mut self, ui: &mut egui::Ui) {
+        theme::section(ui, ic::WAVES, "Source du rythme");
+        let current = match &self.rhythm.source {
+            rhythm::Source::Off => "Aucune".to_owned(),
+            rhythm::Source::Audio(None) => match &self.rhythm.input {
+                Some(input) => format!("Par défaut ({})", input.device),
+                None => "Entrée audio par défaut".to_owned(),
+            },
+            rhythm::Source::Audio(Some(n)) => n.clone(),
+            rhythm::Source::Tempo => "Tempo tapé (BPM)".to_owned(),
+        };
+        let mut chosen = None;
+        let combo = egui::ComboBox::from_id_salt("rhythm_source").selected_text(current).width(220.0).show_ui(ui, |ui| {
+            if ui.selectable_label(self.rhythm.source == rhythm::Source::Off, "Aucune").clicked() {
+                chosen = Some(rhythm::Source::Off);
+            }
+            if ui.selectable_label(self.rhythm.source == rhythm::Source::Tempo, "Tempo tapé (BPM)").clicked() {
+                chosen = Some(rhythm::Source::Tempo);
+            }
+            ui.separator();
+            if ui.selectable_label(self.rhythm.source == rhythm::Source::Audio(None), "Entrée audio par défaut").clicked() {
+                chosen = Some(rhythm::Source::Audio(None));
+            }
+            for name in rhythm::input_devices() {
+                let source = rhythm::Source::Audio(Some(name.clone()));
+                if ui.selectable_label(self.rhythm.source == source, &name).clicked() {
+                    chosen = Some(source);
+                }
+            }
+        });
+        combo.response.on_hover_text(
+            "Son : micro ou entrée de la carte son (pour la sortie de l'ordinateur, utiliser une entrée virtuelle \
+             comme BlackHole sur Mac ou « Mixage stéréo » sous Windows).\nTempo : taper le rythme avec le bouton TAP ou la touche T.",
+        );
+        if let Some(source) = chosen {
+            self.rhythm.set_source(source);
+        }
+        if let Some(e) = &self.rhythm.error {
+            ui.colored_label(WARN, e);
+        }
+        if matches!(self.rhythm.source, rhythm::Source::Audio(_)) {
+            ui.horizontal(|ui| {
+                ui.label("Réagir aux");
+                for band in rhythm::Band::ALL {
+                    if ui
+                        .selectable_label(self.rhythm.band == band, band.label())
+                        .on_hover_text(band.description())
+                        .clicked()
+                    {
+                        self.rhythm.set_band(band);
+                    }
+                }
+            });
+        }
+
+        let pulse = self.rhythm.pulse;
+        match self.rhythm.source {
+            rhythm::Source::Audio(_) if self.rhythm.input.is_some() => {
+                for (label, v) in [("Intensité", pulse.level), ("Graves", pulse.bass), ("Aigus", pulse.high)] {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([56.0, 14.0], egui::Label::new(egui::RichText::new(label).small().color(TEXT_WEAK)));
+                        ui.add(egui::ProgressBar::new(v).desired_height(8.0).fill(ACCENT.gamma_multiply(0.8)));
+                    });
+                }
+            }
+            rhythm::Source::Tempo => {
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button(with_icon(ic::WAVES, "TAP"))).on_hover_text("Touche T").clicked() {
+                        self.tap();
+                    }
+                    let mut bpm = self.rhythm.tempo.bpm;
+                    if ui.add(egui::DragValue::new(&mut bpm).range(30.0..=300.0).speed(0.2).max_decimals(1).suffix(" BPM")).changed() {
+                        self.rhythm.tempo.set_bpm(bpm, self.clock());
+                    }
+                    if ui.small_button("÷2").clicked() {
+                        let b = self.rhythm.tempo.bpm / 2.0;
+                        self.rhythm.tempo.set_bpm(b, self.clock());
+                    }
+                    if ui.small_button("×2").clicked() {
+                        let b = self.rhythm.tempo.bpm * 2.0;
+                        self.rhythm.tempo.set_bpm(b, self.clock());
+                    }
+                });
+            }
+            _ => {}
+        }
+        if self.rhythm.active() {
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), Sense::hover());
+            ui.painter().rect_filled(rect, 3.0, ACCENT.gamma_multiply(0.1 + 0.9 * pulse.env));
+        }
+
+        ui.add_space(8.0);
+        let sel = self.sel();
+        theme::section(ui, ic::SPARKLE, "Réaction du calque");
+        let react = &mut self.project.layers[sel].react;
+        ui.toggle_value(&mut react.enabled, with_icon(ic::LIGHTNING, "Réagir au rythme"))
+            .on_hover_text("Les effets de ce calque bougent avec le son ou le tempo");
+        ui.label(egui::RichText::new("Réactions toutes prêtes").small().color(TEXT_WEAK));
+        ui.horizontal_wrapped(|ui| {
+            for (name, desc, preset) in rhythm::React::presets() {
+                let on = react.enabled && react.same_feel(&preset);
+                if ui.selectable_label(on, name).on_hover_text(desc).clicked() {
+                    *react = rhythm::React { auto_beats: react.auto_beats, mix_beats: react.mix_beats, ..preset };
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.add_enabled_ui(react.enabled, |ui| {
+            percent_slider(ui, &mut react.zoom, "Coup de zoom").on_hover_text("Zoom bref sur chaque temps");
+            percent_slider(ui, &mut react.flash, "Flash").on_hover_text("Éclair de lumière sur chaque temps");
+            percent_slider(ui, &mut react.shake, "Secousse RVB").on_hover_text("Décalage des couleurs sur les temps et les aigus");
+            percent_slider(ui, &mut react.drive, "Suit le volume")
+                .on_hover_text("Ondes, liquide, tourbillon et saturation s'amplifient avec le volume (avec le tempo : sur les temps)");
+            ui.add(
+                egui::Slider::new(&mut react.hue, 0.0..=0.5)
+                    .text("Saut de teinte")
+                    .custom_formatter(|v, _| format!("{:.0}°", v * 360.0)),
+            )
+            .on_hover_text("La teinte tourne d'autant à chaque temps");
+            percent_slider(ui, &mut react.invert, "Négatif").on_hover_text("Flash négatif sur chaque temps");
+            percent_slider(ui, &mut react.gate, "Stroboscope")
+                .on_hover_text("Noir entre les temps : l'image ne s'allume que sur le rythme");
+            percent_slider(ui, &mut react.glitch, "Glitch").on_hover_text("L'image se casse en pixels sur chaque temps");
+            percent_slider(ui, &mut react.shock, "Onde de choc").on_hover_text("Ondulation qui part sur chaque temps");
+            percent_slider(ui, &mut react.kaleido, "Kaléido").on_hover_text("Le kaléidoscope s'ouvre sur chaque temps");
+            ui.add(
+                egui::Slider::new(&mut react.spin, 0.0..=1.0)
+                    .text("Rotation par temps")
+                    .custom_formatter(|v, _| format!("{:.0}°", v * 90.0)),
+            )
+            .on_hover_text("L'image tourne d'autant à chaque temps, en glissant");
+            ui.checkbox(&mut react.flip, "Miroir un temps sur deux");
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Enchaînements sur les temps (0 = désactivé)").small().color(TEXT_WEAK));
+            ui.add(egui::Slider::new(&mut react.auto_beats, 0..=32).text("AUTO : effet suivant tous les").suffix(" temps"))
+                .on_hover_text("Remplace l'intervalle en secondes du mode AUTO (onglet Effets)");
+            ui.add(egui::Slider::new(&mut react.mix_beats, 0..=32).text("Mix auto : coupe tous les").suffix(" temps"))
+                .on_hover_text("Remplace les durées de séquence du mix auto (onglet Mix)");
+        });
+        if !self.rhythm.active() {
+            ui.label(egui::RichText::new("Choisir une source du rythme ci-dessus pour activer les réactions.").small().color(WARN));
+        }
+    }
+
+    /// Menu de choix de l'écran de sortie.
+    fn screen_menu(&mut self, ui: &mut egui::Ui) {
+        // Liste rafraîchie régulièrement : un projecteur peut être branché en cours de route.
+        let now = ui.input(|i| i.time);
+        if now - self.screens_at > 2.0 {
+            self.screens_at = now;
+            self.screens = screens::list();
+        }
+        let current = self.screens.iter().find(|s| Some(&s.key) == self.output_screen.as_ref());
+        let text = current.map_or("Écran…".to_owned(), |s| s.label.split("  ·").next().unwrap_or_default().to_owned());
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt("output_screen")
+            .selected_text(text)
+            .width(150.0)
+            .show_ui(ui, |ui| {
+                if self.screens.is_empty() {
+                    ui.label("Aucun écran détecté");
+                }
+                for screen in &self.screens {
+                    let selected = Some(&screen.key) == self.output_screen.as_ref();
+                    if ui.selectable_label(selected, &screen.label).clicked() {
+                        chosen = Some(screen.clone());
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Écran de la sortie : la fenêtre s'y place en plein écran");
+        if let Some(screen) = chosen {
+            self.output_screen = Some(screen.key.clone());
+            self.output_open = true;
+            self.output_move = Some(OutputMove { screen, stage: 0, at: 0.0 });
+        }
+    }
+
+    /// Fait avancer le déplacement de la sortie vers l'écran choisi (dans la fenêtre de sortie).
+    fn drive_output_move(&mut self, ctx: &egui::Context) {
+        let fullscreen = self.output_fullscreen;
+        let Some(mv) = &mut self.output_move else { return };
+        let now = ctx.input(|i| i.time);
+        ctx.request_repaint();
+        match mv.stage {
+            0 => {
+                // macOS anime la sortie du plein écran : on attend avant de déplacer.
+                if fullscreen {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                    mv.at = now + if cfg!(target_os = "macos") { 1.0 } else { 0.2 };
+                } else {
+                    mv.at = now;
+                }
+                mv.stage = 1;
+            }
+            1 if now >= mv.at => {
+                let pos = screens::window_position(&mv.screen, ctx.pixels_per_point());
+                ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+                mv.at = now + 0.4;
+                mv.stage = 2;
+            }
+            2 if now >= mv.at => {
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                self.output_fullscreen = true;
+                self.output_move = None;
+            }
+            _ => {}
+        }
+    }
+
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
         self.output_open = true;
         self.output_fullscreen = on;
@@ -903,6 +1244,9 @@ impl OzApp {
             ui.separator();
             ui.toggle_value(&mut self.output_open, with_icon(ic::MONITOR, "Sortie"))
                 .on_hover_text("Ouvrir / fermer la fenêtre de sortie");
+            self.screen_menu(ui);
+            ui.separator();
+            self.tap_widget(ui);
             let mut fs = self.output_fullscreen;
             if ui
                 .toggle_value(&mut fs, with_icon(ic::CORNERS_OUT, "Plein écran"))
@@ -1442,6 +1786,7 @@ impl OzApp {
                 (RightTab::Effects, ic::SPARKLE, "Effets"),
                 (RightTab::Shape, ic::POLYGON, "Forme"),
                 (RightTab::Mix, ic::FILM_REEL, "Mix"),
+                (RightTab::Rhythm, ic::WAVES, "Rythme"),
             ] {
                 let text = egui::RichText::new(with_icon(icon, name)).size(15.0).strong();
                 ui.selectable_value(&mut self.right_tab, tab, text);
@@ -1461,6 +1806,7 @@ impl OzApp {
                 RightTab::Effects => self.effects_ui(ui),
                 RightTab::Shape => self.shape_ui(ui),
                 RightTab::Mix => self.mix_ui(ui),
+                RightTab::Rhythm => self.rhythm_ui(ui),
             });
     }
 
@@ -1660,7 +2006,7 @@ impl OzApp {
         );
 
         let sel = self.sel();
-        let mut import_svg = None;
+        let mut import_shape = None;
         let cfg = &mut self.project.layers[sel];
         egui::CollapsingHeader::new(with_icon(ic::GRID_FOUR, "Déformation")).default_open(true).show(ui, |ui| {
             let (mut cols, mut rows) = (cfg.warp.cols, cfg.warp.rows);
@@ -1716,7 +2062,18 @@ impl OzApp {
                     .on_hover_text("Utiliser la forme d'un fichier SVG (logo, pictogramme…). Glisser-déposer un .svg marche aussi.")
                     .clicked()
                 {
-                    import_svg = rfd::FileDialog::new().add_filter("Image SVG", &["svg"]).pick_file();
+                    import_shape = rfd::FileDialog::new().add_filter("Image SVG", &["svg"]).pick_file();
+                }
+                if ui
+                    .button(with_icon(ic::IMAGE, "Depuis une image…"))
+                    .on_hover_text(
+                        "Détoure une image (PNG, JPG…) : la transparence, ou ce qui se détache du fond, devient le masque. \
+                         L'image est ajustée à la sortie : une photo du support projeté s'y superpose. \
+                         Glisser-déposer une image marche aussi.",
+                    )
+                    .clicked()
+                {
+                    import_shape = rfd::FileDialog::new().add_filter("Image", crate::mask::IMAGE_EXTENSIONS).pick_file();
                 }
             });
             let rings = cfg.mask.ring_count();
@@ -1730,8 +2087,8 @@ impl OzApp {
                 .color(TEXT_WEAK),
             );
         });
-        if let Some(path) = import_svg {
-            self.import_svg_mask(&path);
+        if let Some(path) = import_shape {
+            self.import_mask(&path);
             return;
         }
         let cfg = &mut self.project.layers[sel];
@@ -1871,10 +2228,15 @@ impl OzApp {
         }
     }
 
-    /// Importe un SVG comme masque du calque sélectionné.
-    fn import_svg_mask(&mut self, path: &Path) {
+    /// Importe un SVG, ou la forme détourée d'une image, comme masque du calque sélectionné.
+    fn import_mask(&mut self, path: &Path) {
         let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
-        match crate::mask::import_svg(path, aspect) {
+        let imported = if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
+            crate::mask::import_svg(path, aspect)
+        } else {
+            crate::mask::import_image(path, aspect)
+        };
+        match imported {
             Ok((rings, nonzero)) => {
                 let sel = self.sel();
                 let mask = &mut self.project.layers[sel].mask;
@@ -1962,6 +2324,7 @@ impl OzApp {
         if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
             self.output_fullscreen = fs;
         }
+        self.drive_output_move(&ctx);
         self.handle_shortcuts(&ctx);
 
         egui::CentralPanel::default()
@@ -2004,9 +2367,9 @@ impl eframe::App for OzApp {
             if self.confirm_discard() {
                 self.load_project_file(&ctx, proj);
             }
-        } else if let Some(svg) = dropped.iter().find(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"))) {
-            // Un SVG déposé devient le masque du calque sélectionné.
-            self.import_svg_mask(svg);
+        } else if let Some(shape) = dropped.iter().find(|p| is_mask_file(p)) {
+            // Un SVG ou une image déposés deviennent le masque du calque sélectionné.
+            self.import_mask(shape);
         } else if !dropped.is_empty() {
             self.add_media(dropped);
         }
@@ -2066,6 +2429,10 @@ impl eframe::App for OzApp {
         let session = Session {
             project: Some(self.project.clone()),
             project_path: self.project_path.clone(),
+            output_screen: self.output_screen.clone(),
+            rhythm_source: self.rhythm.source.clone(),
+            rhythm_band: self.rhythm.band,
+            bpm: Some(self.rhythm.tempo.bpm),
         };
         eframe::set_value(storage, eframe::APP_KEY, &session);
     }
@@ -2197,6 +2564,13 @@ fn is_video_file(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
+}
+
+/// SVG ou image fixe (le GIF reste une vidéo).
+fn is_mask_file(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).is_some_and(|e| {
+        e == "svg" || (e != "gif" && crate::mask::IMAGE_EXTENSIONS.contains(&e.as_str()))
+    })
 }
 
 fn is_project_file(p: &Path) -> bool {

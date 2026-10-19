@@ -1,4 +1,4 @@
-//! Masques : import de formes SVG et rastérisation en texture.
+//! Masques : import de formes (SVG ou image vectorisée) et rastérisation en texture.
 //!
 //! Le masque est dessiné sur le CPU (tiny-skia) dans une image en niveaux de gris, une seule
 //! fois à chaque modification ; le shader n'a plus qu'à la lire. Le coût de rendu ne dépend
@@ -41,12 +41,18 @@ pub fn svg_to_rings(data: &[u8], aspect: f32) -> Result<(Vec<Vec<Point>>, bool)>
             max[k] = max[k].max(p[k]);
         }
     }
+    Ok((limit_points(place(&rings, min, max, 0.8, aspect)), nonzero.unwrap_or(true)))
+}
+
+/// Place le cadre `min`–`max` au centre de la sortie, dans `fill` (0–1) de sa largeur ou de sa
+/// hauteur, proportions conservées. Renvoie des coordonnées de sortie normalisées.
+fn place(rings: &[Vec<[f64; 2]>], min: [f64; 2], max: [f64; 2], fill: f64, aspect: f32) -> Vec<Vec<Point>> {
     let (w, h) = ((max[0] - min[0]).max(1e-9), (max[1] - min[1]).max(1e-9));
     let aspect = aspect.max(0.01) as f64;
     // Espace « sortie » de largeur `aspect` et de hauteur 1.
-    let scale = (0.8 * aspect / w).min(0.8 / h);
+    let scale = (fill * aspect / w).min(fill / h);
     let center = [(min[0] + max[0]) / 2.0, (min[1] + max[1]) / 2.0];
-    let normalized: Vec<Vec<Point>> = rings
+    rings
         .iter()
         .map(|r| {
             r.iter()
@@ -57,9 +63,7 @@ pub fn svg_to_rings(data: &[u8], aspect: f32) -> Result<(Vec<Vec<Point>>, bool)>
                 })
                 .collect()
         })
-        .collect();
-
-    Ok((limit_points(normalized), nonzero.unwrap_or(true)))
+        .collect()
 }
 
 fn collect_group(group: &usvg::Group, rings: &mut Vec<Vec<[f64; 2]>>, nonzero: &mut Option<bool>) {
@@ -141,6 +145,201 @@ fn flatten(path: &tsp::Path, transform: tsp::Transform, rings: &mut Vec<Vec<[f64
     }
     finish(&mut current, rings);
 }
+
+// ------------------------------------------------------------------ import d'image
+
+/// Extensions d'images acceptées pour créer un masque.
+pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "gif", "tif", "tiff"];
+
+/// Taille maximale (plus grand côté, en pixels) de l'image analysée.
+const TRACE_MAX: u32 = 720;
+
+/// Contours de la forme d'une image. L'image entière est ajustée à la sortie (centrée,
+/// proportions conservées) : une image aux proportions de la sortie s'y superpose exactement.
+pub fn import_image(path: &Path, aspect: f32) -> Result<(Vec<Vec<Point>>, bool)> {
+    let img = image::open(path).with_context(|| format!("lecture de {}", path.display()))?;
+    image_to_rings(&img, aspect)
+}
+
+/// La forme est déduite de la transparence si l'image en a, sinon de ce qui se détache du
+/// fond (couleur des bords) : un logo noir sur blanc ou blanc sur noir donne le logo.
+pub fn image_to_rings(img: &image::DynamicImage, aspect: f32) -> Result<(Vec<Vec<Point>>, bool)> {
+    let rgba = img.to_rgba8();
+    let (w0, h0) = rgba.dimensions();
+    if w0 < 2 || h0 < 2 {
+        bail!("image trop petite");
+    }
+    let scale = (TRACE_MAX as f32 / w0.max(h0) as f32).min(1.0);
+    let rgba = if scale < 1.0 {
+        let (w, h) = (((w0 as f32 * scale).round() as u32).max(2), ((h0 as f32 * scale).round() as u32).max(2));
+        image::imageops::resize(&rgba, w, h, image::imageops::FilterType::Triangle)
+    } else {
+        rgba
+    };
+    let (w, h) = rgba.dimensions();
+    let field = coverage(&rgba);
+
+    // Les petites taches (bruit, poussières) sont ignorées.
+    let min_area = (w as f64 * h as f64 * 0.0002).max(6.0);
+    let rings: Vec<Vec<[f64; 2]>> =
+        trace(&field, w as usize, h as usize).into_iter().filter(|r| ring_area(r).abs() >= min_area).collect();
+    if rings.is_empty() {
+        bail!("aucune forme détectée dans cette image (il faut un sujet qui se détache du fond)");
+    }
+    // Règle pair-impair : les contours intérieurs (trous) se découpent d'eux-mêmes.
+    Ok((limit_points(place(&rings, [0.0, 0.0], [w as f64, h as f64], 1.0, aspect)), false))
+}
+
+/// Appartenance de chaque pixel à la forme (0–1, seuil à 0,5).
+fn coverage(img: &image::RgbaImage) -> Vec<f32> {
+    let total = img.pixels().len();
+    let transparent = img.pixels().filter(|p| p[3] < 128).count();
+    if transparent > total / 200 && transparent < total {
+        return img.pixels().map(|p| p[3] as f32 / 255.0).collect();
+    }
+
+    // Luminance (sur fond blanc pour les pixels semi-transparents), seuil d'Otsu.
+    let lum: Vec<f32> = img
+        .pixels()
+        .map(|p| {
+            let a = p[3] as f32 / 255.0;
+            let l = 0.2126 * p[0] as f32 + 0.7152 * p[1] as f32 + 0.0722 * p[2] as f32;
+            l * a + 255.0 * (1.0 - a)
+        })
+        .collect();
+    let threshold = otsu(&lum);
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let border: Vec<f32> = (0..w)
+        .flat_map(|x| [lum[x], lum[(h - 1) * w + x]])
+        .chain((0..h).flat_map(|y| [lum[y * w], lum[y * w + w - 1]]))
+        .collect();
+    let light_background = border.iter().filter(|&&l| l > threshold).count() * 2 >= border.len();
+    // Valeur continue autour du seuil : des contours lisses plutôt qu'en escalier.
+    let sign = if light_background { 1.0 } else { -1.0 };
+    lum.iter().map(|l| (0.5 + sign * (threshold - l) / 64.0).clamp(0.0, 1.0)).collect()
+}
+
+/// Seuil séparant au mieux les deux populations de luminance (méthode d'Otsu).
+fn otsu(lum: &[f32]) -> f32 {
+    let mut hist = [0u64; 256];
+    for l in lum {
+        hist[l.clamp(0.0, 255.0) as usize] += 1;
+    }
+    let total = lum.len() as f64;
+    let sum: f64 = hist.iter().enumerate().map(|(i, &n)| i as f64 * n as f64).sum();
+    let (mut sum_b, mut w_b, mut best, mut threshold) = (0.0, 0.0, -1.0, 127.5);
+    for (i, &n) in hist.iter().enumerate() {
+        w_b += n as f64;
+        let w_f = total - w_b;
+        if w_b == 0.0 || w_f == 0.0 {
+            continue;
+        }
+        sum_b += i as f64 * n as f64;
+        let (m_b, m_f) = (sum_b / w_b, (sum - sum_b) / w_f);
+        let between = w_b * w_f * (m_b - m_f).powi(2);
+        if between > best {
+            best = between;
+            threshold = i as f32 + 0.5;
+        }
+    }
+    threshold
+}
+
+/// Contours fermés de la zone `field >= 0,5` (carrés marchants), en pixels de l'image.
+fn trace(field: &[f32], w: usize, h: usize) -> Vec<Vec<[f64; 2]>> {
+    const ISO: f32 = 0.5;
+    // Bordure vide d'un pixel : tous les contours sont fermés.
+    let (gw, gh) = (w + 2, h + 2);
+    let v = |x: usize, y: usize| {
+        if x == 0 || y == 0 || x > w || y > h { 0.0 } else { field[(y - 1) * w + (x - 1)] }
+    };
+    // Arêtes : horizontale (x,y)→(x+1,y) = 2·i, verticale (x,y)→(x,y+1) = 2·i + 1.
+    let hz = |x: usize, y: usize| 2 * (y * gw + x);
+    let vt = |x: usize, y: usize| 2 * (y * gw + x) + 1;
+    let point = |edge: usize| -> [f64; 2] {
+        let (i, vertical) = (edge / 2, edge % 2 == 1);
+        let (x, y) = (i % gw, i / gw);
+        let (a, b) = if vertical { (v(x, y), v(x, y + 1)) } else { (v(x, y), v(x + 1, y)) };
+        let t = if (b - a).abs() < 1e-6 { 0.5 } else { ((ISO - a) / (b - a)).clamp(0.0, 1.0) } as f64;
+        // Échantillon (x, y) = centre du pixel (x−1, y−1).
+        let (px, py) = (x as f64 - 0.5, y as f64 - 0.5);
+        if vertical { [px, py + t] } else { [px + t, py] }
+    };
+
+    let mut segments: Vec<[usize; 2]> = Vec::new();
+    for y in 0..gh - 1 {
+        for x in 0..gw - 1 {
+            let (tl, tr, br, bl) = (v(x, y), v(x + 1, y), v(x + 1, y + 1), v(x, y + 1));
+            let case = (tl >= ISO) as u8 * 8 | (tr >= ISO) as u8 * 4 | (br >= ISO) as u8 * 2 | (bl >= ISO) as u8;
+            let (top, right, bottom, left) = (hz(x, y), vt(x + 1, y), hz(x, y + 1), vt(x, y));
+            let center_in = (tl + tr + br + bl) / 4.0 >= ISO;
+            let mut seg = |a, b| segments.push([a, b]);
+            match case {
+                1 | 14 => seg(left, bottom),
+                2 | 13 => seg(bottom, right),
+                3 | 12 => seg(left, right),
+                4 | 11 => seg(top, right),
+                6 | 9 => seg(top, bottom),
+                7 | 8 => seg(left, top),
+                5 | 10 => {
+                    // Point selle : on tranche d'après la valeur au centre.
+                    if (case == 5) == center_in {
+                        seg(left, top);
+                        seg(bottom, right);
+                    } else {
+                        seg(top, right);
+                        seg(left, bottom);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Chaînage : chaque arête traversée touche exactement deux segments.
+    let mut by_edge: std::collections::HashMap<usize, [usize; 2]> = std::collections::HashMap::new();
+    for (i, s) in segments.iter().enumerate() {
+        for &e in s {
+            by_edge.entry(e).and_modify(|p| p[1] = i).or_insert([i, usize::MAX]);
+        }
+    }
+    let mut used = vec![false; segments.len()];
+    let mut rings = Vec::new();
+    for start in 0..segments.len() {
+        if used[start] {
+            continue;
+        }
+        used[start] = true;
+        let mut ring = vec![point(segments[start][0])];
+        let (mut seg, mut edge) = (start, segments[start][1]);
+        loop {
+            ring.push(point(edge));
+            let pair = by_edge[&edge];
+            let next = if pair[0] == seg { pair[1] } else { pair[0] };
+            if next == usize::MAX || used[next] {
+                break;
+            }
+            used[next] = true;
+            edge = if segments[next][0] == edge { segments[next][1] } else { segments[next][0] };
+            seg = next;
+        }
+        if ring.len() >= 3 {
+            rings.push(ring);
+        }
+    }
+    rings
+}
+
+/// Aire signée d'un contour (formule du lacet).
+fn ring_area(ring: &[[f64; 2]]) -> f64 {
+    let n = ring.len();
+    (0..n).map(|i| {
+        let (a, b) = (ring[i], ring[(i + 1) % n]);
+        a[0] * b[1] - b[0] * a[1]
+    }).sum::<f64>() / 2.0
+}
+
+// ------------------------------------------------------------------ simplification
 
 /// Simplifie les contours (Ramer-Douglas-Peucker) jusqu'à tenir dans `MAX_MASK_POINTS`.
 fn limit_points(rings: Vec<Vec<Point>>) -> Vec<Vec<Point>> {
@@ -322,5 +521,56 @@ mod tests {
             .collect();
         let out = limit_points(vec![ring]);
         assert!(out.iter().map(Vec::len).sum::<usize>() <= MAX_MASK_POINTS);
+    }
+    /// Image de test : fond clair, anneau sombre (disque percé), et un pixel isolé (bruit).
+    fn ring_image(dark_on_light: bool) -> image::DynamicImage {
+        let (fg, bg) = if dark_on_light { (20u8, 235u8) } else { (235, 20) };
+        let img = image::RgbaImage::from_fn(200, 100, |x, y| {
+            let d = ((x as f32 - 100.0).powi(2) + (y as f32 - 50.0).powi(2)).sqrt();
+            let on = (15.0..40.0).contains(&d) || (x, y) == (5, 5);
+            let l = if on { fg } else { bg };
+            image::Rgba([l, l, l, 255])
+        });
+        image::DynamicImage::ImageRgba8(img)
+    }
+
+    #[test]
+    fn image_shape_is_traced_with_its_hole() {
+        for dark_on_light in [true, false] {
+            let (rings, nonzero) = image_to_rings(&ring_image(dark_on_light), 2.0).unwrap();
+            assert!(!nonzero);
+            assert_eq!(rings.len(), 2, "contour extérieur + trou, sans le pixel isolé");
+            let mut mask = Mask::default();
+            mask.set_rings(rings, nonzero);
+            // Sortie 2:1 comme l'image : superposition exacte.
+            let img = rasterize(&mask, 200, 100, 0.0);
+            let at = |x: usize, y: usize| img[y * 200 + x];
+            assert_eq!(at(100, 50), 0, "trou");
+            assert_eq!(at(100, 22), 255, "anneau");
+            assert_eq!(at(130, 50), 255, "anneau");
+            assert_eq!(at(10, 10), 0, "fond");
+            assert_eq!(at(180, 90), 0, "fond");
+        }
+    }
+
+    #[test]
+    fn transparency_defines_the_shape() {
+        let img = image::RgbaImage::from_fn(100, 100, |x, y| {
+            let inside = (30..70).contains(&x) && (20..80).contains(&y);
+            image::Rgba([255, 255, 255, if inside { 255 } else { 0 }])
+        });
+        let (rings, _) = image_to_rings(&image::DynamicImage::ImageRgba8(img), 1.0).unwrap();
+        assert_eq!(rings.len(), 1);
+        let xs: Vec<f32> = rings[0].iter().map(|p| p[0]).collect();
+        let min = xs.iter().cloned().fold(f32::MAX, f32::min);
+        let max = xs.iter().cloned().fold(f32::MIN, f32::max);
+        assert!((min - 0.3).abs() < 0.01 && (max - 0.7).abs() < 0.01, "{min} {max}");
+        assert!(rings[0].len() <= 10, "un rectangle reste simple : {}", rings[0].len());
+    }
+
+    #[test]
+    fn plain_image_is_rejected() {
+        let img = image::RgbaImage::from_pixel(50, 50, image::Rgba([128, 128, 128, 255]));
+        assert!(image_to_rings(&image::DynamicImage::ImageRgba8(img), 1.0).is_err());
     }
 }

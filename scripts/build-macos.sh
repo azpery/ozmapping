@@ -62,6 +62,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>NSMicrophoneUsageDescription</key><string>OZ Mapping écoute le son pour faire réagir les effets au rythme.</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSHumanReadableCopyright</key><string>OZ Mapping</string>

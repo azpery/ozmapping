@@ -9,6 +9,8 @@ mod icons;
 mod mask;
 mod project;
 mod renderer;
+mod rhythm;
+mod screens;
 mod surface;
 mod theme;
 mod thumbs;

@@ -3,6 +3,7 @@
 //! Les chemins des médias situés à côté du projet sont enregistrés en relatif,
 //! pour pouvoir déplacer ou copier le dossier complet.
 
+use crate::rhythm::React;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -27,6 +28,8 @@ pub struct LayerConfig {
     pub auto: AutoFx,
     /// Mix auto entre plusieurs vidéos.
     pub mix: AutoMix,
+    /// Réaction au rythme (son ou tempo tapé).
+    pub react: React,
     pub warp: Warp,
     pub mask: Mask,
     /// Vidéo chargée sur ce calque (relancée à l'ouverture du projet).
@@ -43,6 +46,7 @@ impl Default for LayerConfig {
             effects: Effects::default(),
             auto: AutoFx::default(),
             mix: AutoMix::default(),
+            react: React::default(),
             warp: Warp::default(),
             mask: Mask::default(),
             clip: None,
