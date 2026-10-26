@@ -12,14 +12,14 @@ use serde::{Deserialize, Serialize};
 use crate::automix::{self, AutoMix};
 use crate::cpu::{self, CpuStats};
 use crate::cutout::{self, Cutout};
-use crate::effects::{self, AutoTheme, BlendMode, Effects, Mirror, Preset, Shatter};
+use crate::effects::{self, AutoTheme, BlendMode, Effects, Mirror, Object3d, Preset, Shatter};
 use crate::generator::{Palette, Pattern};
 use crate::icons as ic;
-use crate::project::{self, LayerConfig, Project};
+use crate::project::{self, Cell, LayerConfig, Project};
 use crate::rhythm::{self, Rhythm};
 use crate::screens;
 use crate::renderer::{self, DrawParams, GenDraw, LayerDraw, MaskDraw, Phases, Renderer, ShapeDraw, SourceRef};
-use crate::surface::{self, ACCENT, MAX_GRID, Mask, MaskShape, Warp};
+use crate::surface::{self, ACCENT, Fit, MAX_GRID, Mask, MaskShape, Warp};
 use crate::theme::{self, BG, CARD, TEXT, TEXT_WEAK, WARN, with_icon};
 use crate::thumbs::Thumbnails;
 use crate::video::{self, VideoPlayer};
@@ -80,9 +80,58 @@ enum EditTarget {
 enum RightTab {
     Effects,
     Visuals,
+    Photo,
     Shape,
     Mix,
     Rhythm,
+}
+
+impl RightTab {
+    const COUNT: usize = 6;
+
+    /// Onglets horizontaux de chaque onglet latéral (vide : une seule page).
+    fn sections(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            RightTab::Effects => &[
+                (ic::STAR, "Presets"),
+                (ic::PALETTE, "Couleur"),
+                (ic::FRAME_CORNERS, "Géométrie"),
+                (ic::WAVES, "Distorsions"),
+                (ic::SPIRAL, "Psyché"),
+                (ic::MONITOR, "Rétro"),
+                (ic::CUBE, "3D"),
+                (ic::LIGHTNING, "Strobo"),
+            ],
+            RightTab::Visuals => &[
+                (ic::SPIRAL, "Motif"),
+                (ic::PALETTE, "Couleurs"),
+                (ic::SLIDERS_HORIZONTAL, "Réglages"),
+                (ic::SHUFFLE, "Enchaînement"),
+                (ic::SHAPES, "Sur le masque"),
+                (ic::LIGHTNING, "Destruction"),
+            ],
+            RightTab::Shape => &[
+                (ic::FRAME_CORNERS, "Cadrage"),
+                (ic::GRID_FOUR, "Déformation"),
+                (ic::SHAPES, "Masque"),
+            ],
+            RightTab::Rhythm => &[(ic::WAVES, "Source"), (ic::SPARKLE, "Réaction")],
+            RightTab::Photo | RightTab::Mix => &[],
+        }
+    }
+}
+
+/// Onglet horizontal affiché dans l'onglet latéral courant.
+#[derive(Clone, Copy)]
+struct Section(usize);
+
+impl Section {
+    /// N'affiche `add` que si la section `n` est l'onglet choisi.
+    fn show(self, ui: &mut egui::Ui, n: usize, add: impl FnOnce(&mut egui::Ui)) {
+        if self.0 == n {
+            add(ui);
+        }
+    }
 }
 
 /// Transition douce entre deux jeux d'effets (rappel de preset).
@@ -134,6 +183,10 @@ struct LayerRuntime {
     gen_timer: f32,
     /// Destruction déclenchée à la main (« Casser ! ») : avancement du cycle (0..1).
     shatter_shot: Option<f32>,
+    /// Dernière case du tableau jouée sur ce calque.
+    cell: Option<usize>,
+    /// Position de la vidéo de chaque case quittée (par colonne), pour y reprendre au retour.
+    cell_pos: std::collections::HashMap<usize, f64>,
 }
 
 /// Durée d'une destruction déclenchée à la main (cassure, pause, reconstruction).
@@ -255,8 +308,20 @@ pub struct OzApp {
     edit_mapping: bool,
     edit_target: EditTarget,
     right_tab: RightTab,
+    /// Calque dont on vient de changer les effets alors qu'il ne se voit pas à l'écran.
+    fx_hidden_alert: Option<usize>,
+    /// Onglet horizontal choisi dans chaque onglet latéral.
+    sub_tab: [usize; RightTab::COUNT],
+    /// Tableau : dernière colonne lancée, temps écoulé depuis (enchaînement auto),
+    /// largeur de la carte d'un calque (pour aligner les en-têtes de colonnes).
+    chain_col: Option<usize>,
+    chain_timer: f32,
+    layer_card_w: f32,
+    /// Défilement horizontal commun aux lignes du tableau.
+    grid_offset: f32,
 
     preset_name: String,
+    mask_preset_name: String,
     builtin_presets: Vec<Preset>,
     random_seed: u64,
     status: Option<String>,
@@ -322,7 +387,14 @@ impl OzApp {
             edit_mapping: false,
             edit_target: EditTarget::Warp,
             right_tab: RightTab::Effects,
+            fx_hidden_alert: None,
+            sub_tab: [0; RightTab::COUNT],
+            chain_col: None,
+            chain_timer: 0.0,
+            layer_card_w: 0.0,
+            grid_offset: 0.0,
             preset_name: String::new(),
+            mask_preset_name: String::new(),
             builtin_presets: effects::builtin_presets(),
             random_seed: 0x9E37_79B9_7F4A_7C15,
             status,
@@ -374,6 +446,17 @@ impl OzApp {
         app
     }
 
+    /// Ouvre l'onglet Forme sur la déformation ou le masque.
+    fn show_shape_tab(&mut self, target: EditTarget) {
+        self.edit_target = target;
+        self.right_tab = RightTab::Shape;
+        self.sub_tab[RightTab::Shape as usize] = if target == EditTarget::Mask { 2 } else { 1 };
+    }
+
+    fn section(&self) -> Section {
+        Section(self.sub_tab[self.right_tab as usize])
+    }
+
     fn sel(&self) -> usize {
         self.selected.min(self.project.layers.len() - 1)
     }
@@ -390,6 +473,9 @@ impl OzApp {
         self.saved = self.project.clone();
         self.project_path = path;
         self.selected = 0;
+        self.fx_hidden_alert = None;
+        self.chain_col = None;
+        self.chain_timer = 0.0;
         self.cue = None;
         // Relance les vidéos des calques.
         for i in 0..self.project.layers.len() {
@@ -470,6 +556,7 @@ impl OzApp {
                 p
             }
         };
+        self.store_active_cells();
         match self.project.save(&path) {
             Ok(()) => {
                 self.saved = self.project.clone();
@@ -498,7 +585,7 @@ impl OzApp {
             // `absolute` plutôt que `canonicalize` : sous Windows ce dernier produit des chemins
             // « \\?\C:\… » que ffmpeg gère mal.
             let p = std::path::absolute(&p).unwrap_or(p);
-            if is_video_file(&p) && !self.project.media.contains(&p) {
+            if (is_video_file(&p) || video::is_still_image(&p)) && !self.project.media.contains(&p) {
                 self.project.media.push(p);
             }
         }
@@ -606,7 +693,8 @@ impl OzApp {
 
     fn launch_media(&mut self, ctx: &egui::Context, index: usize) {
         if let Some(path) = self.project.media.get(index).cloned() {
-            self.launch_on(ctx, self.sel(), &path);
+            // Une vidéo envoyée remplace le visuel généré du calque.
+            self.launch_any(ctx, self.sel(), &MediaDrag::File(path));
         }
     }
 
@@ -650,6 +738,275 @@ impl OzApp {
         }
     }
 
+    // ---------------------------------------------------------------- tableau
+
+    /// Enregistre l'état du calque `i` (média, effets, réglages) dans la case `k`.
+    fn record_cell(&mut self, i: usize, k: usize) {
+        let mut cell = self.snapshot_cell(i);
+        let cfg = &self.project.layers[i];
+        cell.name = match (&cell.preset, &cell.clip) {
+            (Some(p), _) => p.clone(),
+            (None, Some(c)) => c.file_stem().map_or_else(|| file_name(c), |s| s.to_string_lossy().into_owned()),
+            (None, None) if cfg.generator.pattern != Pattern::Off => cfg.generator.pattern.label().to_owned(),
+            _ => format!("Case {}", k + 1),
+        };
+        let cells = &mut self.project.layers[i].cells;
+        if cells.len() <= k {
+            cells.resize(k + 1, None);
+        }
+        cells[k] = Some(cell);
+        self.layers[i].cell = Some(k);
+        self.layers[i].cell_pos.remove(&k);
+    }
+
+    /// Tous les réglages actuels du calque `i` (média, effets, forme, rythme, mix, lecture), sans nom.
+    fn snapshot_cell(&self, i: usize) -> Cell {
+        let (effects, preset) = self.fx_target(i);
+        let player = self.layers[i].active();
+        let cfg = &self.project.layers[i];
+        // Animations de forme, contours animés et destruction : toujours les réglages actuels
+        // (une transition de preset en cours ne les touche pas).
+        let effects = effects.with_shape_of(&cfg.effects);
+        Cell {
+            name: String::new(),
+            clip: player.map(|p| p.path.clone()),
+            effects,
+            preset,
+            generator: cfg.generator,
+            auto: cfg.auto,
+            fit: cfg.fit,
+            opacity: cfg.opacity,
+            blend: cfg.blend,
+            warp: Some(cfg.warp.clone()),
+            mask: Some(cfg.mask.clone()),
+            react: Some(cfg.react),
+            mix: Some(cfg.mix.clone()),
+            speed: player.map(VideoPlayer::speed),
+            reverse: player.map(VideoPlayer::is_reverse),
+            paused: player.map(VideoPlayer::is_paused),
+        }
+    }
+
+    /// Garde dans la case jouée sur le calque `i` tout ce qui a été réglé depuis qu'elle est lancée.
+    fn store_active_cell(&mut self, i: usize) {
+        let Some(k) = self.layers[i].cell else {
+            return;
+        };
+        if self.project.layers[i].cells.get(k).is_none_or(Option::is_none) {
+            return;
+        }
+        let mut cell = self.snapshot_cell(i);
+        if let Some(Some(old)) = self.project.layers[i].cells.get_mut(k) {
+            cell.name = std::mem::take(&mut old.name);
+            *old = cell;
+        }
+    }
+
+    /// Avant d'enregistrer le projet : les cases en cours de lecture reprennent leurs derniers réglages.
+    fn store_active_cells(&mut self) {
+        for i in 0..self.layers.len() {
+            self.store_active_cell(i);
+        }
+    }
+
+    /// Joue la case `k` sur le calque `i` : son média (en fondu), ses effets (en transition), ses réglages.
+    fn play_cell(&mut self, ctx: &egui::Context, i: usize, k: usize) {
+        if self.project.layers[i].cells.get(k).is_none_or(Option::is_none) {
+            return;
+        }
+        // La case qu'on quitte garde tout ce qui a été réglé pendant qu'elle jouait.
+        self.store_active_cell(i);
+        let Some(cell) = self.project.layers[i].cells.get(k).cloned().flatten() else {
+            return;
+        };
+        // On quitte une case : on retient où en était sa vidéo.
+        let rt = &mut self.layers[i];
+        if let Some(prev) = rt.cell.filter(|&prev| prev != k) {
+            let prev_clip = self.project.layers[i].cells.get(prev).cloned().flatten().and_then(|c| c.clip);
+            if let Some(p) = rt.active().filter(|p| Some(&p.path) == prev_clip.as_ref()) {
+                let pos = p.position();
+                rt.cell_pos.insert(prev, pos);
+            }
+        }
+        match &cell.clip {
+            // Même média déjà à l'écran : on ne le relance pas, seuls effets et réglages changent.
+            Some(path) if self.layers[i].active().is_some_and(|p| p.path == *path) => {}
+            Some(path) => {
+                // Retour sur une case déjà jouée : la vidéo reprend là où on l'avait laissée.
+                let mut opts = video::PlayOptions::new(self.project.looping, video::OUTPUT_MAX);
+                opts.start = self.layers[i].cell_pos.get(&k).copied().unwrap_or(0.0);
+                opts.speed = cell.speed.unwrap_or(opts.speed);
+                opts.reverse = cell.reverse.unwrap_or(opts.reverse);
+                self.launch_with(ctx, i, path, opts, None, true);
+            }
+            None => self.stop_layer(i),
+        }
+        // Même média gardé à l'écran : on lui applique la vitesse et le sens de la case.
+        for p in self.layers[i].players() {
+            if let Some(s) = cell.speed {
+                p.set_speed(s);
+            }
+            if let Some(r) = cell.reverse {
+                p.set_reverse(r);
+            }
+            if let Some(paused) = cell.paused {
+                p.set_paused(paused);
+            }
+        }
+        let cfg = &mut self.project.layers[i];
+        // Mix auto de la case (une ancienne case n'en a pas : le mix changerait de vidéo derrière elle).
+        match cell.mix {
+            Some(mix) => cfg.mix = mix,
+            None => cfg.mix.enabled = false,
+        }
+        if let Some(w) = cell.warp {
+            cfg.warp = w;
+        }
+        if let Some(m) = cell.mask {
+            cfg.mask = m;
+        }
+        if let Some(r) = cell.react {
+            cfg.react = r;
+        }
+        cfg.generator = cell.generator;
+        cfg.auto = cell.auto;
+        cfg.fit = cell.fit;
+        cfg.opacity = cell.opacity;
+        cfg.blend = cell.blend;
+        self.apply_preset_to(i, cell.preset, cell.effects, self.project.preset_secs);
+        // `apply_preset_to` garde les animations de forme, contours et destruction du calque :
+        // ici ce sont celles de la case qu'on veut.
+        let fx = &mut self.project.layers[i].effects;
+        *fx = fx.with_shape_of(&cell.effects);
+        let rt = &mut self.layers[i];
+        rt.auto_timer = 0.0;
+        rt.cell = Some(k);
+    }
+
+    /// Pendant un glisser-déposer de média : miniature et nom sous le pointeur.
+    fn media_drag_preview(&mut self, ctx: &egui::Context) {
+        let Some(drag) = egui::DragAndDrop::payload::<MediaDrag>(ctx) else {
+            return;
+        };
+        let Some(pos) = ctx.pointer_interact_pos() else {
+            return;
+        };
+        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::NULL.with("media_drag")));
+        let rect = Rect::from_min_size(pos + Vec2::new(12.0, 12.0), Vec2::new(78.0, 44.0));
+        painter.rect_filled(rect.expand(3.0), 6.0, theme::PANEL);
+        let name = match &*drag {
+            MediaDrag::File(path) => {
+                match self.thumbs.get(ctx, path) {
+                    Some(t) => {
+                        let full = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+                        painter.image(t.id(), rect, full, Color32::WHITE);
+                    }
+                    None => {
+                        painter.rect_filled(rect, 4.0, theme::WIDGET);
+                    }
+                }
+                file_name(path)
+            }
+            MediaDrag::Pattern(p) => {
+                let palette = self.project.layers[self.sel()].generator.palette;
+                paint_pattern_swatch(&painter, rect, *p, palette);
+                p.label().to_owned()
+            }
+        };
+        painter.rect_stroke(rect.expand(3.0), 6.0, Stroke::new(1.5, WARN), egui::StrokeKind::Outside);
+        painter.text(
+            rect.left_bottom() + Vec2::new(0.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            name,
+            egui::FontId::proportional(11.0),
+            TEXT,
+        );
+    }
+
+    /// Média déposé sur la case `k` du calque `i` : nouvelle case avec ce média (sans effets),
+    /// ou, sur une case pleine, remplacement de son média en gardant ses effets et réglages.
+    fn drop_media_in_cell(&mut self, ctx: &egui::Context, i: usize, k: usize, media: MediaDrag) {
+        let stem = |p: &Path| p.file_stem().map_or_else(|| file_name(p), |s| s.to_string_lossy().into_owned());
+        // Nom automatique d'une case : celui de son média (fichier ou motif).
+        let auto_name = |c: &Cell| match &c.clip {
+            Some(p) => stem(p),
+            None => c.generator.pattern.label().to_owned(),
+        };
+        let fit = self.project.layers[i].fit;
+        let cells = &mut self.project.layers[i].cells;
+        if cells.len() <= k {
+            cells.resize(k + 1, None);
+        }
+        let cell = cells[k].get_or_insert_with(|| Cell { fit, ..Cell::default() });
+        // Nom gardé s'il a été changé à la main ; sinon il suit le média.
+        let renamed = !cell.name.is_empty() && cell.name != auto_name(cell);
+        match &media {
+            MediaDrag::File(path) => {
+                cell.clip = Some(path.clone());
+                // Une vidéo remplace le visuel généré.
+                cell.generator.pattern = Pattern::Off;
+            }
+            MediaDrag::Pattern(p) => {
+                cell.clip = None;
+                cell.generator.pattern = *p;
+                cell.generator.mix = 1.0;
+            }
+        }
+        if !renamed {
+            cell.name = auto_name(cell);
+        }
+        self.layers[i].cell_pos.remove(&k);
+        // Case en cours de lecture : le nouveau média passe tout de suite à l'écran
+        // (sinon la case reprendrait l'ancien en gardant l'état du calque).
+        if self.layers[i].cell == Some(k) {
+            self.launch_any(ctx, i, &media);
+        }
+    }
+
+    /// Envoie un média (fichier ou visuel généré) sur le calque `i`.
+    fn launch_any(&mut self, ctx: &egui::Context, i: usize, media: &MediaDrag) {
+        match media {
+            MediaDrag::File(path) => {
+                // Une vidéo envoyée remplace le visuel généré du calque.
+                self.project.layers[i].generator.pattern = Pattern::Off;
+                self.launch_on(ctx, i, path);
+            }
+            MediaDrag::Pattern(p) => {
+                // Un visuel généré remplace la vidéo du calque, comme un autre média.
+                self.stop_layer(i);
+                self.project.layers[i].mix.enabled = false;
+                let g = &mut self.project.layers[i].generator;
+                g.pattern = *p;
+                g.mix = 1.0;
+            }
+        }
+    }
+
+    fn column_filled(&self, k: usize) -> bool {
+        self.project.layers.iter().any(|l| l.cells.get(k).is_some_and(Option::is_some))
+    }
+
+    /// Joue toute la colonne `k` : chaque calque qui a une case dans cette colonne la lance.
+    fn play_column(&mut self, ctx: &egui::Context, k: usize) {
+        for i in 0..self.project.layers.len() {
+            self.play_cell(ctx, i, k);
+        }
+        self.chain_col = Some(k);
+        self.chain_timer = 0.0;
+    }
+
+    /// Enchaînement : colonne remplie suivante (en boucle).
+    fn chain_next(&mut self, ctx: &egui::Context) {
+        let n = self.project.columns;
+        let start = self.chain_col.map_or(0, |c| c + 1);
+        if let Some(k) = (0..n).map(|d| (start + d) % n).find(|&k| self.column_filled(k)) {
+            self.play_column(ctx, k);
+        } else {
+            self.chain_timer = 0.0;
+        }
+    }
+
     // ---------------------------------------------------------------- calques
 
     fn add_layer(&mut self) {
@@ -675,6 +1032,7 @@ impl OzApp {
         self.project.layers.remove(i);
         self.layers.remove(i);
         self.selected = self.selected.min(self.project.layers.len() - 1);
+        self.fx_hidden_alert = None;
     }
 
     fn move_layer(&mut self, i: usize, up: bool) {
@@ -684,6 +1042,7 @@ impl OzApp {
         }
         self.project.layers.swap(i, j);
         self.layers.swap(i, j);
+        self.fx_hidden_alert = None;
         if self.selected == i {
             self.selected = j;
         } else if self.selected == j {
@@ -696,6 +1055,193 @@ impl OzApp {
         self.apply_preset_to(i, name, fx, self.project.preset_secs);
         // Un choix manuel reste affiché un intervalle complet avant que le mode Auto ne reprenne la main.
         self.layers[i].auto_timer = 0.0;
+    }
+
+    /// Le calque `i` dessine-t-il quelque chose (vidéo, photo ou visuel généré) ?
+    fn has_content(&self, i: usize) -> bool {
+        let rt = &self.layers[i];
+        rt.active().is_some() || rt.gen_shown.0 != Pattern::Off || rt.gen_from.0 != Pattern::Off
+    }
+
+    /// Pourquoi le calque `i` ne se voit pas à l'écran (None s'il est visible).
+    fn hidden_reason(&self, i: usize) -> Option<String> {
+        let cfg = &self.project.layers[i];
+        if !cfg.visible {
+            return Some("il est masqué".into());
+        }
+        if cfg.opacity <= 0.0 {
+            return Some("son opacité est à 0".into());
+        }
+        if !self.has_content(i) {
+            return Some("il n'a ni vidéo ni visuel".into());
+        }
+        self.covered_by(i).map(|j| format!("il est recouvert par le calque « {} », placé devant", self.project.layers[j].name))
+    }
+
+    /// Calque opaque placé devant qui recouvre entièrement le calque `i` (celui qui en cache le plus).
+    /// Test approché sur une grille de points de la sortie : forme déformée et masque de chaque calque.
+    fn covered_by(&self, i: usize) -> Option<usize> {
+        const NX: usize = 32;
+        const NY: usize = 18;
+        // Calques devant qui cachent complètement ce qu'il y a derrière eux.
+        let front: Vec<(usize, Vec<surface::Point>)> = (i + 1..self.project.layers.len())
+            .filter(|&j| {
+                let c = &self.project.layers[j];
+                c.visible
+                    && c.opacity >= 0.99
+                    && c.blend == BlendMode::Normal
+                    && c.fit != Fit::Contain
+                    && c.effects.shatter == Shatter::Off
+                    && c.effects.obj3d == Object3d::Off
+                    && c.effects.fold <= 0.0
+                    && self.has_content(j)
+            })
+            .map(|j| (j, self.project.layers[j].warp.outline()))
+            .collect();
+        if front.is_empty() {
+            return None;
+        }
+        let cfg = &self.project.layers[i];
+        let outline = cfg.warp.outline();
+        let mut hits = vec![0usize; front.len()];
+        let mut drawn = 0;
+        for y in 0..NY {
+            for x in 0..NX {
+                let p = [(x as f32 + 0.5) / NX as f32, (y as f32 + 0.5) / NY as f32];
+                if surface::winding(&outline, p) == 0 || !cfg.mask.contains(p) {
+                    continue;
+                }
+                drawn += 1;
+                let cover = front
+                    .iter()
+                    .rposition(|(j, o)| surface::winding(o, p) != 0 && self.project.layers[*j].mask.contains(p));
+                match cover {
+                    Some(k) => hits[k] += 1,
+                    None => return None, // ce point du calque reste visible
+                }
+            }
+        }
+        if drawn == 0 {
+            return None;
+        }
+        hits.iter().enumerate().max_by_key(|(_, h)| **h).map(|(k, _)| front[k].0)
+    }
+
+    /// Effets visés par le calque `i` (la cible d'une transition en cours, sinon les effets actuels).
+    fn fx_target(&self, i: usize) -> (Effects, Option<String>) {
+        let rt = &self.layers[i];
+        let fx = rt.fx_anim.as_ref().map_or(self.project.layers[i].effects, |a| a.to);
+        (fx, rt.preset.clone())
+    }
+
+    /// Bandeau : l'effet choisi ne se voit pas, proposer de l'appliquer sur un calque visible.
+    fn hidden_fx_banner(&mut self, ui: &mut egui::Ui) {
+        let sel = self.sel();
+        if self.fx_hidden_alert != Some(sel) {
+            self.fx_hidden_alert = None;
+            return;
+        }
+        let Some(reason) = self.hidden_reason(sel) else {
+            // Le calque est redevenu visible : plus rien à signaler.
+            self.fx_hidden_alert = None;
+            return;
+        };
+        // Calques visibles, du premier plan vers le fond (comme la liste).
+        let visible: Vec<usize> = (0..self.project.layers.len())
+            .rev()
+            .filter(|&j| j != sel && self.hidden_reason(j).is_none())
+            .collect();
+        let can_show = !self.project.layers[sel].visible || self.project.layers[sel].opacity <= 0.0;
+        let can_raise = !can_show && self.has_content(sel) && sel + 1 < self.project.layers.len();
+        let mut raise = false;
+        let mut target = None;
+        let mut show = false;
+        let mut dismiss = false;
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .corner_radius(6.0)
+            .fill(WARN.gamma_multiply(0.12))
+            .stroke(Stroke::new(1.0, WARN.gamma_multiply(0.6)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(ic::WARNING).size(16.0).color(WARN));
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "L'effet ne se voit pas : le calque « {} » n'est pas visible à l'écran ({reason}).",
+                                self.project.layers[sel].name
+                            ))
+                            .color(TEXT),
+                        )
+                        .wrap(),
+                    );
+                });
+                if visible.is_empty() {
+                    ui.label(
+                        egui::RichText::new("Aucun autre calque n'est visible pour l'instant.").small().color(TEXT_WEAK),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new("Sélectionner un calque visible et y appliquer l'effet :")
+                            .small()
+                            .color(TEXT_WEAK),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        for &j in &visible {
+                            if ui
+                                .button(with_icon(ic::ARROW_RIGHT, &self.project.layers[j].name))
+                                .on_hover_text("Sélectionner ce calque et lui appliquer les mêmes effets")
+                                .clicked()
+                            {
+                                target = Some(j);
+                            }
+                        }
+                    });
+                }
+                ui.horizontal(|ui| {
+                    if can_show
+                        && ui
+                            .button(with_icon(ic::EYE, "Afficher ce calque"))
+                            .on_hover_text("Rendre visible le calque sélectionné")
+                            .clicked()
+                    {
+                        show = true;
+                    }
+                    if can_raise
+                        && ui
+                            .button(with_icon(ic::CARET_UP, "Passer au premier plan"))
+                            .on_hover_text("Placer le calque sélectionné devant tous les autres")
+                            .clicked()
+                    {
+                        raise = true;
+                    }
+                    if ui.button(with_icon(ic::X, "Ignorer")).clicked() {
+                        dismiss = true;
+                    }
+                });
+            });
+        ui.add_space(4.0);
+        if let Some(j) = target {
+            let (fx, name) = self.fx_target(sel);
+            self.apply_preset_to(j, name, fx, self.project.preset_secs);
+            self.layers[j].auto_timer = 0.0;
+            self.selected = j;
+            self.fx_hidden_alert = None;
+        } else if show {
+            let cfg = &mut self.project.layers[sel];
+            cfg.visible = true;
+            if cfg.opacity <= 0.0 {
+                cfg.opacity = 1.0;
+            }
+            self.fx_hidden_alert = None;
+        } else if raise {
+            for k in sel..self.project.layers.len() - 1 {
+                self.move_layer(k, true);
+            }
+            self.fx_hidden_alert = None;
+        } else if dismiss {
+            self.fx_hidden_alert = None;
+        }
     }
 
     /// Retour à l'image brute sur le calque sélectionné : plus d'effets et mode AUTO coupé.
@@ -795,6 +1341,12 @@ impl OzApp {
         if dt > 0.0 {
             self.fps = self.fps * 0.95 + (1.0 / dt) * 0.05;
         }
+        if self.project.chain.enabled {
+            self.chain_timer += dt;
+            if self.chain_col.is_none() || self.chain_timer >= self.project.chain.secs.max(0.5) {
+                self.chain_next(ctx);
+            }
+        }
 
         for (rt, cfg) in self.layers.iter_mut().zip(&mut self.project.layers) {
             // Fondu enchaîné : démarre dès que la nouvelle vidéo a sa première image.
@@ -856,6 +1408,7 @@ impl OzApp {
         // Rythme : réactions sur les temps.
         let pulse = self.rhythm.update(self.clock());
         let rhythm_on = self.rhythm.active();
+        let counts_beats = self.rhythm.source != rhythm::Source::Manual;
         for i in 0..self.layers.len() {
             let (react, auto_on, mix_on) = {
                 let cfg = &self.project.layers[i];
@@ -867,7 +1420,7 @@ impl OzApp {
                 continue;
             }
             rt.beat.step(&react, pulse.beat, dt);
-            if pulse.beat {
+            if pulse.beat && counts_beats {
                 if auto_on && react.auto_beats > 0 {
                     rt.auto_beats += 1;
                     if rt.auto_beats >= react.auto_beats {
@@ -949,9 +1502,11 @@ impl OzApp {
     }
 
     /// Le calque `i` change sur les temps (AUTO ou mix, selon `n`) plutôt qu'à la durée.
+    /// En mode manuel il n'y a pas de temps réguliers : AUTO et mix gardent leur durée,
+    /// les appuis sur T ne pilotent que les réactions.
     fn on_beats(&self, i: usize, n: impl Fn(&rhythm::React) -> u32) -> bool {
         let react = &self.project.layers[i].react;
-        react.enabled && n(react) > 0 && self.rhythm.active()
+        react.enabled && n(react) > 0 && self.rhythm.active() && self.rhythm.source != rhythm::Source::Manual
     }
 
     fn draw_params(&mut self) -> DrawParams {
@@ -1009,6 +1564,8 @@ impl OzApp {
                 effects,
                 opacity: cfg.opacity,
                 blend: cfg.blend,
+                fit: cfg.fit,
+                surface_aspect: cfg.warp.aspect((self.output_size.x, self.output_size.y)),
                 grid: self.grid,
                 phases: if self.bypass_fx { Phases::default() } else { rt.phases },
             });
@@ -1135,6 +1692,7 @@ impl OzApp {
         ui.painter().circle_filled(rect.center(), 5.0, color);
         let label = match self.rhythm.source {
             rhythm::Source::Audio(_) if on => "SON".to_owned(),
+            rhythm::Source::Manual => "MANUEL".to_owned(),
             _ => format!("{:.0} BPM", self.rhythm.tempo.bpm),
         };
         if ui
@@ -1148,21 +1706,24 @@ impl OzApp {
 
     /// Onglet Rythme : source (son ou tempo) et réaction du calque sélectionné.
     fn generator_ui(&mut self, ui: &mut egui::Ui) {
+        let sec = self.section();
         let sel = self.sel();
         let has_video = self.layers[sel].active().is_some();
         let timer = self.layers[sel].gen_timer;
         let mut next = false;
         let g = &mut self.project.layers[sel].generator;
         let d = crate::generator::Generator::default();
-        ui.label(
-            egui::RichText::new(
-                "Visuels psychédéliques générés en direct, sans vidéo. Les effets, le masque et la déformation \
-                 s'appliquent dessus comme sur une vidéo : essayez-les avec le kaléidoscope ou le tourbillon.",
-            )
-            .small()
-            .color(TEXT_WEAK),
-        );
-        egui::CollapsingHeader::new(with_icon(ic::SPIRAL, "Motif")).default_open(true).show(ui, |ui| {
+        if sec.0 < 4 {
+            ui.label(
+                egui::RichText::new(
+                    "Visuels psychédéliques générés en direct, sans vidéo. Les effets, le masque et la déformation \
+                     s'appliquent dessus comme sur une vidéo : essayez-les avec le kaléidoscope ou le tourbillon.",
+                )
+                .small()
+                .color(TEXT_WEAK),
+            );
+        }
+        sec.show(ui, 0, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for p in Pattern::ALL {
                     let resp = ui.selectable_label(g.pattern == p, p.label()).on_hover_text(p.description());
@@ -1172,7 +1733,7 @@ impl OzApp {
                 }
             });
         });
-        egui::CollapsingHeader::new(with_icon(ic::PALETTE, "Couleurs")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 1, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for p in Palette::ALL {
                     if ui.selectable_label(g.palette == p, p.label()).clicked() {
@@ -1183,7 +1744,7 @@ impl OzApp {
             fx_slider(ui, "Décalage des couleurs", &mut g.hue, 0.0..=1.0, d.hue);
             fx_slider(ui, "Rotation des couleurs /s", &mut g.color_speed, -1.0..=1.0, d.color_speed);
         });
-        egui::CollapsingHeader::new(with_icon(ic::SLIDERS_HORIZONTAL, "Réglages")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 2, |ui| {
             fx_slider(ui, "Vitesse", &mut g.speed, -3.0..=3.0, d.speed);
             fx_slider(ui, "Taille du motif", &mut g.scale, 0.2..=5.0, d.scale);
             fx_slider(ui, "Détail", &mut g.detail, 0.0..=1.0, d.detail);
@@ -1193,7 +1754,7 @@ impl OzApp {
             .response
             .on_disabled_hover_text("Sans vidéo sur ce calque, le visuel est affiché entier");
         });
-        egui::CollapsingHeader::new(with_icon(ic::SHUFFLE, "Enchaînement")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 3, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut g.auto, "Changer de motif automatiquement");
                 if ui
@@ -1216,13 +1777,107 @@ impl OzApp {
         self.shape_fx_ui(ui);
     }
 
+    /// Contours animés de l'image du calque (idéal pour une photo).
+    fn lines_fx_ui(&mut self, ui: &mut egui::Ui) {
+        let i = self.sel();
+        let fx = &mut self.project.layers[i].effects;
+        let d = Effects::default();
+        ui.scope(|ui| {
+            ui.label(
+                egui::RichText::new(
+                    "Les contours de l'image s'illuminent et bougent : idéal pour donner vie à une photo, \
+                     marche aussi sur une vidéo ou un visuel.",
+                )
+                .small()
+                .color(TEXT_WEAK),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for (k, (name, desc)) in Effects::LINE_STYLES.iter().enumerate() {
+                    if ui.button(*name).on_hover_text(*desc).clicked() {
+                        fx.set_lines_style(k);
+                    }
+                }
+            });
+            ui.label(egui::RichText::new("Lumière").strong().color(TEXT));
+            ui.horizontal(|ui| {
+                let mut color = fx.lines_color;
+                if ui.color_edit_button_rgb(&mut color).on_hover_text("Couleur des contours").changed() {
+                    fx.lines_color = color;
+                }
+                fx_slider(ui, "Arc-en-ciel", &mut fx.lines_rainbow, 0.0..=1.0, d.lines_rainbow);
+            });
+            fx_slider(ui, "Illumination", &mut fx.lines_glow, 0.0..=3.0, d.lines_glow);
+            fx_slider(ui, "Seuil (moins de contours)", &mut fx.lines_threshold, 0.0..=1.0, d.lines_threshold);
+            fx_slider(ui, "Halo px", &mut fx.lines_width, 1.0..=16.0, d.lines_width);
+            fx_slider(ui, "Assombrir l'image", &mut fx.lines_dim, 0.0..=1.0, d.lines_dim);
+            ui.label(egui::RichText::new("Mouvement").strong().color(TEXT));
+            fx_slider(ui, "Vagues de lumière", &mut fx.lines_flow, 0.0..=1.0, d.lines_flow);
+            fx_slider(ui, "Vitesse vagues /s", &mut fx.lines_flow_speed, -2.0..=2.0, d.lines_flow_speed);
+            fx_slider(ui, "Ondulation", &mut fx.lines_wobble, 0.0..=0.02, d.lines_wobble);
+            fx_slider(ui, "Vitesse ondulation /s", &mut fx.lines_wobble_speed, 0.0..=3.0, d.lines_wobble_speed);
+        });
+    }
+
     /// Animations qui suivent le contour du masque (réglages d'effets du calque).
     fn shape_fx_ui(&mut self, ui: &mut egui::Ui) {
+        let sec = self.section();
         let i = self.sel();
         let has_mask = self.project.layers[i].mask.is_active();
         let fx = &mut self.project.layers[i].effects;
         let d = Effects::default();
-        egui::CollapsingHeader::new(with_icon(ic::SHAPES, "Sur la forme du masque")).default_open(true).show(ui, |ui| {
+        let builtin = effects::mask_anim_presets();
+        let user = &mut self.project.mask_presets;
+        let preset_name = &mut self.mask_preset_name;
+        sec.show(ui, 4, |ui| {
+            ui.label(egui::RichText::new(with_icon(ic::STAR, "Presets")).strong().color(TEXT));
+            ui.horizontal_wrapped(|ui| {
+                for p in &builtin {
+                    let on = fx.uses_shape() && fx.same_mask_anim(&p.effects);
+                    if ui.selectable_label(on, &p.name).clicked() {
+                        *fx = fx.with_mask_anim_of(&p.effects);
+                    }
+                }
+                if ui
+                    .button(with_icon(ic::PROHIBIT, "Aucune"))
+                    .on_hover_text("Retirer les animations sur la forme du masque")
+                    .clicked()
+                {
+                    *fx = fx.with_mask_anim_of(&d);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(preset_name).hint_text("Nom").desired_width(130.0));
+                if ui
+                    .button(with_icon(ic::FLOPPY_DISK, "Mémoriser"))
+                    .on_hover_text("Enregistrer les animations de forme actuelles comme preset")
+                    .clicked()
+                {
+                    let name = if preset_name.trim().is_empty() {
+                        format!("Forme {}", user.len() + 1)
+                    } else {
+                        preset_name.trim().to_owned()
+                    };
+                    user.push(Preset { name, effects: d.with_mask_anim_of(fx) });
+                    preset_name.clear();
+                }
+            });
+            let mut remove = None;
+            ui.horizontal_wrapped(|ui| {
+                for (k, p) in user.iter().enumerate() {
+                    let on = fx.uses_shape() && fx.same_mask_anim(&p.effects);
+                    let resp = ui.selectable_label(on, &p.name).on_hover_text("Clic : appliquer · Clic droit : supprimer");
+                    if resp.clicked() {
+                        *fx = fx.with_mask_anim_of(&p.effects);
+                    }
+                    if resp.secondary_clicked() {
+                        remove = Some(k);
+                    }
+                }
+            });
+            if let Some(k) = remove {
+                user.remove(k);
+            }
+            ui.separator();
             if !has_mask {
                 ui.label(
                     egui::RichText::new(
@@ -1263,7 +1918,7 @@ impl OzApp {
             fx_slider(ui, "Fréquence respiration Hz", &mut fx.shape_breathe_rate, 0.05..=4.0, d.shape_breathe_rate);
         });
         let mut shot = false;
-        egui::CollapsingHeader::new(with_icon(ic::LIGHTNING, "Destruction")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 5, |ui| {
             ui.label(
                 egui::RichText::new(
                     "La forme se casse depuis le centre du masque (ou du calque, sans masque) et laisse voir \
@@ -1301,7 +1956,14 @@ impl OzApp {
     }
 
     fn rhythm_ui(&mut self, ui: &mut egui::Ui) {
-        theme::section(ui, ic::WAVES, "Source du rythme");
+        if self.section().0 == 0 {
+            self.rhythm_source_ui(ui);
+        } else {
+            self.rhythm_react_ui(ui);
+        }
+    }
+
+    fn rhythm_source_ui(&mut self, ui: &mut egui::Ui) {
         let current = match &self.rhythm.source {
             rhythm::Source::Off => "Aucune".to_owned(),
             rhythm::Source::Audio(None) => match &self.rhythm.input {
@@ -1310,6 +1972,7 @@ impl OzApp {
             },
             rhythm::Source::Audio(Some(n)) => n.clone(),
             rhythm::Source::Tempo => "Tempo tapé (BPM)".to_owned(),
+            rhythm::Source::Manual => "Manuel (touche T)".to_owned(),
         };
         let mut chosen = None;
         let combo = egui::ComboBox::from_id_salt("rhythm_source").selected_text(current).width(220.0).show_ui(ui, |ui| {
@@ -1318,6 +1981,13 @@ impl OzApp {
             }
             if ui.selectable_label(self.rhythm.source == rhythm::Source::Tempo, "Tempo tapé (BPM)").clicked() {
                 chosen = Some(rhythm::Source::Tempo);
+            }
+            if ui
+                .selectable_label(self.rhythm.source == rhythm::Source::Manual, "Manuel (touche T)")
+                .on_hover_text("Chaque appui sur T donne une pulsation ; sans appui, plus rien ne bouge")
+                .clicked()
+            {
+                chosen = Some(rhythm::Source::Manual);
             }
             ui.separator();
             if ui.selectable_label(self.rhythm.source == rhythm::Source::Audio(None), "Entrée audio par défaut").clicked() {
@@ -1332,7 +2002,7 @@ impl OzApp {
         });
         combo.response.on_hover_text(
             "Son : micro ou entrée de la carte son (pour la sortie de l'ordinateur, utiliser une entrée virtuelle \
-             comme BlackHole sur Mac ou « Mixage stéréo » sous Windows).\nTempo : taper le rythme avec le bouton TAP ou la touche T.",
+             comme BlackHole sur Mac ou « Mixage stéréo » sous Windows).\nTempo : taper le rythme avec le bouton TAP ou la touche T.\nManuel : une pulsation à chaque appui sur T, rien sans appui.",
         );
         if let Some(source) = chosen {
             self.rhythm.set_source(source);
@@ -1384,6 +2054,18 @@ impl OzApp {
                     }
                 });
             }
+            rhythm::Source::Manual => {
+                ui.horizontal(|ui| {
+                    if ui.add(theme::primary_button(with_icon(ic::LIGHTNING, "PULSE"))).on_hover_text("Touche T").clicked() {
+                        self.tap();
+                    }
+                    ui.label(
+                        egui::RichText::new("Une pulsation par appui sur T ; sans appui, plus rien ne bouge.")
+                            .small()
+                            .color(TEXT_WEAK),
+                    );
+                });
+            }
             _ => {}
         }
         if self.rhythm.active() {
@@ -1391,9 +2073,10 @@ impl OzApp {
             ui.painter().rect_filled(rect, 3.0, ACCENT.gamma_multiply(0.1 + 0.9 * pulse.env));
         }
 
-        ui.add_space(8.0);
+    }
+
+    fn rhythm_react_ui(&mut self, ui: &mut egui::Ui) {
         let sel = self.sel();
-        theme::section(ui, ic::SPARKLE, "Réaction du calque");
         let react = &mut self.project.layers[sel].react;
         ui.toggle_value(&mut react.enabled, with_icon(ic::LIGHTNING, "Réagir au rythme"))
             .on_hover_text("Les effets de ce calque bougent avec le son ou le tempo");
@@ -1439,8 +2122,15 @@ impl OzApp {
             ui.add(egui::Slider::new(&mut react.mix_beats, 0..=32).text("Mix auto : coupe tous les").suffix(" temps"))
                 .on_hover_text("Remplace les durées de séquence du mix auto (onglet Mix)");
         });
+        if self.rhythm.source == rhythm::Source::Manual {
+            ui.label(
+                egui::RichText::new("Mode manuel : AUTO et mix gardent leur durée en secondes ; T ne pilote que les réactions.")
+                    .small()
+                    .color(TEXT_WEAK),
+            );
+        }
         if !self.rhythm.active() {
-            ui.label(egui::RichText::new("Choisir une source du rythme ci-dessus pour activer les réactions.").small().color(WARN));
+            ui.label(egui::RichText::new("Choisir une source du rythme (onglet Source) pour activer les réactions.").small().color(WARN));
         }
     }
 
@@ -1584,7 +2274,7 @@ impl OzApp {
                 .clicked()
                 && self.edit_mapping
             {
-                self.right_tab = RightTab::Shape;
+                self.show_shape_tab(self.edit_target);
             }
             ui.separator();
             ui.label(egui::RichText::new(ic::SUN).size(15.0)).on_hover_text("Luminosité générale (master)");
@@ -1606,9 +2296,11 @@ impl OzApp {
         ui.horizontal(|ui| {
             theme::section(ui, ic::FILM_STRIP, "Médias");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button(with_icon(ic::PLUS, "Ajouter")).on_hover_text("Ajouter des vidéos (ou glisser-déposer)").clicked()
+            if ui.button(with_icon(ic::PLUS, "Ajouter")).on_hover_text("Ajouter des vidéos ou des photos (ou glisser-déposer)").clicked()
                 && let Some(files) = rfd::FileDialog::new()
+                    .add_filter("Vidéos et photos", &[VIDEO_EXTENSIONS, crate::mask::IMAGE_EXTENSIONS].concat())
                     .add_filter("Vidéos", VIDEO_EXTENSIONS)
+                    .add_filter("Photos", crate::mask::IMAGE_EXTENSIONS)
                     .add_filter("Tous les fichiers", &["*"])
                     .pick_files()
             {
@@ -1640,8 +2332,8 @@ impl OzApp {
                         ui.set_width(ui.available_width());
                         ui.vertical_centered(|ui| {
                             ui.label(egui::RichText::new(ic::VIDEO).size(28.0).color(TEXT_WEAK));
-                            ui.label(egui::RichText::new("Glissez-déposez vos vidéos ici").color(TEXT_WEAK));
-                            ui.label(egui::RichText::new("mp4, mkv, mov, webm…").small().color(TEXT_WEAK));
+                            ui.label(egui::RichText::new("Glissez-déposez vos vidéos et photos ici").color(TEXT_WEAK));
+                            ui.label(egui::RichText::new("mp4, mov, webm… jpg, png, heic…").small().color(TEXT_WEAK));
                         });
                     });
                 }
@@ -1674,15 +2366,15 @@ impl OzApp {
                                 egui::Image::new(t)
                                     .fit_to_exact_size(size)
                                     .corner_radius(4.0)
-                                    .sense(Sense::click()),
+                                    .sense(Sense::click_and_drag()),
                             ),
                             None => {
-                                let (r, resp) = ui.allocate_exact_size(size, Sense::click());
+                                let (r, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
                                 ui.painter().rect_filled(r, 4.0, theme::WIDGET);
                                 ui.painter().text(
                                     r.center(),
                                     egui::Align2::CENTER_CENTER,
-                                    ic::FILM_SLATE,
+                                    if video::is_still_image(path) { ic::IMAGE } else { ic::FILM_SLATE },
                                     egui::FontId::proportional(18.0),
                                     TEXT_WEAK,
                                 );
@@ -1705,8 +2397,8 @@ impl OzApp {
                             let name = egui::RichText::new(file_name(path)).strong();
                             let name = if playing { name.color(ACCENT) } else { name.color(TEXT) };
                             let label = ui
-                                .add(egui::Label::new(name).truncate().sense(Sense::click()))
-                                .on_hover_text(path.display().to_string());
+                                .add(egui::Label::new(name).truncate().sense(Sense::click_and_drag()))
+                                .on_hover_text(format!("{}\nGlisser vers une case du tableau pour en faire un preset", path.display()));
                             ui.horizontal(|ui| {
                                 if ui
                                     .add(theme::primary_button(ic::PLAY).small())
@@ -1754,6 +2446,10 @@ impl OzApp {
                         .inner
                     });
                     let resp = row.inner;
+                    // Glisser le média : on peut le déposer sur une case du tableau.
+                    if resp.drag_started() {
+                        egui::DragAndDrop::set_payload(&ctx, MediaDrag::File(path.clone()));
+                    }
                     if resp.double_clicked() {
                         to_launch = Some(i);
                     } else if resp.clicked() {
@@ -1784,7 +2480,70 @@ impl OzApp {
         }
 
         ui.add_space(6.0);
+        self.generated_media_ui(ui);
+        ui.add_space(6.0);
         self.cue_ui(ui);
+    }
+
+    /// Visuels générés, présentés comme des médias : envoyer sur un calque, glisser vers une case.
+    fn generated_media_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        theme::section(ui, ic::SUN, "Visuels générés");
+        ui.label(
+            egui::RichText::new("Clic : envoyer sur le calque · glisser vers une case du tableau")
+                .small()
+                .color(TEXT_WEAK),
+        );
+        let palette = self.project.layers[self.sel()].generator.palette;
+        let size = Vec2::new(70.0, 40.0);
+        let mut launch = None;
+        egui::ScrollArea::vertical().id_salt("generated").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(4.0);
+                for p in Pattern::ALL.into_iter().filter(|p| *p != Pattern::Off) {
+                    // Calques qui affichent ce motif.
+                    let on_layers: Vec<String> = self
+                        .project
+                        .layers
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.generator.pattern == p)
+                        .map(|(k, _)| format!("C{}", k + 1))
+                        .collect();
+                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+                    let painter = ui.painter();
+                    paint_pattern_swatch(painter, rect, p, palette);
+                    let band = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 14.0), rect.max);
+                    painter.rect_filled(band, 0.0, Color32::from_black_alpha(170));
+                    let short: String =
+                        if p.label().chars().count() > 12 { p.label().chars().take(11).chain(['…']).collect() } else { p.label().to_owned() };
+                    painter.text(band.left_center() + Vec2::new(3.0, 0.0), egui::Align2::LEFT_CENTER, short, egui::FontId::proportional(10.0), TEXT);
+                    let stroke = if !on_layers.is_empty() {
+                        Stroke::new(2.0, ACCENT)
+                    } else if resp.hovered() {
+                        Stroke::new(1.0, TEXT)
+                    } else {
+                        Stroke::new(1.0, theme::BORDER)
+                    };
+                    painter.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+                    let mut hover = format!("{}\n{}", p.label(), p.description());
+                    if !on_layers.is_empty() {
+                        hover.push_str(&format!("\nSur : {}", on_layers.join(" ")));
+                    }
+                    let resp = resp.on_hover_text(hover);
+                    if resp.drag_started() {
+                        egui::DragAndDrop::set_payload(&ctx, MediaDrag::Pattern(p));
+                    }
+                    if resp.clicked() {
+                        launch = Some(p);
+                    }
+                }
+            });
+        });
+        if let Some(p) = launch {
+            let sel = self.sel();
+            self.launch_any(&ctx, sel, &MediaDrag::Pattern(p));
+        }
     }
 
     fn cue_ui(&mut self, ui: &mut egui::Ui) {
@@ -1815,17 +2574,18 @@ impl OzApp {
             }
         }
         ui.label(egui::RichText::new(file_name(&cue.path)).strong().color(TEXT));
-        ui.label(
-            egui::RichText::new(format!(
+        let details = if cue.info.still {
+            format!("Photo  ·  {}×{}", cue.info.width, cue.info.height)
+        } else {
+            format!(
                 "{}×{}  ·  {:.2} i/s  ·  {}",
                 cue.info.width,
                 cue.info.height,
                 cue.info.fps,
                 fmt_time(cue.info.duration)
-            ))
-            .small()
-            .color(TEXT_WEAK),
-        );
+            )
+        };
+        ui.label(egui::RichText::new(details).small().color(TEXT_WEAK));
 
         let path = cue.path.clone();
         let mut pos = cue.position() as f32;
@@ -1875,7 +2635,7 @@ impl OzApp {
         ui.add_space(8.0);
         let total = ui.available_width();
         ui.horizontal_top(|ui| {
-            ui.allocate_ui(Vec2::new(total * 0.64, ui.available_height()), |ui| {
+            ui.allocate_ui(Vec2::new(total * 0.74, ui.available_height()), |ui| {
                 ui.vertical(|ui| self.layer_list(ui));
             });
             ui.separator();
@@ -1896,16 +2656,68 @@ impl OzApp {
                 }
             });
             ui.label(
-                egui::RichText::new("Tab : calque suivant · en haut de la liste = au premier plan")
+                egui::RichText::new("Tab : calque suivant · en haut = au premier plan")
                     .small()
                     .color(TEXT_WEAK),
             );
+            ui.separator();
+            ui.label(egui::RichText::new(with_icon(ic::SQUARES_FOUR, "Tableau")).strong().color(TEXT)).on_hover_text(
+                "Chaque case garde un média avec ses effets et réglages.\n\
+                 Case vide : enregistrer l'état actuel du calque · Case pleine : la jouer · Clic droit : options.\n\
+                 Le bouton d'une colonne joue toutes ses cases d'un coup.",
+            );
+            let chain = &mut self.project.chain;
+            ui.toggle_value(&mut chain.enabled, with_icon(ic::REPEAT, "Enchaîner"))
+                .on_hover_text("Joue les colonnes remplies l'une après l'autre, en boucle");
+            ui.add(egui::DragValue::new(&mut chain.secs).range(0.5..=600.0).speed(0.1).suffix(" s"))
+                .on_hover_text("Durée de chaque colonne");
         });
 
         let n = self.project.layers.len();
         let sel = self.sel();
         let mut action: Option<(usize, &str)> = None;
+        let columns = self.project.columns;
+        let cell_size = Vec2::new(78.0, 30.0);
+        let ctx = ui.ctx().clone();
+        let mut cell_action: Option<CellAction> = None;
+        // Les cases défilent horizontalement, toutes lignes ensemble ; les cartes des calques restent fixes.
+        let offset = self.grid_offset;
+        let mut new_offset = offset;
+        let cells_scroll = |row: usize| {
+            egui::ScrollArea::horizontal()
+                .id_salt(("cells", row))
+                .horizontal_scroll_offset(offset)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        };
         egui::ScrollArea::vertical().id_salt("layers").show(ui, |ui| {
+            // En-têtes de colonnes, alignés sur les cases (à droite des cartes de calque).
+            ui.horizontal(|ui| {
+                ui.add_space(self.layer_card_w);
+                let out = cells_scroll(usize::MAX).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                for k in 0..columns {
+                    let filled = self.project.layers.iter().any(|l| l.cells.get(k).is_some_and(Option::is_some));
+                    let current = self.chain_col == Some(k);
+                    let text = egui::RichText::new(format!("{} {}", ic::PLAY, k + 1)).small();
+                    let text = if current { text.color(ACCENT) } else if filled { text.color(TEXT) } else { text.color(TEXT_WEAK) };
+                    let resp = ui
+                        .add_enabled(filled, egui::Button::new(text).min_size(Vec2::new(cell_size.x, 18.0)))
+                        .on_hover_text("Jouer toute la colonne (une case par calque)");
+                    if resp.clicked() {
+                        cell_action = Some(CellAction::Column(k));
+                    }
+                }
+                if columns < project::MAX_COLUMNS
+                    && ui.add(theme::icon_button(ic::PLUS).small()).on_hover_text("Ajouter une colonne").clicked()
+                {
+                    cell_action = Some(CellAction::AddColumn);
+                }
+                });
+                });
+                if (out.state.clamped_offset().x - offset).abs() > 0.5 {
+                    new_offset = out.state.clamped_offset().x;
+                }
+            });
             for i in (0..n).rev() {
                 let selected = i == sel;
                 let clip = self.layers[i].active().map(|p| file_name(&p.path));
@@ -1915,6 +2727,7 @@ impl OzApp {
                     .corner_radius(6.0)
                     .fill(if selected { theme::ACCENT_DIM.gamma_multiply(0.55) } else { CARD })
                     .stroke(Stroke::new(1.0, if selected { ACCENT.gamma_multiply(0.7) } else { theme::BORDER }));
+                let row = ui.horizontal(|ui| {
                 let row = frame
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -1943,7 +2756,7 @@ impl OzApp {
                                 None => "—".into(),
                             };
                             ui.add_sized(
-                                [140.0, 20.0],
+                                [110.0, 20.0],
                                 egui::Label::new(egui::RichText::new(clip_text).small().color(TEXT_WEAK)).truncate(),
                             );
                             let badge = egui::RichText::new(ic::MAGIC_WAND).size(15.0);
@@ -1984,6 +2797,70 @@ impl OzApp {
                         });
                     })
                     .response;
+                self.layer_card_w = row.rect.width();
+                // Cases du tableau pour ce calque.
+                let out = cells_scroll(i).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                for k in 0..columns {
+                    let cell = cfg.cells.get(k).and_then(Option::as_ref);
+                    let thumb = cell.and_then(|c| c.clip.as_ref()).and_then(|p| self.thumbs.get(&ctx, p));
+                    let hover = cell.map(|c| {
+                        let mut lines = vec![c.name.clone()];
+                        lines.push(match &c.clip {
+                            Some(p) => with_icon(ic::FILM_SLATE, &file_name(p)),
+                            None if c.generator.pattern != Pattern::Off => with_icon(ic::SUN, c.generator.pattern.label()),
+                            None => "Sans média".into(),
+                        });
+                        if let Some(p) = &c.preset {
+                            lines.push(with_icon(ic::SPARKLE, p));
+                        }
+                        lines.push("Clic : jouer · Clic droit : options".into());
+                        lines.join("\n")
+                    });
+                    let name = cell.map(|c| c.name.clone());
+                    let active = self.layers[i].cell == Some(k) && name.is_some();
+                    let swatch = cell
+                        .filter(|c| c.clip.is_none() && c.generator.pattern != Pattern::Off)
+                        .map(|c| (c.generator.pattern, c.generator.palette));
+                    let resp = cell_widget(ui, cell_size, thumb.as_ref(), swatch, name.as_deref(), active);
+                    if resp.dnd_hover_payload::<MediaDrag>().is_some() {
+                        ui.painter().rect_stroke(resp.rect, 4.0, Stroke::new(2.0, WARN), egui::StrokeKind::Inside);
+                    }
+                    if let Some(m) = resp.dnd_release_payload::<MediaDrag>() {
+                        cell_action = Some(CellAction::Drop(i, k, (*m).clone()));
+                    }
+                    let resp = resp.on_hover_text(
+                        hover.unwrap_or_else(|| "Enregistrer ici le média, les effets et les réglages actuels du calque".into()),
+                    );
+                    if resp.clicked() {
+                        cell_action = Some(if name.is_some() { CellAction::Play(i, k) } else { CellAction::Record(i, k) });
+                    }
+                    if name.is_some() {
+                        resp.context_menu(|ui| {
+                            if let Some(Some(c)) = cfg.cells.get_mut(k) {
+                                ui.horizontal(|ui| {
+                                    ui.label(with_icon(ic::PENCIL_SIMPLE, ""));
+                                    ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(140.0));
+                                });
+                            }
+                            if ui.button(with_icon(ic::FLOPPY_DISK, "Remplacer par l'état actuel")).clicked() {
+                                cell_action = Some(CellAction::Record(i, k));
+                                ui.close();
+                            }
+                            if ui.button(with_icon(ic::TRASH, "Vider la case")).clicked() {
+                                cell_action = Some(CellAction::Clear(i, k));
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+                });
+                });
+                if (out.state.clamped_offset().x - offset).abs() > 0.5 {
+                    new_offset = out.state.clamped_offset().x;
+                }
+                row
+                }).inner;
                 // Un clic n'importe où sur la ligne sélectionne le calque, sans capturer le clic :
                 // les boutons et curseurs de la ligne continuent de fonctionner.
                 let clicked_in_row = ui.input(|inp| {
@@ -1995,6 +2872,30 @@ impl OzApp {
                 }
             }
         });
+        self.grid_offset = new_offset;
+        match cell_action {
+            Some(CellAction::Play(i, k)) => {
+                self.play_cell(&ctx, i, k);
+                self.selected = i;
+            }
+            Some(CellAction::Record(i, k)) => {
+                self.record_cell(i, k);
+                self.selected = i;
+            }
+            Some(CellAction::Clear(i, k)) => {
+                if let Some(c) = self.project.layers[i].cells.get_mut(k) {
+                    *c = None;
+                }
+                if self.layers[i].cell == Some(k) {
+                    self.layers[i].cell = None;
+                }
+                self.layers[i].cell_pos.remove(&k);
+            }
+            Some(CellAction::Column(k)) => self.play_column(&ctx, k),
+            Some(CellAction::AddColumn) => self.project.columns += 1,
+            Some(CellAction::Drop(i, k, media)) => self.drop_media_in_cell(&ctx, i, k, media),
+            None => {}
+        }
         match action {
             Some((i, "select")) => self.selected = i,
             Some((i, "up")) => self.move_layer(i, true),
@@ -2018,10 +2919,28 @@ impl OzApp {
             }
         }
         let Some(player) = self.layers[i].active() else {
-            ui.label(egui::RichText::new("Aucune vidéo sur ce calque.").color(TEXT_WEAK));
+            ui.label(egui::RichText::new("Aucune vidéo ni photo sur ce calque.").color(TEXT_WEAK));
             return;
         };
         let info = player.info.clone();
+        if info.still {
+            // Photo : rien à lire, mais on peut l'animer.
+            ui.label(egui::RichText::new(with_icon(ic::IMAGE, &file_name(&player.path))).strong().color(TEXT));
+            ui.label(
+                egui::RichText::new(format!("Photo  ·  {}×{}", info.width, info.height)).small().color(TEXT_WEAK),
+            );
+            if ui
+                .button(with_icon(ic::SPARKLE, "Animer la photo…"))
+                .on_hover_text("Contours qui s'illuminent et bougent (onglet Photo)")
+                .clicked()
+            {
+                self.right_tab = RightTab::Photo;
+                if self.project.layers[i].effects.lines_glow <= 0.0 {
+                    self.project.layers[i].effects.set_lines_style(0);
+                }
+            }
+            return;
+        }
         ui.label(egui::RichText::new(with_icon(ic::FILM_SLATE, &file_name(&player.path))).strong().color(TEXT));
 
         let paused = player.is_paused();
@@ -2089,18 +3008,37 @@ impl OzApp {
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            for (tab, icon, name) in [
-                (RightTab::Effects, ic::SPARKLE, "Effets"),
-                (RightTab::Visuals, ic::SUN, "Visuels"),
-                (RightTab::Shape, ic::POLYGON, "Forme"),
-                (RightTab::Mix, ic::FILM_REEL, "Mix"),
-                (RightTab::Rhythm, ic::WAVES, "Rythme"),
-            ] {
-                let text = egui::RichText::new(with_icon(icon, name)).size(15.0).strong();
-                ui.selectable_value(&mut self.right_tab, tab, text);
-            }
+        // Réglages à gauche (largeur fixée : le panneau ne doit pas s'élargir), onglets collés au bord droit.
+        const STRIP_W: f32 = 62.0;
+        let content_w = (ui.available_width() - STRIP_W - 14.0).max(120.0);
+        let h = ui.available_height();
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(content_w, h), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(content_w);
+                self.settings_pane(ui);
+            });
+            ui.separator();
+            // Onglets latéraux : les grandes familles de réglages.
+            ui.vertical(|ui| {
+                ui.set_width(STRIP_W);
+                for (tab, icon, name) in [
+                    (RightTab::Effects, ic::SPARKLE, "Effets"),
+                    (RightTab::Visuals, ic::SUN, "Visuels"),
+                    (RightTab::Photo, ic::IMAGE, "Photo"),
+                    (RightTab::Shape, ic::POLYGON, "Forme"),
+                    (RightTab::Mix, ic::FILM_REEL, "Mix"),
+                    (RightTab::Rhythm, ic::WAVES, "Rythme"),
+                ] {
+                    if side_tab(ui, icon, name, self.right_tab == tab).clicked() {
+                        self.right_tab = tab;
+                    }
+                }
+            });
         });
+    }
+
+    /// Contenu de l'onglet latéral choisi, avec ses onglets horizontaux.
+    fn settings_pane(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(with_icon(ic::STACK, &self.project.layers[self.sel()].name))
                 .color(ACCENT)
@@ -2108,19 +3046,52 @@ impl OzApp {
         )
         .on_hover_text("Calque sélectionné : les réglages ci-dessous s'appliquent à lui");
         ui.add_space(2.0);
+        // Onglets horizontaux : les sections de l'onglet latéral.
+        let sections = self.right_tab.sections();
+        if !sections.is_empty() {
+            let current = &mut self.sub_tab[self.right_tab as usize];
+            *current = (*current).min(sections.len() - 1);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                for (k, (icon, name)) in sections.iter().enumerate() {
+                    let text = egui::RichText::new(with_icon(icon, name)).size(13.0);
+                    let text = if *current == k { text.strong().color(TEXT) } else { text.color(TEXT_WEAK) };
+                    if ui.selectable_label(*current == k, text).clicked() {
+                        *current = k;
+                    }
+                }
+            });
+            ui.separator();
+        }
+        let fx_tab = matches!(self.right_tab, RightTab::Effects | RightTab::Visuals | RightTab::Photo);
+        if fx_tab {
+            self.hidden_fx_banner(ui);
+        }
+        let sel = self.sel();
+        let before = self.fx_target(sel);
         egui::ScrollArea::vertical()
             .id_salt("right")
             .auto_shrink([false, false])
             .show(ui, |ui| match self.right_tab {
                 RightTab::Effects => self.effects_ui(ui),
                 RightTab::Visuals => self.generator_ui(ui),
+                RightTab::Photo => self.lines_fx_ui(ui),
                 RightTab::Shape => self.shape_ui(ui),
                 RightTab::Mix => self.mix_ui(ui),
                 RightTab::Rhythm => self.rhythm_ui(ui),
             });
+        // Un effet vient d'être choisi sur un calque qui ne se voit pas : on le signale.
+        // (« Aucun » ne compte pas : retirer les effets d'un calque caché n'a rien d'étonnant.)
+        if fx_tab && sel == self.sel() {
+            let after = self.fx_target(sel);
+            if after != before && after.0 != Effects::default() && self.hidden_reason(sel).is_some() {
+                self.fx_hidden_alert = Some(sel);
+            }
+        }
     }
 
     fn effects_ui(&mut self, ui: &mut egui::Ui) {
+        let sec = self.section();
         self.presets_ui(ui);
 
         let i = self.sel();
@@ -2128,7 +3099,7 @@ impl OzApp {
         // Vrai seulement si l'utilisateur a touché un réglage (pas sur une simple mise à jour).
         let mut touched = false;
         let d = Effects::default();
-        egui::CollapsingHeader::new(with_icon(ic::PALETTE, "Couleur")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 1, |ui| {
             touched |= fx_slider(ui, "Luminosité", &mut fx.brightness, -1.0..=1.0, d.brightness);
             touched |= fx_slider(ui, "Contraste", &mut fx.contrast, 0.0..=3.0, d.contrast);
             touched |= fx_slider(ui, "Saturation", &mut fx.saturation, 0.0..=3.0, d.saturation);
@@ -2147,8 +3118,11 @@ impl OzApp {
             });
             touched |= fx_slider(ui, "Contours", &mut fx.edge, 0.0..=1.0, d.edge);
             touched |= fx_slider(ui, "Vignette", &mut fx.vignette, 0.0..=1.0, d.vignette);
+            touched |= fx_slider(ui, "Caméra thermique", &mut fx.thermal, 0.0..=1.0, d.thermal);
+            touched |= fx_slider(ui, "Flou", &mut fx.blur, 0.0..=1.0, d.blur);
+            touched |= fx_slider(ui, "Halo lumineux", &mut fx.bloom, 0.0..=1.5, d.bloom);
         });
-        egui::CollapsingHeader::new(with_icon(ic::FRAME_CORNERS, "Géométrie")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 2, |ui| {
             touched |= fx_slider(ui, "Zoom", &mut fx.zoom, 0.2..=5.0, d.zoom);
             touched |= fx_slider(ui, "Rotation °", &mut fx.rotate, -180.0..=180.0, d.rotate);
             touched |= fx_slider(ui, "Rotation auto °/s", &mut fx.rotate_speed, -360.0..=360.0, d.rotate_speed);
@@ -2166,14 +3140,21 @@ impl OzApp {
             touched |= fx_slider(ui, "Kaléidoscope", &mut fx.kaleido, 0.0..=16.0, d.kaleido);
             touched |= fx_slider(ui, "Rotation kaléido °/s", &mut fx.kaleido_spin, -180.0..=180.0, d.kaleido_spin);
         });
-        egui::CollapsingHeader::new(with_icon(ic::WAVES, "Distorsions")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 3, |ui| {
             touched |= fx_slider(ui, "Pixelisation", &mut fx.pixelate, 0.0..=1.0, d.pixelate);
             touched |= fx_slider(ui, "Décalage RVB", &mut fx.rgb_shift, 0.0..=0.05, d.rgb_shift);
             touched |= fx_slider(ui, "Ondulation", &mut fx.wave_amp, 0.0..=0.1, d.wave_amp);
             touched |= fx_slider(ui, "Fréquence onde", &mut fx.wave_freq, 0.5..=30.0, d.wave_freq);
             touched |= fx_slider(ui, "Vitesse onde", &mut fx.wave_speed, 0.0..=20.0, d.wave_speed);
+            touched |= fx_slider(ui, "Fish-eye", &mut fx.fisheye, -1.5..=1.5, d.fisheye);
+            touched |= fx_slider(ui, "Ondes de choc", &mut fx.shock, 0.0..=1.0, d.shock);
+            touched |= fx_slider(ui, "Ondes de choc /s", &mut fx.shock_speed, 0.05..=3.0, d.shock_speed);
+            touched |= fx_slider(ui, "Mosaïque hexagonale", &mut fx.hexagon, 0.0..=1.0, d.hexagon);
+            touched |= fx_slider(ui, "Droste (spirale infinie)", &mut fx.droste, 0.0..=1.0, d.droste);
+            touched |= fx_slider(ui, "Zoom Droste /s", &mut fx.droste_speed, -1.5..=1.5, d.droste_speed);
+            touched |= fx_slider(ui, "Flou de zoom", &mut fx.zoom_blur, 0.0..=1.0, d.zoom_blur);
         });
-        egui::CollapsingHeader::new(with_icon(ic::SPIRAL, "Psychédélique")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 4, |ui| {
             touched |= fx_slider(ui, "Tourbillon", &mut fx.swirl, -4.0..=4.0, d.swirl);
             touched |= fx_slider(ui, "Oscillation tourbillon /s", &mut fx.swirl_speed, 0.0..=1.0, d.swirl_speed);
             touched |= fx_slider(ui, "Tunnel", &mut fx.polar, 0.0..=1.0, d.polar);
@@ -2190,7 +3171,43 @@ impl OzApp {
             touched |= fx_slider(ui, "Fréquence pulsation Hz", &mut fx.pulse_rate, 0.05..=5.0, d.pulse_rate);
             touched |= fx_slider(ui, "Écho", &mut fx.echo, 0.0..=1.0, d.echo);
         });
-        egui::CollapsingHeader::new(with_icon(ic::LIGHTNING, "Rythme")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 5, |ui| {
+            touched |= fx_slider(ui, "Télé cathodique", &mut fx.crt, 0.0..=1.0, d.crt);
+            touched |= fx_slider(ui, "Glitch numérique", &mut fx.glitch, 0.0..=1.0, d.glitch);
+            touched |= fx_slider(ui, "Grain de pellicule", &mut fx.grain, 0.0..=1.0, d.grain);
+            touched |= fx_slider(ui, "Trame BD", &mut fx.halftone, 0.0..=1.0, d.halftone);
+            touched |= fx_slider(ui, "ASCII (taille des caractères)", &mut fx.ascii, 0.0..=1.0, d.ascii);
+        });
+        sec.show(ui, 6, |ui| {
+            ui.label(egui::RichText::new("Objet").strong().color(TEXT));
+            ui.horizontal_wrapped(|ui| {
+                for o in Object3d::ALL {
+                    touched |= ui.selectable_value(&mut fx.obj3d, o, o.label()).on_hover_text(o.description()).changed();
+                }
+            });
+            ui.add_enabled_ui(fx.obj3d != Object3d::Off, |ui| {
+                touched |= fx_slider(ui, "Inclinaison °", &mut fx.rot3d_x, -180.0..=180.0, d.rot3d_x);
+                touched |= fx_slider(ui, "Rotation °", &mut fx.rot3d_y, -180.0..=180.0, d.rot3d_y);
+                touched |= fx_slider(ui, "Rotation auto °/s", &mut fx.spin3d_y, -180.0..=180.0, d.spin3d_y);
+                touched |= fx_slider(ui, "Bascule auto °/s", &mut fx.spin3d_x, -180.0..=180.0, d.spin3d_x);
+                touched |= fx_slider(ui, "Distance caméra", &mut fx.dist3d, 1.0..=8.0, d.dist3d);
+                if fx.obj3d.uses_height() {
+                    touched |= fx_slider(ui, "Hauteur du relief", &mut fx.height3d, 0.0..=1.0, d.height3d);
+                }
+                if fx.obj3d == Object3d::Voxels {
+                    touched |= fx_slider(ui, "Colonnes (par hauteur)", &mut fx.voxels, 8.0..=120.0, d.voxels);
+                }
+            });
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Volume").strong().color(TEXT));
+            touched |= fx_slider(ui, "Relief", &mut fx.relief, 0.0..=1.5, d.relief);
+            touched |= fx_slider(ui, "Anaglyphe (lunettes 3D)", &mut fx.anaglyph, 0.0..=0.04, d.anaglyph);
+            touched |= fx_slider(ui, "Drapeau", &mut fx.flag, 0.0..=1.5, d.flag);
+            touched |= fx_slider(ui, "Vitesse drapeau", &mut fx.flag_speed, 0.0..=8.0, d.flag_speed);
+            touched |= fx_slider(ui, "Accordéon", &mut fx.fold, 0.0..=1.0, d.fold);
+            touched |= fx_slider(ui, "Nombre de plis", &mut fx.fold_count, 2.0..=16.0, d.fold_count);
+        });
+        sec.show(ui, 7, |ui| {
             touched |= fx_slider(ui, "Stroboscope Hz", &mut fx.strobe, 0.0..=20.0, d.strobe);
         });
         // Un réglage manuel interrompt une transition de preset en cours.
@@ -2201,6 +3218,7 @@ impl OzApp {
     }
 
     fn presets_ui(&mut self, ui: &mut egui::Ui) {
+        let sec = self.section();
         let sel = self.sel();
         let current = self.project.layers[sel].effects;
         let active = self.layers[sel].preset.clone();
@@ -2212,7 +3230,7 @@ impl OzApp {
         let mut apply: Option<(Option<String>, Effects)> = None;
         let mut auto_next = false;
         let mut clear = false;
-        egui::CollapsingHeader::new(with_icon(ic::STAR, "Presets")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 0, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for p in &self.builtin_presets {
                     if ui.selectable_label(is_active(p), &p.name).clicked() {
@@ -2301,24 +3319,36 @@ impl OzApp {
 
     fn shape_ui(&mut self, ui: &mut egui::Ui) {
         let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
-        ui.toggle_value(&mut self.edit_mapping, with_icon(ic::PENCIL_SIMPLE, "Éditer sur l'aperçu (M)"));
-        ui.horizontal(|ui| {
-            ui.label("Éditer :");
-            ui.radio_value(&mut self.edit_target, EditTarget::Warp, "Déformation");
-            ui.radio_value(&mut self.edit_target, EditTarget::Mask, "Masque");
+        let sec = self.section();
+        let i = self.sel();
+        sec.show(ui, 0, |ui| {
+            ui.label(egui::RichText::new("Comment l'image se place dans la surface").small().color(TEXT_WEAK));
+            for f in Fit::ALL {
+                ui.selectable_value(&mut self.project.layers[i].fit, f, f.label()).on_hover_text(f.hint());
+            }
         });
-        ui.label(
-            egui::RichText::new(
-                "Glissez les points sur l'aperçu ou sur la sortie. Maj = déplacement précis. La croix déplace toute la forme.",
-            )
-            .small()
-            .color(TEXT_WEAK),
-        );
+        // L'onglet choisit ce qu'on édite sur l'aperçu.
+        match sec.0 {
+            1 => self.edit_target = EditTarget::Warp,
+            2 => self.edit_target = EditTarget::Mask,
+            _ => {}
+        }
+        if sec.0 != 0 {
+            ui.toggle_value(&mut self.edit_mapping, with_icon(ic::PENCIL_SIMPLE, "Éditer sur l'aperçu (M)"));
+            ui.label(
+                egui::RichText::new(
+                    "Glissez les points sur l'aperçu ou sur la sortie. Maj = déplacement précis. La croix déplace toute la forme.",
+                )
+                .small()
+                .color(TEXT_WEAK),
+            );
+            ui.add_space(4.0);
+        }
 
         let sel = self.sel();
         let mut import_shape = None;
         let cfg = &mut self.project.layers[sel];
-        egui::CollapsingHeader::new(with_icon(ic::GRID_FOUR, "Déformation")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 1, |ui| {
             let (mut cols, mut rows) = (cfg.warp.cols, cfg.warp.rows);
             ui.horizontal(|ui| {
                 ui.label("Grille");
@@ -2351,7 +3381,7 @@ impl OzApp {
                 }
             });
         });
-        egui::CollapsingHeader::new(with_icon(ic::SHAPES, "Masque")).default_open(true).show(ui, |ui| {
+        sec.show(ui, 2, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut cfg.mask.enabled, "Activer");
                 ui.checkbox(&mut cfg.mask.invert, "Inverser");
@@ -2558,8 +3588,7 @@ impl OzApp {
                 let mask = &mut self.project.layers[sel].mask;
                 mask.set_rings(rings, nonzero);
                 mask.enabled = true;
-                self.edit_target = EditTarget::Mask;
-                self.right_tab = RightTab::Shape;
+                self.show_shape_tab(EditTarget::Mask);
                 self.status = None;
             }
             Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
@@ -2572,8 +3601,7 @@ impl OzApp {
         let mask = &mut self.project.layers[sel].mask;
         mask.set_rings(rings, nonzero);
         mask.enabled = true;
-        self.edit_target = EditTarget::Mask;
-        self.right_tab = RightTab::Shape;
+        self.show_shape_tab(EditTarget::Mask);
     }
 
     /// Fenêtre de détourage d'une photo.
@@ -2925,8 +3953,12 @@ impl eframe::App for OzApp {
             if self.confirm_discard() {
                 self.load_project_file(&ctx, proj);
             }
-        } else if let Some(shape) = dropped.iter().find(|p| is_mask_file(p)) {
-            // Un SVG ou une image déposés deviennent le masque du calque sélectionné.
+        } else if let Some(shape) = dropped
+            .iter()
+            .find(|p| is_svg_file(p) || (self.right_tab == RightTab::Shape && video::is_still_image(p)))
+        {
+            // Un SVG déposé (ou une photo déposée quand l'onglet Forme est ouvert) devient le masque
+            // du calque sélectionné. Sinon, les photos s'ajoutent aux médias.
             self.import_mask(shape);
         } else if !dropped.is_empty() {
             self.add_media(dropped);
@@ -2963,15 +3995,19 @@ impl eframe::App for OzApp {
             .default_size(330.0)
             .frame(panel_frame)
             .show(ui, |ui| self.media_panel(ui));
+        // Largeur limitée : l'aperçu garde toujours sa place au centre.
+        let win_w = ui.available_width();
         egui::Panel::right("effects")
             .resizable(true)
-            .default_size(360.0)
+            .default_size(420.0)
+            .size_range(320.0..=(win_w * 0.45).max(320.0))
             .frame(panel_frame)
             .show(ui, |ui| self.right_panel(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| self.preview(ui));
 
+        self.media_drag_preview(&ctx);
         self.cutout_window(&ctx);
 
         if self.output_open {
@@ -2986,6 +4022,7 @@ impl eframe::App for OzApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.store_active_cells();
         let session = Session {
             project: Some(self.project.clone()),
             project_path: self.project_path.clone(),
@@ -3009,6 +4046,126 @@ impl eframe::App for OzApp {
 }
 
 /// Jauge CPU : l'app avec ses décodeurs ffmpeg, sur fond de charge totale de la machine.
+/// Onglet latéral : icône au-dessus du nom, barre d'accent quand il est choisi.
+fn side_tab(ui: &mut egui::Ui, icon: &str, name: &str, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
+    let p = ui.painter();
+    if selected {
+        p.rect_filled(rect, 6.0, theme::ACCENT_DIM.gamma_multiply(0.55));
+        // Barre d'accent côté bord de la fenêtre (les onglets sont à droite).
+        let bar = Rect::from_min_size(egui::pos2(rect.max.x - 3.0, rect.min.y + 8.0), Vec2::new(3.0, rect.height() - 16.0));
+        p.rect_filled(bar, 1.5, ACCENT);
+    } else if resp.hovered() {
+        p.rect_filled(rect, 6.0, theme::WIDGET);
+    }
+    let color = if selected { ACCENT } else if resp.hovered() { TEXT } else { TEXT_WEAK };
+    p.text(rect.center() - Vec2::new(0.0, 8.0), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(20.0), color);
+    p.text(
+        rect.center() + Vec2::new(0.0, 13.0),
+        egui::Align2::CENTER_CENTER,
+        name,
+        egui::FontId::proportional(11.0),
+        if selected { TEXT } else { TEXT_WEAK },
+    );
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Action demandée depuis le tableau.
+enum CellAction {
+    Play(usize, usize),
+    Record(usize, usize),
+    Clear(usize, usize),
+    Column(usize),
+    AddColumn,
+    /// Média glissé depuis la liste sur la case (calque, colonne).
+    Drop(usize, usize, MediaDrag),
+}
+
+/// Média en cours de glisser-déposer depuis la liste des médias : un fichier ou un visuel généré.
+#[derive(Clone)]
+enum MediaDrag {
+    File(PathBuf),
+    Pattern(Pattern),
+}
+
+/// Vignette d'un visuel généré : dégradé de sa palette, décalé selon le motif (pour les distinguer).
+fn paint_pattern_swatch(painter: &egui::Painter, rect: Rect, pattern: Pattern, palette: Palette) {
+    const STRIPS: usize = 24;
+    let shift = pattern as usize as f32 * 0.137;
+    let w = rect.width() / STRIPS as f32;
+    for s in 0..STRIPS {
+        let t = s as f32 / STRIPS as f32;
+        let [r, g, b] = palette.color(t * 0.9 + shift);
+        let strip = Rect::from_min_size(egui::pos2(rect.min.x + s as f32 * w, rect.min.y), Vec2::new(w + 0.5, rect.height()));
+        painter.rect_filled(strip, 0.0, Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8));
+    }
+}
+
+/// Case du tableau : miniature du média, nom en bas ; « + » si vide.
+fn cell_widget(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    thumb: Option<&egui::TextureHandle>,
+    swatch: Option<(Pattern, Palette)>,
+    name: Option<&str>,
+    active: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let p = ui.painter();
+    let hover = resp.hovered();
+    let radius = 4.0;
+    match name {
+        None => {
+            p.rect_filled(rect, radius, if hover { theme::WIDGET } else { CARD });
+            let c = if hover { TEXT } else { theme::BORDER };
+            p.text(rect.center(), egui::Align2::CENTER_CENTER, ic::PLUS, egui::FontId::proportional(13.0), c);
+        }
+        Some(name) => {
+            p.rect_filled(rect, radius, theme::WIDGET_ACTIVE);
+            if let Some((pattern, palette)) = swatch {
+                paint_pattern_swatch(p, rect.shrink(1.0), pattern, palette);
+            }
+            if let Some(t) = thumb {
+                // Miniature recadrée pour remplir la case sans déformation.
+                let [tw, th] = t.size();
+                let (ta, ra) = (tw as f32 / th.max(1) as f32, rect.width() / rect.height());
+                let uv = if ta > ra {
+                    let w = ra / ta;
+                    Rect::from_min_max(egui::pos2(0.5 - w / 2.0, 0.0), egui::pos2(0.5 + w / 2.0, 1.0))
+                } else {
+                    let h = ta / ra;
+                    Rect::from_min_max(egui::pos2(0.0, 0.5 - h / 2.0), egui::pos2(1.0, 0.5 + h / 2.0))
+                };
+                let tint = if hover { Color32::WHITE } else { Color32::from_gray(190) };
+                p.image(t.id(), rect.shrink(1.0), uv, tint);
+            }
+            let band = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 14.0), rect.max);
+            p.rect_filled(band.shrink(1.0), 2.0, Color32::from_black_alpha(170));
+            let short: String = if name.chars().count() > 13 {
+                name.chars().take(12).chain(['…']).collect()
+            } else {
+                name.to_owned()
+            };
+            p.text(
+                band.left_center() + Vec2::new(4.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                short,
+                egui::FontId::proportional(10.5),
+                TEXT,
+            );
+        }
+    }
+    let stroke = if active {
+        Stroke::new(2.0, ACCENT)
+    } else if hover {
+        Stroke::new(1.0, TEXT_WEAK)
+    } else {
+        Stroke::new(1.0, theme::BORDER)
+    };
+    p.rect_stroke(rect, radius, stroke, egui::StrokeKind::Inside);
+    resp
+}
+
 fn cpu_gauge(ui: &mut egui::Ui, stats: CpuStats) {
     // Couleur selon la charge de l'app ; la partie grise de la barre montre le reste de la machine.
     let color = theme::load_color(stats.app);
@@ -3126,11 +4283,8 @@ fn is_video_file(p: &Path) -> bool {
         .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.to_lowercase().as_str()))
 }
 
-/// SVG ou image fixe (le GIF reste une vidéo).
-fn is_mask_file(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).map(str::to_lowercase).is_some_and(|e| {
-        e == "svg" || (e != "gif" && crate::mask::IMAGE_EXTENSIONS.contains(&e.as_str()))
-    })
+fn is_svg_file(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"))
 }
 
 fn is_project_file(p: &Path) -> bool {

@@ -22,6 +22,64 @@ impl Mirror {
     }
 }
 
+/// Objet 3D sur lequel l'image est posée. L'ordre (numéro envoyé au shader) ne doit pas changer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Object3d {
+    #[default]
+    Off,
+    Plane,
+    Cube,
+    Sphere,
+    Cylinder,
+    Torus,
+    Terrain,
+    Voxels,
+}
+
+impl Object3d {
+    pub const ALL: [Object3d; 8] = [
+        Object3d::Off,
+        Object3d::Plane,
+        Object3d::Cube,
+        Object3d::Sphere,
+        Object3d::Cylinder,
+        Object3d::Torus,
+        Object3d::Terrain,
+        Object3d::Voxels,
+    ];
+
+    /// Objets construits à partir de l'image (hauteur = luminosité).
+    pub fn uses_height(self) -> bool {
+        matches!(self, Object3d::Terrain | Object3d::Voxels)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Object3d::Off => "Aucun",
+            Object3d::Plane => "Plan",
+            Object3d::Cube => "Cube",
+            Object3d::Sphere => "Sphère",
+            Object3d::Cylinder => "Cylindre",
+            Object3d::Torus => "Tore",
+            Object3d::Terrain => "Terrain",
+            Object3d::Voxels => "Pixels 3D",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Object3d::Off => "L'image reste à plat",
+            Object3d::Plane => "L'image comme une carte qui pivote dans l'espace, en perspective",
+            Object3d::Cube => "L'image sur les six faces d'un cube qui tourne",
+            Object3d::Sphere => "L'image enroulée sur une boule",
+            Object3d::Cylinder => "L'image enroulée sur un cylindre qui tourne",
+            Object3d::Torus => "L'image enroulée sur un anneau (donut)",
+            Object3d::Terrain => "L'image devient un paysage en relief : les zones claires sont des sommets",
+            Object3d::Voxels => "L'image devient une ville de colonnes : chaque pixel monte selon sa clarté",
+        }
+    }
+}
+
 /// Destruction du masque : la forme se casse et laisse voir les calques du dessous.
 /// L'ordre (numéro envoyé au shader) ne doit pas changer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -155,6 +213,69 @@ pub struct Effects {
     pub shatter_speed: f32,
     pub shatter_size: f32,
     pub shatter_glow: f32,
+    /// Contours animés de l'image (photo ou vidéo) : lueur des contours (0..2), leur couleur
+    /// et la part d'arc-en-ciel qui défile.
+    pub lines_glow: f32,
+    pub lines_color: [f32; 3],
+    pub lines_rainbow: f32,
+    /// Seuil (0..1) : plus il est haut, moins il reste de contours (seulement les plus nets).
+    pub lines_threshold: f32,
+    /// Largeur du halo, en pixels de l'image.
+    pub lines_width: f32,
+    /// Vagues de lumière qui parcourent les contours (0..1), et leur vitesse (vagues/s).
+    pub lines_flow: f32,
+    pub lines_flow_speed: f32,
+    /// Les contours ondulent (amplitude, en largeurs d'image), à cette vitesse (cycles/s).
+    pub lines_wobble: f32,
+    pub lines_wobble_speed: f32,
+    /// Assombrit l'image pour ne garder que les contours lumineux (0..1).
+    pub lines_dim: f32,
+    /// 3D : objet portant l'image, ses angles (degrés), sa rotation automatique (°/s)
+    /// et la distance de la caméra (plus grande = perspective plus douce).
+    pub obj3d: Object3d,
+    pub rot3d_x: f32,
+    pub rot3d_y: f32,
+    pub spin3d_x: f32,
+    pub spin3d_y: f32,
+    pub dist3d: f32,
+    /// Terrain et pixels 3D : hauteur du relief, nombre de colonnes (par hauteur d'image).
+    pub height3d: f32,
+    pub voxels: f32,
+    /// Relief : l'image prend du volume selon sa luminosité, éclairée de biais (0..1).
+    pub relief: f32,
+    /// Anaglyphe rouge / cyan (décalage, en largeur d'image).
+    pub anaglyph: f32,
+    /// Drapeau : l'image ondule comme un tissu, avec ses ombres (0..1), et sa vitesse (rad/s).
+    pub flag: f32,
+    pub flag_speed: f32,
+    /// Caméra thermique : la luminosité devient une palette de chaleur (0..1).
+    pub thermal: f32,
+    /// Flou (0..1) et halo lumineux autour des zones claires (bloom, 0..1).
+    pub blur: f32,
+    pub bloom: f32,
+    /// Ondes de choc qui partent du centre (force 0..1) et leur fréquence (ondes/s).
+    pub shock: f32,
+    pub shock_speed: f32,
+    /// Fish-eye : bombé (positif) ou pincé (négatif).
+    pub fisheye: f32,
+    /// Mosaïque hexagonale (0..1 = taille des alvéoles).
+    pub hexagon: f32,
+    /// Rétro : télé cathodique (lignes, courbure), glitch numérique, grain de pellicule,
+    /// trame de points façon BD (0..1).
+    pub crt: f32,
+    pub glitch: f32,
+    pub grain: f32,
+    pub halftone: f32,
+    /// Droste : l'image se répète en spirale infinie (0..1) et zoome (répétitions/s).
+    pub droste: f32,
+    pub droste_speed: f32,
+    /// Flou de zoom radial (0..1).
+    pub zoom_blur: f32,
+    /// Rendu en caractères ASCII (0 = non ; plus grand = caractères plus gros).
+    pub ascii: f32,
+    /// Accordéon 3D : l'image pliée en panneaux (0..1), et leur nombre.
+    pub fold: f32,
+    pub fold_count: f32,
     // Rythme
     pub strobe: f32,
 }
@@ -223,6 +344,45 @@ impl Default for Effects {
             shatter_speed: 0.0,
             shatter_size: 10.0,
             shatter_glow: 0.8,
+            lines_glow: 0.0,
+            lines_color: [1.0, 0.75, 0.3],
+            lines_rainbow: 0.0,
+            lines_threshold: 0.25,
+            lines_width: 4.0,
+            lines_flow: 0.0,
+            lines_flow_speed: 0.4,
+            lines_wobble: 0.0,
+            lines_wobble_speed: 0.3,
+            lines_dim: 0.0,
+            obj3d: Object3d::Off,
+            rot3d_x: 0.0,
+            rot3d_y: 0.0,
+            spin3d_x: 0.0,
+            spin3d_y: 0.0,
+            dist3d: 2.5,
+            height3d: 0.3,
+            voxels: 40.0,
+            relief: 0.0,
+            anaglyph: 0.0,
+            flag: 0.0,
+            flag_speed: 2.0,
+            thermal: 0.0,
+            blur: 0.0,
+            bloom: 0.0,
+            shock: 0.0,
+            shock_speed: 0.5,
+            fisheye: 0.0,
+            hexagon: 0.0,
+            crt: 0.0,
+            glitch: 0.0,
+            grain: 0.0,
+            halftone: 0.0,
+            droste: 0.0,
+            droste_speed: 0.3,
+            zoom_blur: 0.0,
+            ascii: 0.0,
+            fold: 0.0,
+            fold_count: 6.0,
             strobe: 0.0,
         }
     }
@@ -303,6 +463,49 @@ impl Effects {
             shatter_speed: l(a.shatter_speed, b.shatter_speed),
             shatter_size: l(a.shatter_size, b.shatter_size),
             shatter_glow: l(a.shatter_glow, b.shatter_glow),
+            lines_glow: l(a.lines_glow, b.lines_glow),
+            lines_color: [
+                l(a.lines_color[0], b.lines_color[0]),
+                l(a.lines_color[1], b.lines_color[1]),
+                l(a.lines_color[2], b.lines_color[2]),
+            ],
+            lines_rainbow: l(a.lines_rainbow, b.lines_rainbow),
+            lines_threshold: l(a.lines_threshold, b.lines_threshold),
+            lines_width: l(a.lines_width, b.lines_width),
+            lines_flow: l(a.lines_flow, b.lines_flow),
+            lines_flow_speed: l(a.lines_flow_speed, b.lines_flow_speed),
+            lines_wobble: l(a.lines_wobble, b.lines_wobble),
+            lines_wobble_speed: l(a.lines_wobble_speed, b.lines_wobble_speed),
+            lines_dim: l(a.lines_dim, b.lines_dim),
+            obj3d: pick(a.obj3d, b.obj3d, t),
+            rot3d_x: l(a.rot3d_x, b.rot3d_x),
+            rot3d_y: l(a.rot3d_y, b.rot3d_y),
+            spin3d_x: l(a.spin3d_x, b.spin3d_x),
+            spin3d_y: l(a.spin3d_y, b.spin3d_y),
+            dist3d: l(a.dist3d, b.dist3d),
+            height3d: l(a.height3d, b.height3d),
+            voxels: pick(a.voxels, b.voxels, t),
+            relief: l(a.relief, b.relief),
+            anaglyph: l(a.anaglyph, b.anaglyph),
+            flag: l(a.flag, b.flag),
+            flag_speed: l(a.flag_speed, b.flag_speed),
+            thermal: l(a.thermal, b.thermal),
+            blur: l(a.blur, b.blur),
+            bloom: l(a.bloom, b.bloom),
+            shock: l(a.shock, b.shock),
+            shock_speed: l(a.shock_speed, b.shock_speed),
+            fisheye: l(a.fisheye, b.fisheye),
+            hexagon: l(a.hexagon, b.hexagon),
+            crt: l(a.crt, b.crt),
+            glitch: l(a.glitch, b.glitch),
+            grain: l(a.grain, b.grain),
+            halftone: l(a.halftone, b.halftone),
+            droste: l(a.droste, b.droste),
+            droste_speed: l(a.droste_speed, b.droste_speed),
+            zoom_blur: l(a.zoom_blur, b.zoom_blur),
+            ascii: pick(a.ascii, b.ascii, t),
+            fold: l(a.fold, b.fold),
+            fold_count: pick(a.fold_count, b.fold_count, t),
             strobe: pick(a.strobe, b.strobe, t),
         }
     }
@@ -326,8 +529,9 @@ impl Effects {
         }
     }
 
-    /// Ces effets, avec les animations de forme du masque de `other`. Les animations de forme se
-    /// règlent à part (onglet Visuels) : presets, mode Auto et « Aucun » ne les touchent pas.
+    /// Ces effets, avec les animations de forme du masque et les contours animés de `other`.
+    /// Ces animations se règlent à part (onglet Visuels) : presets, mode Auto et « Aucun » ne
+    /// les touchent pas.
     pub fn with_shape_of(self, other: &Effects) -> Effects {
         Effects {
             shape_color: other.shape_color,
@@ -352,8 +556,78 @@ impl Effects {
             shatter_speed: other.shatter_speed,
             shatter_size: other.shatter_size,
             shatter_glow: other.shatter_glow,
+            lines_glow: other.lines_glow,
+            lines_color: other.lines_color,
+            lines_rainbow: other.lines_rainbow,
+            lines_threshold: other.lines_threshold,
+            lines_width: other.lines_width,
+            lines_flow: other.lines_flow,
+            lines_flow_speed: other.lines_flow_speed,
+            lines_wobble: other.lines_wobble,
+            lines_wobble_speed: other.lines_wobble_speed,
+            lines_dim: other.lines_dim,
             ..self
         }
+    }
+
+    /// Reprend seulement les animations de forme du masque de `other` (ni la destruction, ni les contours).
+    pub fn with_mask_anim_of(self, other: &Effects) -> Effects {
+        Effects {
+            shape_color: other.shape_color,
+            shape_glow: other.shape_glow,
+            shape_width: other.shape_width,
+            shape_ripple: other.shape_ripple,
+            shape_ripple_freq: other.shape_ripple_freq,
+            shape_ripple_speed: other.shape_ripple_speed,
+            shape_wave: other.shape_wave,
+            shape_trace: other.shape_trace,
+            shape_trace_count: other.shape_trace_count,
+            shape_trace_speed: other.shape_trace_speed,
+            shape_breathe: other.shape_breathe,
+            shape_breathe_rate: other.shape_breathe_rate,
+            shape_rainbow: other.shape_rainbow,
+            shape_echo: other.shape_echo,
+            shape_inner: other.shape_inner,
+            shape_dashes: other.shape_dashes,
+            shape_dash_count: other.shape_dash_count,
+            ..self
+        }
+    }
+
+    /// Mêmes animations de forme du masque que `other`.
+    pub fn same_mask_anim(&self, other: &Effects) -> bool {
+        self.with_mask_anim_of(other) == *self
+    }
+
+    /// Styles tout prêts pour les contours animés : (nom, description).
+    pub const LINE_STYLES: [(&'static str, &'static str); 5] = [
+        ("Néon doré", "Contours dorés et lumineux qui frémissent"),
+        ("Dessin vivant", "L'image s'efface derrière un trait blanc qui ondule, comme un dessin animé"),
+        ("Arc-en-ciel", "Contours aux couleurs qui défilent, parcourus de vagues"),
+        ("Vagues de lumière", "Des vagues partent du centre et allument les contours à leur passage"),
+        ("Aucun", "Retirer l'animation des contours"),
+    ];
+
+    /// Applique le style `k` de `LINE_STYLES` (seulement les réglages des contours animés).
+    pub fn set_lines_style(&mut self, k: usize) {
+        let d = Effects::default();
+        let (glow, color, rainbow, threshold, width, flow, wobble, wobble_speed, dim) = match k {
+            0 => (1.2, [1.0, 0.75, 0.3], 0.0, 0.25, 4.0, 0.0, 0.002, 0.3, 0.3),
+            1 => (1.1, [1.0, 1.0, 1.0], 0.0, 0.3, 2.0, 0.0, 0.004, 0.5, 0.85),
+            2 => (1.3, d.lines_color, 1.0, 0.25, 4.0, 0.6, 0.002, 0.3, 0.5),
+            3 => (1.5, [0.3, 0.85, 1.0], 0.0, 0.2, 5.0, 1.0, 0.0, d.lines_wobble_speed, 0.25),
+            _ => (0.0, d.lines_color, 0.0, d.lines_threshold, d.lines_width, 0.0, 0.0, d.lines_wobble_speed, 0.0),
+        };
+        self.lines_glow = glow;
+        self.lines_color = color;
+        self.lines_rainbow = rainbow;
+        self.lines_threshold = threshold;
+        self.lines_width = width;
+        self.lines_flow = flow;
+        self.lines_flow_speed = d.lines_flow_speed;
+        self.lines_wobble = wobble;
+        self.lines_wobble_speed = wobble_speed;
+        self.lines_dim = dim;
     }
 
     /// Vrai si une animation suit la forme du masque (il faut alors calculer son champ).
@@ -405,6 +679,8 @@ impl Effects {
                 Ingredient::Solarize,
                 Ingredient::Invert,
                 Ingredient::Contrast,
+                Ingredient::Thermal,
+                Ingredient::Halftone,
             ],
             AutoTheme::Speed => &[
                 Ingredient::FastSpin,
@@ -415,6 +691,7 @@ impl Effects {
                 Ingredient::FastHue,
                 Ingredient::FastLiquid,
                 Ingredient::Strobe,
+                Ingredient::ZoomBlur,
             ],
             AutoTheme::Geometry => &[
                 Ingredient::Kaleido,
@@ -425,6 +702,10 @@ impl Effects {
                 Ingredient::Rotate,
                 Ingredient::Flip,
                 Ingredient::Swirl,
+                Ingredient::Fisheye,
+                Ingredient::Shock,
+                Ingredient::Droste,
+                Ingredient::Fold,
             ],
             AutoTheme::Glitch => &[
                 Ingredient::RgbShift,
@@ -435,6 +716,11 @@ impl Effects {
                 Ingredient::Solarize,
                 Ingredient::Invert,
                 Ingredient::Strobe,
+                Ingredient::Crt,
+                Ingredient::BlockGlitch,
+                Ingredient::Grain,
+                Ingredient::Hexagon,
+                Ingredient::Ascii,
             ],
             AutoTheme::Soft => &[
                 Ingredient::SoftColor,
@@ -444,6 +730,7 @@ impl Effects {
                 Ingredient::SlowRotate,
                 Ingredient::SoftTint,
                 Ingredient::SoftPulse,
+                Ingredient::Bloom,
             ],
         };
         let count = 2 + r.below(3);
@@ -533,11 +820,35 @@ enum Ingredient {
     SlowRotate,
     SoftTint,
     SoftPulse,
+    Thermal,
+    Crt,
+    BlockGlitch,
+    Grain,
+    Shock,
+    Fisheye,
+    Hexagon,
+    Halftone,
+    Bloom,
+    Droste,
+    ZoomBlur,
+    Ascii,
+    Fold,
 }
 
 impl Ingredient {
     /// Ingrédients du thème « Tout » (sans le stroboscope, géré à part).
-    const ALL: [Ingredient; 21] = [
+    const ALL: [Ingredient; 32] = [
+        Ingredient::Droste,
+        Ingredient::ZoomBlur,
+        Ingredient::Ascii,
+        Ingredient::Fold,
+        Ingredient::Thermal,
+        Ingredient::Crt,
+        Ingredient::BlockGlitch,
+        Ingredient::Shock,
+        Ingredient::Fisheye,
+        Ingredient::Halftone,
+        Ingredient::Bloom,
         Ingredient::Swirl,
         Ingredient::Tunnel,
         Ingredient::Liquid,
@@ -666,6 +977,31 @@ impl Ingredient {
             Ingredient::SoftPulse => {
                 fx.pulse = r.range(0.02, 0.05);
                 fx.pulse_rate = r.range(0.1, 0.3);
+            }
+            Ingredient::Thermal => fx.thermal = r.range(0.7, 1.0).min(k),
+            Ingredient::Crt => fx.crt = r.range(0.5, 1.0).min(k),
+            Ingredient::BlockGlitch => fx.glitch = r.range(0.3, 0.8) * k,
+            Ingredient::Grain => fx.grain = r.range(0.2, 0.6) * k,
+            Ingredient::Shock => {
+                fx.shock = r.range(0.4, 0.9).min(k);
+                fx.shock_speed = r.range(0.3, 1.2);
+            }
+            Ingredient::Fisheye => fx.fisheye = r.signed(0.4, 1.0) * k,
+            Ingredient::Hexagon => fx.hexagon = r.range(0.2, 0.6),
+            Ingredient::Halftone => fx.halftone = r.range(0.3, 0.7),
+            Ingredient::Droste => {
+                fx.droste = 1.0;
+                fx.droste_speed = r.signed(0.1, 0.5) * k;
+            }
+            Ingredient::ZoomBlur => fx.zoom_blur = r.range(0.3, 0.8).min(k),
+            Ingredient::Ascii => fx.ascii = r.range(0.2, 0.6),
+            Ingredient::Fold => {
+                fx.fold = r.range(0.3, 0.8).min(k);
+                fx.fold_count = (r.range(3.0, 10.0)).round();
+            }
+            Ingredient::Bloom => {
+                fx.bloom = r.range(0.4, 0.9) * k;
+                fx.blur = r.range(0.0, 0.2);
             }
         }
     }
@@ -797,6 +1133,81 @@ impl BlendMode {
 }
 
 /// Presets fournis avec le logiciel.
+/// Presets intégrés des animations sur la forme du masque (seuls les réglages `shape_*` comptent).
+pub fn mask_anim_presets() -> Vec<Preset> {
+    let p = |name: &str, f: &dyn Fn(&mut Effects)| {
+        let mut effects = Effects::default();
+        f(&mut effects);
+        Preset { name: name.into(), effects }
+    };
+    vec![
+        p("Néon", &|e| {
+            e.shape_glow = 1.2;
+        }),
+        p("Néon arc-en-ciel", &|e| {
+            e.shape_glow = 1.3;
+            e.shape_rainbow = 1.0;
+            e.shape_trace_speed = 0.15;
+        }),
+        p("Comètes", &|e| {
+            e.shape_glow = 0.35;
+            e.shape_trace = 1.5;
+            e.shape_trace_count = 3.0;
+            e.shape_trace_speed = 0.25;
+        }),
+        p("Pointillés", &|e| {
+            e.shape_glow = 0.3;
+            e.shape_dashes = 1.2;
+            e.shape_dash_count = 40.0;
+            e.shape_trace_speed = 0.12;
+        }),
+        p("Ondes", &|e| {
+            e.shape_ripple = 0.8;
+            e.shape_ripple_freq = 14.0;
+            e.shape_ripple_speed = 0.6;
+        }),
+        p("Échos", &|e| {
+            e.shape_glow = 0.6;
+            e.shape_echo = 1.0;
+            e.shape_ripple_freq = 10.0;
+            e.shape_ripple_speed = 0.5;
+        }),
+        p("Aura", &|e| {
+            e.shape_color = [1.0, 0.35, 0.8];
+            e.shape_inner = 1.0;
+            e.shape_glow = 0.5;
+        }),
+        p("Respiration", &|e| {
+            e.shape_glow = 0.8;
+            e.shape_breathe = 0.05;
+            e.shape_breathe_rate = 0.3;
+        }),
+        p("Onde liquide", &|e| {
+            e.shape_wave = 0.02;
+            e.shape_ripple = 0.25;
+            e.shape_ripple_freq = 10.0;
+            e.shape_ripple_speed = 0.8;
+        }),
+        p("Radar", &|e| {
+            e.shape_color = [0.3, 1.0, 0.5];
+            e.shape_glow = 0.5;
+            e.shape_trace = 2.0;
+            e.shape_trace_count = 1.0;
+            e.shape_trace_speed = 0.5;
+            e.shape_echo = 0.5;
+        }),
+        p("Fête", &|e| {
+            e.shape_rainbow = 1.0;
+            e.shape_glow = 1.0;
+            e.shape_trace = 1.0;
+            e.shape_trace_count = 4.0;
+            e.shape_echo = 0.6;
+            e.shape_breathe = 0.03;
+            e.shape_breathe_rate = 0.5;
+        }),
+    ]
+}
+
 pub fn builtin_presets() -> Vec<Preset> {
     let d = Effects::default;
     let p = |name: &str, effects: Effects| Preset {
@@ -867,12 +1278,66 @@ pub fn builtin_presets() -> Vec<Preset> {
             kaleido_spin: 15.0,
             ..d()
         }),
+        p("Cube 3D", Effects { obj3d: Object3d::Cube, rot3d_x: 20.0, spin3d_y: 30.0, spin3d_x: 8.0, ..d() }),
+        p("Sphère", Effects { obj3d: Object3d::Sphere, rot3d_x: 15.0, spin3d_y: 25.0, ..d() }),
+        p("Carte 3D", Effects { obj3d: Object3d::Plane, rot3d_x: 25.0, spin3d_y: 20.0, dist3d: 3.0, ..d() }),
+        p("Cylindre", Effects { obj3d: Object3d::Cylinder, rot3d_x: 10.0, spin3d_y: 35.0, ..d() }),
+        p("Relief", Effects { relief: 0.8, contrast: 1.1, ..d() }),
+        p("Anaglyphe", Effects { anaglyph: 0.012, contrast: 1.1, ..d() }),
+        p("Drapeau", Effects { flag: 0.8, flag_speed: 2.5, ..d() }),
+        p("Thermique", Effects { thermal: 1.0, contrast: 1.2, blur: 0.15, ..d() }),
+        p("Télé cathodique", Effects { crt: 0.9, rgb_shift: 0.003, grain: 0.25, vignette: 0.5, ..d() }),
+        p("Glitch numérique", Effects { glitch: 0.7, rgb_shift: 0.008, grain: 0.2, ..d() }),
+        p("Pellicule", Effects { grain: 0.6, saturation: 0.7, contrast: 1.15, vignette: 0.6, tint: [1.0, 0.85, 0.6], tint_amount: 0.25, ..d() }),
+        p("Onde de choc", Effects { shock: 0.8, shock_speed: 0.6, ..d() }),
+        p("Fish-eye", Effects { fisheye: 0.8, vignette: 0.4, ..d() }),
+        p("Hexagones", Effects { hexagon: 0.4, saturation: 1.3, ..d() }),
+        p("Trame BD", Effects { halftone: 0.5, posterize: 6.0, edge: 0.4, saturation: 1.4, ..d() }),
+        p("Droste", Effects { droste: 1.0, droste_speed: 0.3, ..d() }),
+        p("Zoom radial", Effects { zoom_blur: 0.6, saturation: 1.2, ..d() }),
+        p("ASCII", Effects { ascii: 0.4, contrast: 1.3, ..d() }),
+        p("Tore", Effects { obj3d: Object3d::Torus, rot3d_x: 55.0, spin3d_y: 30.0, ..d() }),
+        p("Accordéon", Effects { fold: 0.6, fold_count: 6.0, ..d() }),
+        p("Terrain 3D", Effects { obj3d: Object3d::Terrain, rot3d_x: -50.0, spin3d_y: 8.0, height3d: 0.35, dist3d: 2.8, ..d() }),
+        p("Pixels 3D", Effects { obj3d: Object3d::Voxels, rot3d_x: -45.0, spin3d_y: 12.0, height3d: 0.3, voxels: 40.0, dist3d: 2.8, ..d() }),
+        p("Halo", Effects { bloom: 0.8, blur: 0.2, brightness: 0.05, saturation: 1.2, ..d() }),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_preset_names_are_unique() {
+        let presets = builtin_presets();
+        let mut names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), presets.len());
+    }
+
+    #[test]
+    fn three_d_presets_switch_object_midway() {
+        let presets = builtin_presets();
+        let cube = presets.iter().find(|p| p.name == "Cube 3D").unwrap().effects;
+        assert_eq!(cube.obj3d, Object3d::Cube);
+        let d = Effects::default();
+        assert_eq!(Effects::lerp(&d, &cube, 0.2).obj3d, Object3d::Off);
+        assert_eq!(Effects::lerp(&d, &cube, 0.8).obj3d, Object3d::Cube);
+        assert!(Effects::lerp(&d, &cube, 0.5).spin3d_y > 0.0);
+    }
+
+    #[test]
+    fn mask_presets_only_touch_shape_animations() {
+        let base = Effects { zoom: 2.0, shatter_amount: 0.4, ..Effects::default() };
+        for p in mask_anim_presets() {
+            assert!(p.effects.uses_shape(), "{} n'anime pas la forme", p.name);
+            let fx = base.with_mask_anim_of(&p.effects);
+            assert_eq!((fx.zoom, fx.shatter_amount), (2.0, 0.4), "{}", p.name);
+            assert!(fx.same_mask_anim(&p.effects));
+        }
+    }
 
     #[test]
     fn random_effects_are_varied_and_never_neutral() {

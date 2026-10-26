@@ -12,6 +12,7 @@ use eframe::glow::{self, HasContext as _};
 
 use crate::effects::{BlendMode, Effects};
 use crate::generator::{Palette, Pattern};
+use crate::surface::Fit;
 use crate::video::FrameSlot;
 
 /// Une source vidéo : clé de texture (uid du lecteur) + dernière frame partagée.
@@ -35,6 +36,9 @@ pub struct LayerDraw {
     pub effects: Effects,
     pub opacity: f32,
     pub blend: BlendMode,
+    /// Cadrage de l'image, et proportions de la surface sur la sortie.
+    pub fit: Fit,
+    pub surface_aspect: f32,
     pub grid: bool,
     pub phases: Phases,
     pub generator: GenDraw,
@@ -96,6 +100,16 @@ pub struct Phases {
     pub shape_breathe: f32,
     /// Boucle de destruction, en cycles (0..1).
     pub shatter: f32,
+    /// Contours animés : vagues de lumière (en vagues), ondulation (en radians).
+    pub lines_flow: f32,
+    pub lines_wobble: f32,
+    /// 3D : rotation automatique de l'objet (degrés), ondulation du drapeau (radians).
+    pub rot3d_x: f32,
+    pub rot3d_y: f32,
+    pub flag: f32,
+    /// Ondes de choc, en cycles (0..1) ; zoom du Droste, en répétitions (0..1).
+    pub shock: f32,
+    pub droste: f32,
 }
 
 impl Phases {
@@ -131,6 +145,18 @@ impl Phases {
         self.shape_trace = step(self.shape_trace, fx.shape_trace_speed, 1.0);
         self.shape_breathe = step(self.shape_breathe, fx.shape_breathe_rate * tau, tau);
         self.shatter = step(self.shatter, fx.shatter_speed, 1.0);
+        self.lines_flow = step(self.lines_flow, fx.lines_flow_speed, 1.0);
+        self.lines_wobble = step(self.lines_wobble, fx.lines_wobble_speed * tau, tau);
+        self.rot3d_x = step(self.rot3d_x, fx.spin3d_x, 360.0);
+        self.rot3d_y = step(self.rot3d_y, fx.spin3d_y, 360.0);
+        // Le drapeau ondule tant qu'il est actif.
+        let flag_speed = if fx.flag > 0.0 { fx.flag_speed } else { 0.0 };
+        self.flag = step(self.flag, flag_speed, 100.0 * tau);
+        // Les ondes de choc repartent du centre tant qu'elles sont actives.
+        let shock_speed = if fx.shock > 0.0 { fx.shock_speed } else { 0.0 };
+        self.shock = step(self.shock, shock_speed, 1.0);
+        let droste_speed = if fx.droste > 0.0 { fx.droste_speed } else { 0.0 };
+        self.droste = step(self.droste, droste_speed, 1.0);
     }
 }
 
@@ -174,8 +200,20 @@ struct VideoTexture {
     size: (u32, u32),
 }
 
+/// Texture où un calque reçoit son visuel généré (rendu à part, une fois par image).
+struct GenTarget {
+    fbo: glow::Framebuffer,
+    texture: glow::Texture,
+    size: (u32, u32),
+    /// Réglages du dernier rendu : identiques (aperçu puis sortie, même image) = pas de nouveau calcul.
+    last: Option<GenDraw>,
+}
+
 pub struct Renderer {
     program: glow::Program,
+    /// Programme des visuels générés (même source, compilée avec GEN_PASS).
+    gen_program: glow::Program,
+    gen_targets: HashMap<usize, GenTarget>,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     black: glow::Texture,
@@ -214,6 +252,10 @@ uniform int u_has_mask;
 uniform int u_mask_invert;
 uniform float u_time;
 uniform vec2 u_tex_size;
+uniform int u_fit;
+uniform float u_surface_aspect;
+uniform vec2 u_size_a;
+uniform vec2 u_size_b;
 uniform int u_grid;
 uniform float u_opacity;
 uniform int u_blend;
@@ -290,9 +332,50 @@ uniform float u_break_size;
 uniform vec2 u_break_center;
 uniform float u_break_glow;
 
+// Contours animés de l'image.
+uniform float u_lines_glow;
+uniform vec3 u_lines_color;
+uniform float u_lines_rainbow;
+uniform float u_lines_threshold;
+uniform float u_lines_width;
+uniform float u_lines_flow;
+uniform float u_lines_flow_phase;
+uniform float u_lines_wobble;
+uniform float u_lines_wobble_phase;
+uniform float u_lines_dim;
+uniform int u_obj3d;
+uniform vec2 u_rot3d;
+uniform float u_dist3d;
+uniform float u_relief;
+uniform vec2 u_relief_dir;
+uniform float u_anaglyph;
+uniform float u_flag;
+uniform float u_flag_phase;
+uniform float u_thermal;
+uniform float u_blur;
+uniform float u_bloom;
+uniform float u_shock;
+uniform float u_shock_phase;
+uniform float u_fisheye;
+uniform float u_hexagon;
+uniform float u_crt;
+uniform float u_glitch;
+uniform float u_grain;
+uniform float u_halftone;
+uniform float u_droste;
+uniform float u_droste_phase;
+uniform float u_zoom_blur;
+uniform float u_ascii;
+uniform float u_fold;
+uniform float u_fold_count;
+uniform float u_height3d;
+uniform float u_voxels;
+
 // Générateurs (motif de départ A, d'arrivée B, fondu entre les deux).
 uniform int u_gen_a;
 uniform int u_gen_b;
+uniform sampler2D u_gen_tex;
+uniform int u_gen_on;
 uniform float u_gen_fade;
 uniform float u_gen_mix;
 uniform float u_gen_time;
@@ -304,6 +387,125 @@ uniform vec3 u_pal_a[4];
 uniform vec3 u_pal_b[4];
 
 const float PI = 3.14159265359;
+
+mat3 rot_x(float a) { float c = cos(a), s = sin(a); return mat3(1.0, 0.0, 0.0, 0.0, c, s, 0.0, -s, c); }
+mat3 rot_y(float a) { float c = cos(a), s = sin(a); return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c); }
+
+// 3D : rayon lancé depuis la caméra vers le point `q` de la surface (0..1).
+// Renvoie les coordonnées image du point touché sur l'objet, hit = 0 si le rayon passe à côté,
+// et l'éclairage du point. Sans rotation, le plan remplit exactement la surface.
+void object3d(vec2 q, out vec2 ouv, out float hit, out float light3) {
+    float asp = max(u_surface_aspect, 0.05);
+    vec2 p = (q - 0.5) * vec2(asp, 1.0);
+    p.y = -p.y;
+    float D = max(u_dist3d, 0.5);
+    mat3 R = rot_y(u_rot3d.y) * rot_x(u_rot3d.x);
+    mat3 Rt = transpose(R);
+    vec3 ro = Rt * vec3(0.0, 0.0, -D);
+    vec3 rd = Rt * normalize(vec3(p, D));
+    // Lumière en haut à gauche, du côté de la caméra.
+    vec3 L = Rt * normalize(vec3(-0.4, 0.5, -1.0));
+    hit = 0.0;
+    ouv = vec2(0.0);
+    light3 = 1.0;
+    float t = -1.0;
+    vec3 n = vec3(0.0, 0.0, -1.0);
+    if (u_obj3d == 1) {
+        // Plan : l'image à ses proportions, dans le plan z = 0.
+        if (abs(rd.z) > 1e-5) {
+            float tt = -ro.z / rd.z;
+            vec3 h = ro + rd * tt;
+            if (tt > 0.0 && abs(h.x) <= asp * 0.5 && abs(h.y) <= 0.5) {
+                t = tt;
+                ouv = vec2(h.x / asp + 0.5, 0.5 - h.y);
+            }
+        }
+    } else if (u_obj3d == 2) {
+        // Cube : l'image sur chaque face.
+        float b = 0.42;
+        // Jamais de division par zéro (sign(0) vaut 0).
+        vec3 safe = mix(vec3(-1.0), vec3(1.0), step(0.0, rd)) * max(abs(rd), vec3(1e-6));
+        vec3 t1 = (vec3(-b) - ro) / safe;
+        vec3 t2 = (vec3(b) - ro) / safe;
+        vec3 tmin = min(t1, t2);
+        vec3 tmax = max(t1, t2);
+        float tn = max(max(tmin.x, tmin.y), tmin.z);
+        float tf = min(min(tmax.x, tmax.y), tmax.z);
+        if (tn < tf && tn > 0.0) {
+            t = tn;
+            vec3 h = ro + rd * t;
+            vec3 a = abs(h);
+            if (a.x >= a.y && a.x >= a.z) {
+                n = vec3(sign(h.x), 0.0, 0.0);
+                ouv = vec2(h.z * sign(h.x), -h.y) / (2.0 * b) + 0.5;
+            } else if (a.y >= a.z) {
+                n = vec3(0.0, sign(h.y), 0.0);
+                ouv = vec2(h.x, h.z * sign(h.y)) / (2.0 * b) + 0.5;
+            } else {
+                n = vec3(0.0, 0.0, sign(h.z));
+                ouv = vec2(-h.x * sign(h.z), -h.y) / (2.0 * b) + 0.5;
+            }
+        }
+    } else if (u_obj3d == 3) {
+        // Sphère : l'image enroulée (longitude, latitude).
+        float r = 0.45;
+        float bq = dot(ro, rd);
+        float disc = bq * bq - (dot(ro, ro) - r * r);
+        if (disc > 0.0) {
+            float tt = -bq - sqrt(disc);
+            if (tt > 0.0) {
+                t = tt;
+                vec3 h = ro + rd * t;
+                n = h / r;
+                ouv = vec2(atan(h.z, h.x) / (2.0 * PI) + 0.5, acos(clamp(-h.y / r, -1.0, 1.0)) / PI);
+            }
+        }
+    } else if (u_obj3d == 4) {
+        // Cylindre vertical ouvert : face extérieure, sinon l'intérieur par le haut ou le bas.
+        float r = 0.38;
+        float hh = 0.5;
+        float a = dot(rd.xz, rd.xz);
+        float bq = dot(ro.xz, rd.xz);
+        float disc = bq * bq - a * (dot(ro.xz, ro.xz) - r * r);
+        if (disc > 0.0 && a > 1e-8) {
+            float s = sqrt(disc);
+            for (int k = 0; k < 2; k++) {
+                float tt = (-bq + (k == 0 ? -s : s)) / a;
+                vec3 h = ro + rd * tt;
+                if (tt > 0.0 && abs(h.y) <= hh) {
+                    t = tt;
+                    n = vec3(h.x, 0.0, h.z) / r;
+                    ouv = vec2(atan(h.z, h.x) / (2.0 * PI) + 0.5, 0.5 - h.y / (2.0 * hh));
+                    break;
+                }
+            }
+        }
+    }
+    if (u_obj3d == 5) {
+        // Tore (anneau couché dans le plan xz) : marche sur sa distance.
+        vec2 tor = vec2(0.32, 0.13);
+        float tt = 0.0;
+        for (int k = 0; k < 64; k++) {
+            vec3 h = ro + rd * tt;
+            float lxz = max(length(h.xz), 1e-5);
+            vec2 qq = vec2(lxz - tor.x, h.y);
+            float dd = length(qq) - tor.y;
+            if (dd < 0.0008) {
+                t = tt;
+                n = normalize(vec3(h.x * (1.0 - tor.x / lxz), h.y, h.z * (1.0 - tor.x / lxz)));
+                ouv = vec2(atan(h.z, h.x) / (2.0 * PI) + 0.5, atan(qq.y, qq.x) / (2.0 * PI) + 0.5);
+                break;
+            }
+            tt += dd;
+            if (tt > D + 2.0) break;
+        }
+    }
+    if (t > 0.0) {
+        hit = 1.0;
+        if (dot(n, rd) > 0.0) n = -n;
+        light3 = 0.3 + 0.75 * max(dot(n, L), 0.0);
+    }
+}
 
 // Sortie selon le mode de fusion (les facteurs GL correspondants sont réglés côté Rust).
 // Une couverture nulle donne toujours une valeur neutre pour le mode.
@@ -348,7 +550,13 @@ float fbm(vec2 p) {
 }
 
 // Motif `kind` au point p (centré, hauteur ≈ 1) : x = position dans la palette, y = intensité.
+#ifdef GEN_PASS
+// Visuels générés : compilés seulement dans le programme du générateur (une passe à part,
+// rendue dans une texture). Le shader des calques ne fait que lire cette texture.
+vec2 march3d(int kind, vec2 p, float t); // visuels 3D, plus bas
+
 vec2 pattern(int kind, vec2 p, float t) {
+    if (kind >= 23) return march3d(kind, p, t);
     float d = u_gen_detail;
     float r = length(p);
     float a = atan(p.y, p.x);
@@ -570,6 +778,7 @@ vec2 pattern(int kind, vec2 p, float t) {
     }
     return vec2(0.0);
 }
+#endif
 
 // ---------------------------------------------------------------- destruction
 //
@@ -711,6 +920,180 @@ void shatter(vec2 q, vec2 impact, out vec2 src, out float alpha, out float crack
     }
 }
 
+#ifdef GEN_PASS
+// ------------------------------------------------------------ visuels 3D (lancer de rayons)
+
+float sd_box(vec3 p, vec3 b) {
+    vec3 q = abs(p) - b;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+// Distance à la scène 3D du motif `kind` ; `trap` sert à colorer (palette).
+float sdf3d(int kind, vec3 p, float t, inout float trap) {
+    float d = u_gen_detail;
+    if (kind == 23) { // Mandelbulb
+        float power = 6.0 + 2.0 * sin(t * 0.15) + d * 2.0;
+        vec3 z = p;
+        float dr = 1.0;
+        float r = 0.0;
+        float tr = 1e9;
+        for (int i = 0; i < 7; i++) {
+            r = length(z);
+            if (r > 2.0) break;
+            float theta = acos(clamp(z.z / max(r, 1e-6), -1.0, 1.0)) * power;
+            float phi = atan(z.y, z.x) * power;
+            dr = pow(r, power - 1.0) * power * dr + 1.0;
+            z = pow(r, power) * vec3(sin(theta) * cos(phi), sin(phi) * sin(theta), cos(theta)) + p;
+            tr = min(tr, length(z));
+        }
+        trap = tr;
+        return 0.5 * log(max(r, 1e-6)) * r / dr;
+    }
+    if (kind == 24) { // éponge de Menger
+        float dist = sd_box(p, vec3(1.0));
+        float s = 1.0;
+        int levels = 3 + int(d * 2.0);
+        for (int m = 0; m < 5; m++) {
+            if (m >= levels) break;
+            vec3 a = mod(p * s, 2.0) - 1.0;
+            s *= 3.0;
+            vec3 r = abs(1.0 - 3.0 * abs(a));
+            float c = (min(max(r.x, r.y), min(max(r.y, r.z), max(r.z, r.x))) - 1.0) / s;
+            if (c > dist) {
+                dist = c;
+                trap = float(m) * 0.25;
+            }
+        }
+        return dist;
+    }
+    if (kind == 25) { // cubes infinis
+        vec3 id = floor(p / 2.0);
+        vec3 q = mod(p, 2.0) - 1.0;
+        float h = hash(id.xy + id.z * 7.31);
+        q.xy = rot2(t * (0.5 + h) + h * 6.0) * q.xy;
+        q.yz = rot2(t * 0.7 + h * 3.0) * q.yz;
+        trap = h;
+        return sd_box(q, vec3(0.28 + d * 0.2)) - 0.04;
+    }
+    if (kind == 26) { // gyroïde
+        float sc = 2.0 + d * 2.0;
+        vec3 q = p * sc;
+        float g = abs(dot(sin(q), cos(q.zxy))) / sc;
+        trap = 0.5 + 0.5 * sin(p.z * 0.3 + q.x * 0.2);
+        return g - 0.06;
+    }
+    if (kind == 27) { // kaléidoscope 3D (fractale à replis)
+        float s = 1.0;
+        float tr = 1e9;
+        int it = 5 + int(d * 4.0);
+        for (int i = 0; i < 9; i++) {
+            if (i >= it) break;
+            p = abs(p);
+            if (p.x < p.y) p.xy = p.yx;
+            if (p.x < p.z) p.xz = p.zx;
+            if (p.y < p.z) p.yz = p.zy;
+            p.xy = rot2(0.3 + 0.2 * sin(t * 0.2)) * p.xy;
+            p.yz = rot2(0.2 + 0.15 * cos(t * 0.17)) * p.yz;
+            p = p * 2.0 - vec3(1.0);
+            s *= 2.0;
+            tr = min(tr, length(p));
+        }
+        trap = tr * 0.2;
+        return (length(p) - 1.2) / s;
+    }
+    if (kind == 29) { // colonnes torsadées
+        vec2 cell = floor(p.xy / 2.0);
+        vec3 q = vec3(mod(p.xy, 2.0) - 1.0, p.z);
+        float h = hash(cell);
+        q.xy = rot2(q.z * (0.4 + d * 0.8) + t * 0.5 + h * 6.0) * q.xy;
+        trap = h + q.z * 0.05;
+        return sd_box(vec3(q.xy, 0.0), vec3(0.22, 0.22, 1.0)) - 0.03;
+    }
+    if (kind == 30) { // anneaux 3D imbriqués
+        float dist = 1e9;
+        int count = 3 + int(d * 3.0);
+        for (int k = 0; k < 6; k++) {
+            if (k >= count) break;
+            float fk = float(k);
+            vec3 q = p;
+            q.xy = rot2(t * (0.3 + fk * 0.17)) * q.xy;
+            q.yz = rot2(t * (0.2 + fk * 0.11) + fk) * q.yz;
+            float R = 0.5 + fk * 0.28;
+            float dd = length(vec2(length(q.xz) - R, q.y)) - 0.06;
+            if (dd < dist) {
+                dist = dd;
+                trap = fk / 6.0;
+            }
+        }
+        return dist;
+    }
+    // 28 : sphères infinies
+    vec3 id = floor(p / 1.6);
+    vec3 q = mod(p, 1.6) - 0.8;
+    float h = hash(id.xy + id.z * 3.17);
+    trap = h;
+    return length(q) - (0.25 + 0.15 * sin(t * 2.0 + h * 6.28) + d * 0.15);
+}
+
+// Lance un rayon par pixel : (indice de palette, luminosité), comme les motifs 2D.
+vec2 march3d(int kind, vec2 p, float t) {
+    float d = u_gen_detail;
+    bool fly = kind == 25 || kind == 26 || kind == 28 || kind == 29;
+    vec3 ro;
+    vec3 ta;
+    if (fly) {
+        // Vol vers l'avant, en serpentant.
+        ro = vec3(0.4 * sin(t * 0.3), 0.3 * cos(t * 0.23), t * 1.2);
+        // (Cubes centrés sur les coordonnées impaires, sphères sur ±0,8 : la caméra passe entre eux.)
+        ta = ro + vec3(0.3 * sin(t * 0.2), 0.2 * cos(t * 0.27), 1.0);
+    } else {
+        // Orbite autour de l'objet.
+        float dist = kind == 23 ? 3.1 : (kind == 24 ? 4.4 : (kind == 30 ? 5.0 : 4.5));
+        float a = t * 0.2;
+        ro = vec3(sin(a), 0.45 * sin(t * 0.11), cos(a)) * dist;
+        ta = vec3(0.0);
+    }
+    vec3 fw = normalize(ta - ro);
+    vec3 rt = normalize(cross(vec3(0.0, 1.0, 0.0), fw));
+    vec3 up = cross(fw, rt);
+    vec3 rd = normalize(p.x * rt - p.y * up + 1.6 * fw);
+    float far = fly ? 28.0 : 9.0;
+    int steps = 48 + int(d * 40.0);
+    float dist = 0.0;
+    float trap = 0.0;
+    bool hit = false;
+    int i;
+    for (i = 0; i < 88; i++) {
+        if (i >= steps) break;
+        float h = sdf3d(kind, ro + rd * dist, t, trap);
+        if (h < 0.0008 + 0.0015 * dist) {
+            hit = true;
+            break;
+        }
+        dist += h * 0.8;
+        if (dist > far) break;
+    }
+    if (!hit) return vec2(t * 0.02, 0.0);
+    vec3 q = ro + rd * dist;
+    // Normale par différences (tétraèdre).
+    float e = 0.0015 + 0.001 * dist;
+    float dummy = 0.0;
+    vec3 n = vec3(0.0);
+    for (int j = 0; j < 4; j++) {
+        // Tétraèdre : (1,-1,-1), (-1,-1,1), (-1,1,-1), (1,1,1) ; une seule copie de sdf3d.
+        vec3 o = vec3(j == 0 || j == 3 ? 1.0 : -1.0, j >= 2 ? 1.0 : -1.0, j == 1 || j == 3 ? 1.0 : -1.0);
+        n += o * sdf3d(kind, q + o * e, t, dummy);
+    }
+    n = normalize(n);
+    vec3 light = normalize(up * 0.8 - rt * 0.5 - fw * 0.6);
+    float diff = max(dot(n, light), 0.0);
+    float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+    float ao = 1.0 - float(i) / float(steps);
+    float fog = exp(-dist * (fly ? 0.11 : 0.12));
+    float bright = ((0.2 + 0.8 * diff) * (0.35 + 0.65 * ao) + rim * 0.4) * fog;
+    return vec2(trap * 0.6 + dist * 0.04 + t * 0.02, clamp(bright * 1.3, 0.0, 1.0));
+}
+
 vec3 palette(vec3 pal[4], float x) {
     return clamp(pal[0] + pal[1] * cos(2.0 * PI * (pal[2] * x + pal[3])), 0.0, 1.0);
 }
@@ -721,22 +1104,188 @@ vec3 generate(int kind, vec3 pal[4], vec2 uv) {
     return palette(pal, v.x + u_gen_hue) * v.y;
 }
 
-vec3 fetch(vec2 uv) {
-    vec3 a = u_has_a == 1 ? texture(u_tex_a, uv).rgb : vec3(0.0);
-    vec3 b = u_has_b == 1 ? texture(u_tex_b, uv).rgb : vec3(0.0);
-    vec3 video = mix(a, b, u_mix);
-    if (u_gen_a == 0 && u_gen_b == 0) return video;
-    // Fondu entre deux motifs ; « aucun » motif laisse passer la vidéo.
-    vec3 gb = u_gen_b > 0 ? generate(u_gen_b, u_pal_b, uv) : video;
-    vec3 g = gb;
-    if (u_gen_fade < 1.0) {
-        vec3 ga = u_gen_a > 0 ? generate(u_gen_a, u_pal_a, uv) : video;
-        g = mix(ga, gb, u_gen_fade);
+// Passe du générateur : fondu entre l'ancien et le nouveau motif. Alpha = part de motif
+// (un motif « aucun » laisse passer la vidéo du calque).
+void main() {
+    vec2 uv = vec2(v_uv.x, 1.0 - v_uv.y); // la texture est lue avec y vers le bas
+    vec3 col = vec3(0.0);
+    float cover = 0.0;
+    vec3 pal[4];
+    // Un seul appel à `generate` (dans la boucle) : le code compilé reste petit.
+    for (int k = 0; k < 2; k++) {
+        int kind = k == 0 ? u_gen_a : u_gen_b;
+        float w = k == 0 ? 1.0 - u_gen_fade : u_gen_fade;
+        if (kind == 0 || w <= 0.0) continue;
+        for (int j = 0; j < 4; j++) pal[j] = k == 0 ? u_pal_a[j] : u_pal_b[j];
+        col += generate(kind, pal, uv) * w;
+        cover += w;
     }
-    return mix(video, g, u_gen_mix);
+    out_color = vec4(col, cover);
+}
+#endif
+
+// Cadrage : coordonnées dans l'image (de taille `size`) d'un point de la surface.
+vec2 fit_uv(vec2 uv, vec2 size) {
+    if (u_fit == 0) return uv;
+    float r = (size.x / max(size.y, 1.0)) / max(u_surface_aspect, 1e-3);
+    vec2 s = vec2(1.0);
+    if (u_fit == 1) {
+        // Ajuster : l'image entière, bandes autour.
+        if (r > 1.0) s.y = r; else s.x = 1.0 / r;
+    } else {
+        // Remplir : toute la surface, image rognée.
+        if (r > 1.0) s.x = 1.0 / r; else s.y = r;
+    }
+    return (uv - 0.5) * s + 0.5;
+}
+
+// 1 dans l'image, 0 dans les bandes du mode « Ajuster ».
+float in_frame(vec2 uv) {
+    if (u_fit != 1) return 1.0;
+    return step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0);
+}
+
+vec3 fetch(vec2 uv) {
+    vec2 ua = fit_uv(uv, u_size_a);
+    vec2 ub = fit_uv(uv, u_size_b);
+    vec3 a = u_has_a == 1 ? texture(u_tex_a, ua).rgb * in_frame(ua) : vec3(0.0);
+    vec3 b = u_has_b == 1 ? texture(u_tex_b, ub).rgb * in_frame(ub) : vec3(0.0);
+    vec3 video = mix(a, b, u_mix);
+    if (u_gen_on == 0) return video;
+    // Visuel généré, calculé à part une fois par image (alpha = part de motif).
+    vec4 g = texture(u_gen_tex, uv);
+    return mix(video, g.rgb + video * (1.0 - g.a), u_gen_mix);
 }
 
 float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// Palette de caméra thermique : noir, bleu, violet, rouge, jaune, blanc.
+// ------------------------------------------------------------ 3D construite depuis l'image
+// Terrain (relief lisse) et pixels 3D (colonnes) : la clarté de l'image donne la hauteur.
+// L'image est posée dans le plan z = 0, le relief monte vers la caméra (z négatif).
+
+float height_at(vec2 xy, float asp) {
+    vec2 q = vec2(xy.x / asp + 0.5, 0.5 - xy.y);
+    return luma(fetch(q)) * u_height3d;
+}
+
+void heightfield3d(vec2 sq, out vec2 ouv, out float hit, out float light3) {
+    float asp = max(u_surface_aspect, 0.05);
+    vec2 p = (sq - 0.5) * vec2(asp, 1.0);
+    p.y = -p.y;
+    float D = max(u_dist3d, 0.5);
+    mat3 R = rot_y(u_rot3d.y) * rot_x(u_rot3d.x);
+    mat3 Rt = transpose(R);
+    vec3 ro = Rt * vec3(0.0, 0.0, -D);
+    vec3 rd = Rt * normalize(vec3(p, D));
+    vec3 L = Rt * normalize(vec3(-0.4, 0.5, -1.0));
+    hit = 0.0;
+    ouv = vec2(0.0);
+    light3 = 1.0;
+    float H = max(u_height3d, 1e-3);
+    vec2 half_size = vec2(asp * 0.5, 0.5);
+    if (rd.z <= 1e-4) return; // le rayon s'éloigne du plan de l'image
+    float t_end = -ro.z / rd.z;          // plan de base z = 0
+    float t_start = max((-H - ro.z) / rd.z, 0.0); // haut du relief
+    vec3 n = vec3(0.0, 0.0, -1.0);
+    float t = -1.0;
+    vec2 cell_uv = vec2(0.0);
+    if (u_obj3d == 6) {
+        // Terrain : pas réguliers, puis interpolation entre les deux derniers points.
+        float prev_t = t_start;
+        float prev_gap = 1.0;
+        for (int k = 0; k <= 96; k++) {
+            float tt = mix(t_start, t_end, float(k) / 96.0);
+            vec3 h = ro + rd * tt;
+            bool inside = all(lessThanEqual(abs(h.xy), half_size));
+            float gap = h.z + (inside ? height_at(h.xy, asp) : -1e3); // >= 0 : sous la surface
+            if (inside && gap >= 0.0) {
+                float f = prev_gap < 0.0 ? prev_gap / (prev_gap - gap) : 0.0;
+                t = mix(prev_t, tt, f);
+                break;
+            }
+            prev_t = tt;
+            prev_gap = gap;
+        }
+        if (t > 0.0) {
+            vec3 h = ro + rd * t;
+            float e = 0.004;
+            float hx = height_at(h.xy + vec2(e, 0.0), asp) - height_at(h.xy - vec2(e, 0.0), asp);
+            float hy = height_at(h.xy + vec2(0.0, e), asp) - height_at(h.xy - vec2(0.0, e), asp);
+            n = normalize(vec3(hx, hy, 2.0 * e));
+            cell_uv = vec2(h.x / asp + 0.5, 0.5 - h.y);
+        }
+    } else {
+        // Pixels 3D : traversée case par case (DDA) d'une grille de colonnes.
+        float cs = 1.0 / max(floor(u_voxels), 4.0);
+        vec3 h0 = ro + rd * t_start;
+        vec2 cell = floor(h0.xy / cs);
+        vec2 stp = vec2(rd.x >= 0.0 ? 1.0 : -1.0, rd.y >= 0.0 ? 1.0 : -1.0);
+        vec2 ird = 1.0 / max(abs(rd.xy), vec2(1e-6));
+        vec2 next = ((cell + max(stp, 0.0)) * cs - h0.xy) * stp * ird + t_start;
+        vec2 delta = cs * ird;
+        float t_in = t_start;
+        float side = -1.0; // axe de la dernière face traversée (0 : x, 1 : y)
+        for (int k = 0; k < 200; k++) {
+            float t_out = min(min(next.x, next.y), t_end);
+            vec2 center = (cell + 0.5) * cs;
+            if (all(lessThanEqual(abs(center), half_size))) {
+                float hc = height_at(center, asp);
+                float z_out = ro.z + rd.z * t_out;
+                if (z_out >= -hc) {
+                    float z_in = ro.z + rd.z * t_in;
+                    if (z_in >= -hc && side >= 0.0) {
+                        t = t_in; // flanc de la colonne
+                        n = side < 0.5 ? vec3(-stp.x, 0.0, 0.0) : vec3(0.0, -stp.y, 0.0);
+                    } else {
+                        t = max((-hc - ro.z) / rd.z, t_in); // dessus
+                        n = vec3(0.0, 0.0, -1.0);
+                    }
+                    cell_uv = vec2(center.x / asp + 0.5, 0.5 - center.y);
+                    // Joints sombres entre les colonnes, sur le dessus.
+                    vec3 hp = ro + rd * t;
+                    vec2 local = abs(fract(hp.xy / cs) - 0.5);
+                    if (n.z < -0.5) light3 *= 0.75 + 0.25 * smoothstep(0.5, 0.42, max(local.x, local.y));
+                    break;
+                }
+            }
+            if (t_out >= t_end) break;
+            if (next.x < next.y) {
+                t_in = next.x;
+                next.x += delta.x;
+                cell.x += stp.x;
+                side = 0.0;
+            } else {
+                t_in = next.y;
+                next.y += delta.y;
+                cell.y += stp.y;
+                side = 1.0;
+            }
+        }
+    }
+    if (t > 0.0) {
+        hit = 1.0;
+        ouv = cell_uv;
+        if (dot(n, rd) > 0.0) n = -n;
+        light3 *= 0.3 + 0.8 * max(dot(n, L), 0.0);
+    }
+}
+
+vec3 thermal(float t) {
+    t = clamp(t, 0.0, 1.0);
+    vec3 c = mix(vec3(0.0, 0.0, 0.15), vec3(0.35, 0.0, 0.65), smoothstep(0.0, 0.25, t));
+    c = mix(c, vec3(0.95, 0.1, 0.2), smoothstep(0.25, 0.5, t));
+    c = mix(c, vec3(1.0, 0.75, 0.0), smoothstep(0.5, 0.75, t));
+    return mix(c, vec3(1.0), smoothstep(0.75, 1.0, t));
+}
+
+// Caractère ASCII (5×5 points codés dans un entier) au point p (-1..1 dans la case).
+float ascii_char(int n, vec2 p) {
+    p = floor(p * vec2(-2.5, 2.5) + 2.5);
+    if (p.x < 0.0 || p.x > 4.0 || p.y < 0.0 || p.y > 4.0) return 0.0;
+    int a = int(p.x + 0.5) + 5 * int(p.y + 0.5);
+    return float((n >> a) & 1);
+}
 
 vec3 rgb2hsv(vec3 c) {
     vec4 K = vec4(0.0, -1.0 / 3.0, 2.0 / 3.0, -1.0);
@@ -753,6 +1302,25 @@ vec3 hsv2rgb(vec3 c) {
     return c.z * mix(K.xxx, clamp(p - K.xxx, 0.0, 1.0), c.y);
 }
 
+// Force des contours (filtre de Sobel sur la luminosité), avec un écart de `t` entre les points.
+float sobel(vec2 uv, vec2 t) {
+    float tl = luma(fetch(uv + t * vec2(-1, -1))), tc = luma(fetch(uv + t * vec2(0, -1))), tr = luma(fetch(uv + t * vec2(1, -1)));
+    float ml = luma(fetch(uv + t * vec2(-1, 0))),                                          mr = luma(fetch(uv + t * vec2(1, 0)));
+    float bl = luma(fetch(uv + t * vec2(-1, 1))),  bc = luma(fetch(uv + t * vec2(0, 1))),  br = luma(fetch(uv + t * vec2(1, 1)));
+    float gx = -tl - 2.0 * ml - bl + tr + 2.0 * mr + br;
+    float gy = -tl - 2.0 * tc - tr + bl + 2.0 * bc + br;
+    return length(vec2(gx, gy));
+}
+
+// Ondulation des contours : somme de sinus dont la phase fait un tour complet (boucle sans saut).
+vec2 wobble(vec2 p, float ph) {
+    return vec2(
+        sin(p.y * 7.0 + ph) + 0.5 * sin(p.x * 13.0 - 2.0 * ph + 1.7) + 0.3 * sin((p.x + p.y) * 23.0 + 3.0 * ph),
+        cos(p.x * 8.0 - ph) + 0.5 * cos(p.y * 11.0 + 2.0 * ph + 0.4) + 0.3 * cos((p.x - p.y) * 19.0 - 3.0 * ph)
+    ) / 1.8;
+}
+
+#ifndef GEN_PASS
 void main() {
     if (u_solid == 1) {
         out_color = vec4(0.0, 0.0, 0.0, u_solid_alpha);
@@ -834,6 +1402,34 @@ void main() {
     }
     vec2 quad_uv = tex_uv;
     vec2 uv = quad_uv;
+    if (u_fit == 1 && (u_has_a == 1 || u_has_b == 1)) {
+        // Ajuster : les bandes autour de l'image laissent voir les calques de derrière.
+        float ia = u_has_a == 1 ? in_frame(fit_uv(quad_uv, u_size_a)) : 0.0;
+        float ib = u_has_b == 1 ? in_frame(fit_uv(quad_uv, u_size_b)) : 0.0;
+        float inside = u_has_b == 1 ? mix(ia, ib, u_mix) : ia;
+        float gen = u_gen_on == 1 ? u_gen_mix : 0.0;
+        coverage *= mix(inside, 1.0, gen);
+        if (coverage <= 0.0) {
+            emit(vec3(0.0), 0.0);
+            return;
+        }
+    }
+
+    // 1 bis. Objet 3D : l'image est posée sur un plan, un cube, une sphère ou un cylindre.
+    float shade3d = 1.0;
+    if (u_obj3d > 0) {
+        float hit3d;
+        if (u_obj3d >= 6) {
+            heightfield3d(quad_uv, uv, hit3d, shade3d);
+        } else {
+            object3d(quad_uv, uv, hit3d, shade3d);
+        }
+        coverage *= hit3d;
+        if (coverage <= 0.0) {
+            emit(vec3(0.0), 0.0);
+            return;
+        }
+    }
 
     // 2. Géométrie
     if (u_tiles > 1.0) {
@@ -913,10 +1509,103 @@ void main() {
         float w = sin(2.0 * PI * (dv * u_shape_freq - u_shape_ripple_phase));
         uv += n * vec2(t.x / t.y, 1.0) * w * u_shape_wave;
     }
+    if (u_fisheye != 0.0) {
+        // Fish-eye : bombé (positif) ou pincé (négatif) depuis le centre.
+        vec2 c = (uv - 0.5) * vec2(aspect, 1.0);
+        float r2 = dot(c, c);
+        c *= 1.0 / (1.0 + u_fisheye * r2 * 1.2);
+        uv = c / vec2(aspect, 1.0) + 0.5;
+    }
+    if (u_crt > 0.0) {
+        // Écran cathodique bombé.
+        vec2 c = uv - 0.5;
+        uv = c * (1.0 + dot(c, c) * 0.35 * u_crt) + 0.5;
+    }
+    float shock_glow = 0.0;
+    if (u_shock > 0.0) {
+        // Onde de choc : un anneau part du centre et pousse l'image.
+        vec2 c = (uv - 0.5) * vec2(aspect, 1.0);
+        float r = length(c);
+        float d = r - u_shock_phase * 1.3;
+        float ring = exp(-d * d * 250.0) * (1.0 - u_shock_phase);
+        uv += c / max(r, 1e-4) / vec2(aspect, 1.0) * ring * u_shock * 0.05;
+        shock_glow = ring * u_shock * 0.35;
+    }
+    if (u_droste > 0.0) {
+        // Droste : chaque anneau reprend l'image en plus petit, en spirale, et ça zoome.
+        vec2 c = (uv - 0.5) * vec2(aspect, 1.0);
+        float r = max(length(c), 1e-5);
+        float a = atan(c.y, c.x);
+        float L = log(4.0);
+        float r0 = log(0.5);
+        float lr = log(r) + a / (2.0 * PI) * L - u_droste_phase * L;
+        float rr = exp(mod(lr - r0, L) + r0 - L * 0.999);
+        vec2 dst = vec2(cos(a), sin(a)) * rr / vec2(aspect, 1.0) + 0.5;
+        uv = mix(uv, dst, clamp(u_droste, 0.0, 1.0));
+    }
+    if (u_glitch > 0.0) {
+        // Glitch numérique : bandes décalées et blocs qui sautent, plusieurs fois par seconde.
+        float tt = floor(u_time * 12.0);
+        float band = floor(quad_uv.y * 28.0);
+        if (hash(vec2(band, tt)) < u_glitch * 0.45) {
+            uv.x += (hash(vec2(band + 7.0, tt)) - 0.5) * 0.25 * u_glitch;
+        }
+        vec2 blk = floor(quad_uv * vec2(9.0, 6.0));
+        if (hash(blk + tt * 1.7) < u_glitch * 0.12) {
+            uv += (hash2(blk + tt) - 0.5) * 0.15;
+        }
+    }
+    float fold_shade = 1.0;
+    if (u_fold > 0.0) {
+        // Accordéon : l'image pliée en panneaux, vus en perspective.
+        float nf = max(floor(u_fold_count), 2.0);
+        float ang = u_fold * 1.1;
+        float x = (quad_uv.x - 0.5) / cos(ang) + 0.5;
+        coverage *= step(0.0, x) * step(x, 1.0);
+        float sx = x * nf;
+        bool even = mod(floor(sx), 2.0) < 1.0;
+        float f = fract(sx);
+        float depth = (even ? f : 1.0 - f) * sin(ang) / nf;
+        uv.x += x - quad_uv.x;
+        uv.y = 0.5 + (uv.y - 0.5) / (1.0 + depth * 2.0);
+        fold_shade = even ? 1.0 - 0.35 * u_fold : 1.0 + 0.08 * u_fold;
+    }
+    float flag_shade = 1.0;
+    if (u_flag > 0.0) {
+        // Drapeau : vagues qui partent du bord gauche (le mât) et grandissent vers la droite.
+        float reach = 0.25 + 0.75 * clamp(uv.x, 0.0, 1.0);
+        float a = uv.x * 7.0 + uv.y * 2.0 - u_flag_phase;
+        uv.y += sin(a) * reach * u_flag * 0.04;
+        uv.x += cos(a) * reach * u_flag * 0.01;
+        flag_shade = 1.0 + cos(a) * reach * u_flag * 0.45;
+    }
+    float relief_shade = 1.0;
+    if (u_relief > 0.0) {
+        // Relief : la luminosité devient une hauteur ; l'image se décale avec le point de vue
+        // et s'éclaire de biais.
+        vec2 tx = 2.0 / max(u_tex_size, vec2(1.0));
+        float hc = luma(fetch(uv));
+        float hx = luma(fetch(uv + vec2(tx.x, 0.0))) - luma(fetch(uv - vec2(tx.x, 0.0)));
+        float hy = luma(fetch(uv + vec2(0.0, tx.y))) - luma(fetch(uv - vec2(0.0, tx.y)));
+        uv += u_relief_dir * (hc - 0.5) * u_relief * 0.02;
+        vec3 nr = normalize(vec3(-hx, -hy, 0.25 / u_relief));
+        vec3 lr = normalize(vec3(-0.5, -0.5, 0.7));
+        relief_shade = mix(1.0, max(dot(nr, lr), 0.0) / lr.z, clamp(u_relief, 0.0, 1.0));
+    }
     if (u_pixelate > 0.0) {
         float cells = mix(320.0, 6.0, u_pixelate);
         vec2 grid = vec2(cells, cells / aspect);
         uv = (floor(uv * grid) + 0.5) / grid;
+    }
+    if (u_hexagon > 0.0) {
+        // Mosaïque hexagonale : chaque alvéole prend la couleur de son centre.
+        float sz = mix(0.004, 0.06, u_hexagon);
+        vec2 hp = uv * vec2(aspect, 1.0) / sz;
+        vec2 rr = vec2(1.0, 1.7320508);
+        vec2 ha = mod(hp, rr) - rr * 0.5;
+        vec2 hb = mod(hp - rr * 0.5, rr) - rr * 0.5;
+        vec2 g = dot(ha, ha) < dot(hb, hb) ? ha : hb;
+        uv = (hp - g) * sz / vec2(aspect, 1.0);
     }
 
     // 4. Échantillonnage (avec décalage RVB)
@@ -926,6 +1615,54 @@ void main() {
         col = vec3(fetch(uv + off).r, fetch(uv).g, fetch(uv - off).b);
     } else {
         col = fetch(uv);
+    }
+    if (u_anaglyph > 0.0) {
+        // Anaglyphe : rouge et cyan décalés, d'autant plus que le point est clair (fausse profondeur).
+        vec2 off = vec2(u_anaglyph * (0.5 + luma(col)), 0.0);
+        col = vec3(fetch(uv - off).r, fetch(uv + off).gb);
+    }
+    if (u_blur > 0.0 || u_bloom > 0.0 || u_zoom_blur > 0.0) {
+        // Flou (disque), halo des zones claires, et flou de zoom (le long des rayons) :
+        // une seule boucle de lectures.
+        vec3 acc = vec3(0.0);
+        vec3 bright = vec3(0.0);
+        vec3 zacc = vec3(0.0);
+        float rad = mix(0.002, 0.03, max(u_blur, u_bloom * 0.8));
+        for (int k = 0; k < 12; k++) {
+            float fk = float(k);
+            float a = fk * 2.39996;
+            vec2 o = vec2(cos(a), sin(a)) * sqrt((fk + 0.5) / 12.0) * rad * vec2(1.0 / aspect, 1.0);
+            vec2 zuv = 0.5 + (uv - 0.5) * (1.0 - u_zoom_blur * 0.18 * fk / 11.0);
+            // Une seule lecture par tour : disque ou rayon selon l'effet le plus fort.
+            bool zoom = u_zoom_blur > max(u_blur, u_bloom);
+            vec3 sc = fetch(zoom ? zuv : uv + o);
+            if (zoom) zacc += sc; else { acc += sc; bright += max(sc - 0.55, 0.0); }
+        }
+        if (u_zoom_blur > max(u_blur, u_bloom)) {
+            col = mix(col, zacc / 12.0, clamp(u_zoom_blur * 1.5, 0.0, 1.0));
+        } else {
+            col = mix(col, acc / 12.0, clamp(u_blur, 0.0, 1.0));
+            col += bright / 12.0 * u_bloom * 3.0;
+        }
+    }
+    if (u_ascii > 0.0) {
+        // ASCII : chaque case devient un caractère, plus « plein » quand la case est claire.
+        float cols = mix(160.0, 40.0, clamp(u_ascii, 0.0, 1.0));
+        vec2 grid = vec2(cols, cols / max(u_surface_aspect, 0.05) * 1.25);
+        vec2 cell = floor(quad_uv * grid);
+        vec2 center = (cell + 0.5) / grid;
+        vec3 cc = fetch(uv + center - quad_uv);
+        float gray = luma(cc);
+        int n = 4096;
+        if (gray > 0.2) n = 65600;
+        if (gray > 0.3) n = 332772;
+        if (gray > 0.4) n = 15255086;
+        if (gray > 0.5) n = 23385164;
+        if (gray > 0.6) n = 15252014;
+        if (gray > 0.7) n = 13199452;
+        if (gray > 0.8) n = 11512810;
+        vec2 local = fract(quad_uv * grid) * 2.0 - 1.0;
+        col = cc * ascii_char(n, local) * 1.3;
     }
 
     if (u_echo > 0.0) {
@@ -938,13 +1675,7 @@ void main() {
     }
 
     if (u_edge > 0.0) {
-        vec2 t = 1.0 / max(u_tex_size, vec2(1.0));
-        float tl = luma(fetch(uv + t * vec2(-1, -1))), tc = luma(fetch(uv + t * vec2(0, -1))), tr = luma(fetch(uv + t * vec2(1, -1)));
-        float ml = luma(fetch(uv + t * vec2(-1, 0))),                                          mr = luma(fetch(uv + t * vec2(1, 0)));
-        float bl = luma(fetch(uv + t * vec2(-1, 1))),  bc = luma(fetch(uv + t * vec2(0, 1))),  br = luma(fetch(uv + t * vec2(1, 1)));
-        float gx = -tl - 2.0 * ml - bl + tr + 2.0 * mr + br;
-        float gy = -tl - 2.0 * tc - tr + bl + 2.0 * bc + br;
-        float e = clamp(length(vec2(gx, gy)) * 2.0, 0.0, 1.0);
+        float e = clamp(sobel(uv, 1.0 / max(u_tex_size, vec2(1.0))) * 2.0, 0.0, 1.0);
         col = mix(col, vec3(e) * mix(vec3(1.0), col * 2.0, 0.5), u_edge);
     }
 
@@ -974,12 +1705,52 @@ void main() {
     }
     col = mix(col, 1.0 - col, u_invert);
     col = mix(col, luma(col) * u_tint * 1.5, u_tint_amount);
+    if (u_thermal > 0.0) {
+        col = mix(col, thermal(luma(clamp(col, 0.0, 1.0)) * 1.1), clamp(u_thermal, 0.0, 1.0));
+    }
+    if (u_halftone > 0.0) {
+        // Trame de points façon BD : gros points d'encre dans les zones sombres.
+        float cells = mix(140.0, 28.0, clamp(u_halftone, 0.0, 1.0));
+        vec2 hp = rot2(0.785) * (quad_uv * vec2(u_surface_aspect, 1.0) * cells);
+        float rad = sqrt(1.0 - clamp(luma(col), 0.0, 1.0)) * 0.62;
+        float ink = 1.0 - smoothstep(rad - 0.08, rad + 0.08, length(fract(hp) - 0.5));
+        vec3 paper = vec3(0.97, 0.95, 0.88);
+        col = mix(col, mix(paper, col * 0.45, ink), smoothstep(0.0, 0.15, u_halftone));
+    }
+    if (u_crt > 0.0) {
+        // Lignes de balayage et grille de phosphores RVB.
+        float sl = 0.7 + 0.3 * sin(gl_FragCoord.y * PI * 0.5);
+        int m = int(mod(gl_FragCoord.x, 3.0));
+        vec3 mask = vec3(m == 0 ? 1.2 : 0.85, m == 1 ? 1.2 : 0.85, m == 2 ? 1.2 : 0.85);
+        col *= mix(vec3(1.0), sl * mask * 1.15, clamp(u_crt, 0.0, 1.0));
+    }
+    if (u_grain > 0.0) {
+        col += (hash(gl_FragCoord.xy + fract(u_time * 7.3) * 100.0) - 0.5) * u_grain * 0.35;
+    }
+    col += shock_glow;
 
     if (u_vignette > 0.0) {
         float d = length(quad_uv - 0.5) * 1.4142;
         col *= 1.0 - smoothstep(1.0 - u_vignette, 1.0 + 0.0001, d) * clamp(u_vignette * 1.5, 0.0, 1.0);
     }
-    col *= tunnel_fade * shade;
+    col *= tunnel_fade * shade * shade3d * relief_shade * flag_shade * fold_shade;
+    if (u_lines_glow > 0.0 || u_lines_dim > 0.0) {
+        // Contours animés : les contours de l'image s'illuminent, ondulent et sont parcourus
+        // par des vagues de lumière. L'image elle-même reste en place (et peut être assombrie).
+        vec2 t = 1.0 / max(u_tex_size, vec2(1.0));
+        vec2 luv = uv + wobble(uv * vec2(aspect, 1.0), u_lines_wobble_phase) * u_lines_wobble * vec2(1.0, aspect);
+        float th = u_lines_threshold;
+        float core = smoothstep(th, th + 0.25, sobel(luv, t) * 1.5);
+        float halo = smoothstep(th * 0.6, th * 0.6 + 0.4, sobel(luv, t * max(u_lines_width, 1.0)) * 1.5);
+        float lit = core + 0.6 * halo * halo;
+        // Vagues qui partent du centre de l'image et allument les contours à leur passage.
+        float d = length((quad_uv - 0.5) * vec2(u_tex_size.x / max(u_tex_size.y, 1.0), 1.0));
+        float wave = pow(0.5 + 0.5 * sin(2.0 * PI * (d * 3.0 - u_lines_flow_phase)), 4.0);
+        lit *= mix(1.0, 0.15 + 2.2 * wave, clamp(u_lines_flow, 0.0, 1.0));
+        vec3 rainbow = 0.5 + 0.5 * cos(2.0 * PI * (quad_uv.x * 0.7 + quad_uv.y * 0.5 - u_lines_flow_phase + vec3(0.0, 0.33, 0.67)));
+        vec3 lcol = mix(u_lines_color, rainbow, u_lines_rainbow);
+        col = col * (1.0 - u_lines_dim) + mix(lcol, vec3(1.0), 0.35 * core) * lit * u_lines_glow;
+    }
     if (u_has_shape == 1 && u_shape_ripple > 0.0) {
         // Lignes concentriques qui épousent la forme et avancent vers l'intérieur.
         float r = dv * u_shape_freq - u_shape_ripple_phase;
@@ -1014,13 +1785,13 @@ void main() {
 
     emit(col, coverage);
 }
+#endif
 "#;
 
 impl Renderer {
-    pub fn new(gl: &glow::Context) -> Result<Self, String> {
+    unsafe fn compile(gl: &glow::Context, header: &str) -> Result<glow::Program, String> {
         unsafe {
             let program = gl.create_program()?;
-            let header = "#version 330\n";
             let mut shaders = Vec::new();
             for (kind, src) in [
                 (glow::VERTEX_SHADER, VERTEX_SHADER),
@@ -1043,6 +1814,14 @@ impl Renderer {
                 gl.detach_shader(program, s);
                 gl.delete_shader(s);
             }
+            Ok(program)
+        }
+    }
+
+    pub fn new(gl: &glow::Context) -> Result<Self, String> {
+        unsafe {
+            let program = Self::compile(gl, "#version 330\n")?;
+            let gen_program = Self::compile(gl, "#version 330\n#define GEN_PASS\n")?;
 
             let vao = gl.create_vertex_array()?;
             let vbo = gl.create_buffer()?;
@@ -1061,6 +1840,8 @@ impl Renderer {
 
             Ok(Self {
                 program,
+                gen_program,
+                gen_targets: HashMap::new(),
                 vao,
                 vbo,
                 black,
@@ -1098,6 +1879,11 @@ impl Renderer {
     pub fn destroy(&mut self, gl: &glow::Context) {
         unsafe {
             gl.delete_program(self.program);
+            gl.delete_program(self.gen_program);
+            for (_, t) in self.gen_targets.drain() {
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
             gl.delete_vertex_array(self.vao);
             gl.delete_buffer(self.vbo);
             gl.delete_texture(self.black);
@@ -1244,6 +2030,16 @@ impl Renderer {
             }
             keep
         });
+        self.gen_targets.retain(|k, t| {
+            let keep = p.layers.get(*k).is_some_and(|l| l.generator.is_active());
+            if !keep {
+                unsafe {
+                    gl.delete_framebuffer(t.fbo);
+                    gl.delete_texture(t.texture);
+                }
+            }
+            keep
+        });
         let shapes: HashSet<u64> = p.layers.iter().filter_map(|l| l.shape.as_ref()).map(|s| s.key).collect();
         self.shape_textures.retain(|key, t| {
             let keep = shapes.contains(key);
@@ -1254,8 +2050,116 @@ impl Renderer {
         });
     }
 
+    /// Visuels générés : chaque calque qui en a un le reçoit dans sa texture, une seule fois
+    /// par image (l'aperçu et la sortie partagent le résultat).
+    unsafe fn render_generators(&mut self, gl: &glow::Context, p: &DrawParams) {
+        unsafe {
+            if !p.layers.iter().any(|l| l.generator.is_active()) {
+                return;
+            }
+            // État d'egui à remettre en place ensuite.
+            let prev_fbo = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
+            let mut prev_vp = [0i32; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut prev_vp);
+            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            let blend = gl.is_enabled(glow::BLEND);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(self.gen_program));
+            gl.bind_vertex_array(Some(self.vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            let full: [f32; 24] = [
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, //
+                0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+            ];
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&full), glow::STREAM_DRAW);
+            for (k, layer) in p.layers.iter().enumerate() {
+                let g = &layer.generator;
+                if !g.is_active() {
+                    continue;
+                }
+                // Les visuels 3D (lancer de rayons) sont calculés en plus basse définition.
+                let is_3d = |pt: Pattern| pt as i32 >= Pattern::Mandelbulb as i32;
+                let h: u32 = if is_3d(g.from) || is_3d(g.to) { 540 } else { 900 };
+                let size = (((h as f32) * g.aspect.clamp(0.2, 5.0)) as u32, h);
+                let Some(target) = self.gen_target(gl, k, size) else {
+                    continue;
+                };
+                if target.last == Some(*g) {
+                    continue;
+                }
+                target.last = Some(*g);
+                let fbo = target.fbo;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+                Self::set_gen_uniforms(gl, self.gen_program, g);
+                gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            }
+            gl.bind_framebuffer(glow::FRAMEBUFFER, prev_fbo);
+            gl.viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+            if scissor {
+                gl.enable(glow::SCISSOR_TEST);
+            }
+            if blend {
+                gl.enable(glow::BLEND);
+            }
+        }
+    }
+
+    /// Texture + framebuffer du visuel généré du calque `k`, (re)créés à la bonne taille.
+    unsafe fn gen_target(&mut self, gl: &glow::Context, k: usize, size: (u32, u32)) -> Option<&mut GenTarget> {
+        unsafe {
+            if self.gen_targets.get(&k).is_some_and(|t| t.size != size) {
+                let t = self.gen_targets.remove(&k).unwrap();
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
+            if !self.gen_targets.contains_key(&k) {
+                let texture = Self::create_texture(gl).ok()?;
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    size.0 as i32,
+                    size.1 as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                let fbo = gl.create_framebuffer().ok()?;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+                self.gen_targets.insert(k, GenTarget { fbo, texture, size, last: None });
+            }
+            self.gen_targets.get_mut(&k)
+        }
+    }
+
+    unsafe fn set_gen_uniforms(gl: &glow::Context, program: glow::Program, g: &GenDraw) {
+        unsafe {
+            let loc = |name: &str| gl.get_uniform_location(program, name);
+            let f = |name: &str, v: f32| gl.uniform_1_f32(loc(name).as_ref(), v);
+            let i = |name: &str, v: i32| gl.uniform_1_i32(loc(name).as_ref(), v);
+            i("u_gen_a", g.from as i32);
+            i("u_gen_b", g.to as i32);
+            f("u_gen_fade", g.fade.clamp(0.0, 1.0));
+            f("u_gen_time", g.time);
+            f("u_gen_hue", g.hue);
+            f("u_gen_scale", g.scale.max(0.05));
+            f("u_gen_detail", g.detail.clamp(0.0, 1.0));
+            f("u_gen_aspect", g.aspect.max(0.1));
+            for (name, pal) in [("u_pal_a", g.from_palette), ("u_pal_b", g.to_palette)] {
+                let flat: Vec<f32> = pal.coefs().iter().flatten().copied().collect();
+                gl.uniform_3_f32_slice(loc(&format!("{name}[0]")).as_ref(), &flat);
+            }
+        }
+    }
+
     pub fn paint(&mut self, gl: &glow::Context, info: &egui::PaintCallbackInfo, p: &DrawParams) {
         self.collect_garbage(gl, p);
+        unsafe { self.render_generators(gl, p) };
 
         unsafe {
             // Fond noir limité au rectangle du callback.
@@ -1284,8 +2188,8 @@ impl Renderer {
             gl.uniform_1_i32(loc("u_solid").as_ref(), 0);
             gl.uniform_2_f32(loc("u_res").as_ref(), vp.width_px as f32, vp.height_px as f32);
 
-            for layer in &p.layers {
-                self.paint_layer(gl, layer, p.time);
+            for (k, layer) in p.layers.iter().enumerate() {
+                self.paint_layer(gl, k, layer, p.time);
             }
 
             // Master / blackout : voile noir par-dessus la composition.
@@ -1303,6 +2207,8 @@ impl Renderer {
                 gl.draw_arrays(glow::TRIANGLES, 0, 6);
             }
 
+            gl.active_texture(glow::TEXTURE4);
+            gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE3);
             gl.bind_texture(glow::TEXTURE_2D, None);
             gl.active_texture(glow::TEXTURE2);
@@ -1317,7 +2223,7 @@ impl Renderer {
         }
     }
 
-    unsafe fn paint_layer(&mut self, gl: &glow::Context, layer: &LayerDraw, time: f32) {
+    unsafe fn paint_layer(&mut self, gl: &glow::Context, k: usize, layer: &LayerDraw, time: f32) {
         let a = layer.a.as_ref().and_then(|s| self.upload(gl, s));
         let b = layer.b.as_ref().and_then(|s| self.upload(gl, s));
         let mask = layer.mask.as_ref().and_then(|m| Some((m.invert, self.mask_texture(gl, m)?)));
@@ -1376,6 +2282,12 @@ impl Renderer {
             }
             f("u_time", time);
             gl.uniform_2_f32(loc("u_tex_size").as_ref(), tex_size.0 as f32, tex_size.1 as f32);
+            let size_of = |t: Option<(glow::Texture, (u32, u32))>| t.map_or(tex_size, |(_, s)| s);
+            let (sa, sb) = (size_of(a), size_of(b));
+            gl.uniform_2_f32(loc("u_size_a").as_ref(), sa.0 as f32, sa.1 as f32);
+            gl.uniform_2_f32(loc("u_size_b").as_ref(), sb.0 as f32, sb.1 as f32);
+            i("u_fit", layer.fit as i32);
+            f("u_surface_aspect", layer.surface_aspect);
             i("u_grid", layer.grid as i32);
             f("u_opacity", layer.opacity.clamp(0.0, 1.0));
             i("u_blend", layer.blend as i32);
@@ -1421,20 +2333,15 @@ impl Renderer {
             f("u_echo", fx.echo.clamp(0.0, 1.0));
 
             let g = &layer.generator;
-            i("u_gen_a", g.from as i32);
-            i("u_gen_b", g.to as i32);
-            f("u_gen_fade", g.fade.clamp(0.0, 1.0));
+            // Visuel généré : texture rendue à part (voir `render_generators`), unité 4.
+            let gen_tex = self.gen_targets.get(&k).filter(|_| gen_on).map(|t| t.texture);
+            i("u_gen_on", gen_tex.is_some() as i32);
+            gl.active_texture(glow::TEXTURE4);
+            gl.bind_texture(glow::TEXTURE_2D, Some(gen_tex.unwrap_or(self.black)));
+            gl.active_texture(glow::TEXTURE0);
+            i("u_gen_tex", 4);
             // Sans vidéo, rien à mélanger : le générateur est montré entier.
             f("u_gen_mix", if a.is_none() && b.is_none() { 1.0 } else { g.mix.clamp(0.0, 1.0) });
-            f("u_gen_time", g.time);
-            f("u_gen_hue", g.hue);
-            f("u_gen_scale", g.scale.max(0.05));
-            f("u_gen_detail", g.detail.clamp(0.0, 1.0));
-            f("u_gen_aspect", g.aspect.max(0.1));
-            for (name, pal) in [("u_pal_a", g.from_palette), ("u_pal_b", g.to_palette)] {
-                let flat: Vec<f32> = pal.coefs().iter().flatten().copied().collect();
-                gl.uniform_3_f32_slice(loc(&format!("{name}[0]")).as_ref(), &flat);
-            }
             gl.uniform_3_f32(loc("u_shape_color").as_ref(), fx.shape_color[0], fx.shape_color[1], fx.shape_color[2]);
             f("u_shape_glow", fx.shape_glow.max(0.0));
             f("u_shape_width", fx.shape_width.max(0.0005));
@@ -1457,6 +2364,48 @@ impl Renderer {
             f("u_break_size", fx.shatter_size.max(1.0));
             gl.uniform_2_f32(loc("u_break_center").as_ref(), layer.shatter_center[0], layer.shatter_center[1]);
             f("u_break_glow", fx.shatter_glow.max(0.0));
+            f("u_lines_glow", fx.lines_glow.max(0.0));
+            gl.uniform_3_f32(loc("u_lines_color").as_ref(), fx.lines_color[0], fx.lines_color[1], fx.lines_color[2]);
+            f("u_lines_rainbow", fx.lines_rainbow.clamp(0.0, 1.0));
+            f("u_lines_threshold", fx.lines_threshold.clamp(0.0, 1.0));
+            f("u_lines_width", fx.lines_width.max(1.0));
+            f("u_lines_flow", fx.lines_flow.max(0.0));
+            f("u_lines_flow_phase", ph.lines_flow);
+            f("u_lines_wobble", fx.lines_wobble.max(0.0));
+            f("u_lines_wobble_phase", ph.lines_wobble);
+            f("u_lines_dim", fx.lines_dim.clamp(0.0, 1.0));
+            i("u_obj3d", fx.obj3d as i32);
+            let (rx, ry) = (
+                (fx.rot3d_x + layer.phases.rot3d_x).to_radians(),
+                (fx.rot3d_y + layer.phases.rot3d_y).to_radians(),
+            );
+            gl.uniform_2_f32(loc("u_rot3d").as_ref(), rx, ry);
+            f("u_dist3d", fx.dist3d);
+            f("u_height3d", fx.height3d.max(0.0));
+            f("u_voxels", fx.voxels.max(4.0));
+            f("u_relief", fx.relief.max(0.0));
+            // Le relief bouge avec le point de vue : angles 3D, sinon un léger biais fixe.
+            gl.uniform_2_f32(loc("u_relief_dir").as_ref(), 0.4 + ry.sin(), 0.3 + rx.sin());
+            f("u_anaglyph", fx.anaglyph.max(0.0));
+            f("u_flag", fx.flag.max(0.0));
+            f("u_flag_phase", layer.phases.flag);
+            f("u_thermal", fx.thermal.max(0.0));
+            f("u_blur", fx.blur.max(0.0));
+            f("u_bloom", fx.bloom.max(0.0));
+            f("u_shock", fx.shock.max(0.0));
+            f("u_shock_phase", layer.phases.shock);
+            f("u_fisheye", fx.fisheye);
+            f("u_hexagon", fx.hexagon.max(0.0));
+            f("u_crt", fx.crt.max(0.0));
+            f("u_glitch", fx.glitch.max(0.0));
+            f("u_grain", fx.grain.max(0.0));
+            f("u_halftone", fx.halftone.max(0.0));
+            f("u_droste", fx.droste.max(0.0));
+            f("u_droste_phase", layer.phases.droste);
+            f("u_zoom_blur", fx.zoom_blur.max(0.0));
+            f("u_ascii", fx.ascii.max(0.0));
+            f("u_fold", fx.fold.clamp(0.0, 1.0));
+            f("u_fold_count", fx.fold_count);
 
             let (src, dst, eq) = match layer.blend {
                 BlendMode::Normal => (glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA, glow::FUNC_ADD),

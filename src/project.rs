@@ -12,10 +12,11 @@ use serde::{Deserialize, Serialize};
 use crate::automix::AutoMix;
 use crate::effects::{AutoFx, BlendMode, Effects, Preset};
 use crate::generator::Generator;
-use crate::surface::{Mask, Warp};
+use crate::surface::{Fit, Mask, Warp};
 
 pub const EXTENSION: &str = "ozmap";
 const VERSION: u32 = 1;
+pub const MAX_COLUMNS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -24,6 +25,8 @@ pub struct LayerConfig {
     pub visible: bool,
     pub opacity: f32,
     pub blend: BlendMode,
+    /// Cadrage de l'image dans la surface (étirer, ajuster, remplir).
+    pub fit: Fit,
     pub effects: Effects,
     /// Navigation automatique entre les effets.
     pub auto: AutoFx,
@@ -37,6 +40,73 @@ pub struct LayerConfig {
     pub mask: Mask,
     /// Vidéo chargée sur ce calque (relancée à l'ouverture du projet).
     pub clip: Option<PathBuf>,
+    /// Ligne du tableau : cases enregistrées pour ce calque (index = colonne).
+    pub cells: Vec<Option<Cell>>,
+}
+
+/// Case du tableau : un média avec ses effets et ses réglages, rejoué d'un clic sur son calque.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Cell {
+    pub name: String,
+    /// Média joué (aucun : seulement le visuel généré, ou rien).
+    pub clip: Option<PathBuf>,
+    pub effects: Effects,
+    /// Nom du preset d'origine, pour le surligner une fois la case jouée.
+    pub preset: Option<String>,
+    pub generator: Generator,
+    pub auto: AutoFx,
+    pub fit: Fit,
+    pub opacity: f32,
+    pub blend: BlendMode,
+    // Réglages ajoutés ensuite : absents (None) dans une case plus ancienne, le calque garde alors les siens.
+    pub warp: Option<Warp>,
+    pub mask: Option<Mask>,
+    pub react: Option<React>,
+    pub mix: Option<AutoMix>,
+    /// Lecture : vitesse et sens.
+    pub speed: Option<f32>,
+    pub reverse: Option<bool>,
+    pub paused: Option<bool>,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        let layer = LayerConfig::default();
+        Self {
+            name: String::new(),
+            clip: None,
+            effects: layer.effects,
+            preset: None,
+            generator: layer.generator,
+            auto: layer.auto,
+            fit: layer.fit,
+            opacity: layer.opacity,
+            blend: layer.blend,
+            warp: None,
+            mask: None,
+            react: None,
+            mix: None,
+            speed: None,
+            reverse: None,
+            paused: None,
+        }
+    }
+}
+
+/// Enchaînement automatique des colonnes du tableau.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Chain {
+    pub enabled: bool,
+    /// Durée d'une colonne, en secondes.
+    pub secs: f32,
+}
+
+impl Default for Chain {
+    fn default() -> Self {
+        Self { enabled: false, secs: 8.0 }
+    }
 }
 
 impl Default for LayerConfig {
@@ -46,6 +116,7 @@ impl Default for LayerConfig {
             visible: true,
             opacity: 1.0,
             blend: BlendMode::Normal,
+            fit: Fit::Stretch,
             effects: Effects::default(),
             auto: AutoFx::default(),
             mix: AutoMix::default(),
@@ -54,6 +125,7 @@ impl Default for LayerConfig {
             warp: Warp::default(),
             mask: Mask::default(),
             clip: None,
+            cells: Vec::new(),
         }
     }
 }
@@ -66,10 +138,15 @@ pub struct Project {
     /// Du bas vers le haut.
     pub layers: Vec<LayerConfig>,
     pub presets: Vec<Preset>,
+    /// Presets mémorisés des animations sur la forme du masque.
+    pub mask_presets: Vec<Preset>,
     pub fade_secs: f32,
     pub preset_secs: f32,
     pub looping: bool,
     pub master: f32,
+    /// Nombre de colonnes du tableau.
+    pub columns: usize,
+    pub chain: Chain,
 }
 
 impl Default for Project {
@@ -79,10 +156,13 @@ impl Default for Project {
             media: Vec::new(),
             layers: vec![LayerConfig::default()],
             presets: Vec::new(),
+            mask_presets: Vec::new(),
             fade_secs: 1.0,
             preset_secs: 0.5,
             looping: true,
             master: 1.0,
+            columns: 8,
+            chain: Chain::default(),
         }
     }
 }
@@ -97,6 +177,9 @@ impl Project {
         }
         for l in &mut p.layers {
             if let Some(c) = &mut l.clip {
+                *c = relative_to(c, base);
+            }
+            for c in l.cells.iter_mut().flatten().filter_map(|c| c.clip.as_mut()) {
                 *c = relative_to(c, base);
             }
         }
@@ -115,6 +198,9 @@ impl Project {
             if let Some(c) = &mut l.clip {
                 *c = resolve(c, base);
             }
+            for c in l.cells.iter_mut().flatten().filter_map(|c| c.clip.as_mut()) {
+                *c = resolve(c, base);
+            }
         }
         p.sanitize();
         Ok(p)
@@ -125,9 +211,15 @@ impl Project {
         if self.layers.is_empty() {
             self.layers.push(LayerConfig::default());
         }
+        self.columns = self.columns.clamp(1, MAX_COLUMNS);
         for l in &mut self.layers {
             l.warp.sanitize();
             l.mask.sanitize();
+            // Une case au-delà de la dernière colonne agrandit le tableau.
+            if let Some(last) = l.cells.iter().rposition(Option::is_some) {
+                self.columns = self.columns.max((last + 1).min(MAX_COLUMNS));
+            }
+            l.cells.truncate(MAX_COLUMNS);
         }
     }
 }
@@ -164,6 +256,7 @@ mod tests {
         let mut p = Project::default();
         p.media = vec![inside.clone(), outside.clone()];
         p.layers[0].clip = Some(inside.clone());
+        p.layers[0].cells = vec![None, Some(Cell { name: "A".into(), clip: Some(inside.clone()), ..Cell::default() })];
         p.save(&file).unwrap();
 
         let raw = std::fs::read_to_string(&file).unwrap();
@@ -176,6 +269,9 @@ mod tests {
         assert!(same(&loaded.media[0], &inside), "{:?}", loaded.media[0]);
         assert!(same(&loaded.media[1], &outside));
         assert!(same(loaded.layers[0].clip.as_deref().unwrap(), &inside));
+        let cell = loaded.layers[0].cells[1].as_ref().expect("case enregistrée");
+        assert!(same(cell.clip.as_deref().unwrap(), &inside), "{:?}", cell.clip);
+        assert!(loaded.layers[0].cells[0].is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

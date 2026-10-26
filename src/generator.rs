@@ -32,10 +32,19 @@ pub enum Pattern {
     Flames,
     Electric,
     Ripples,
+    // Visuels 3D (lancer de rayons)
+    Mandelbulb,
+    Menger,
+    CubeField,
+    Gyroid,
+    Kifs,
+    SphereField,
+    Pillars,
+    Rings,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 23] = [
+    pub const ALL: [Pattern; 31] = [
         Pattern::Off,
         Pattern::Plasma,
         Pattern::Spiral,
@@ -59,6 +68,14 @@ impl Pattern {
         Pattern::Flames,
         Pattern::Electric,
         Pattern::Ripples,
+        Pattern::Mandelbulb,
+        Pattern::Menger,
+        Pattern::CubeField,
+        Pattern::Gyroid,
+        Pattern::Kifs,
+        Pattern::SphereField,
+        Pattern::Pillars,
+        Pattern::Rings,
     ];
 
     pub fn label(self) -> &'static str {
@@ -86,6 +103,14 @@ impl Pattern {
             Pattern::Flames => "Flammes",
             Pattern::Electric => "Électricité",
             Pattern::Ripples => "Gouttes",
+            Pattern::Mandelbulb => "Mandelbulb 3D",
+            Pattern::Menger => "Éponge de Menger",
+            Pattern::CubeField => "Cubes infinis",
+            Pattern::Gyroid => "Gyroïde",
+            Pattern::Kifs => "Kaléidoscope 3D",
+            Pattern::SphereField => "Sphères infinies",
+            Pattern::Pillars => "Colonnes torsadées",
+            Pattern::Rings => "Anneaux 3D",
         }
     }
 
@@ -114,6 +139,14 @@ impl Pattern {
             Pattern::Flames => "Flammes qui montent et vacillent (idéal avec la palette Feu)",
             Pattern::Electric => "Arcs électriques qui crépitent et serpentent",
             Pattern::Ripples => "Ronds dans l'eau qui apparaissent et s'élargissent",
+            Pattern::Mandelbulb => "Fractale 3D en volume qui tourne et se transforme (Détail = finesse)",
+            Pattern::Menger => "Cube percé à l'infini, vu en rotation",
+            Pattern::CubeField => "Vol à travers une forêt de cubes qui tournent",
+            Pattern::Gyroid => "Vol dans des cavernes organiques sans fin",
+            Pattern::Kifs => "Fractale 3D faite de reflets qui se replient, en rotation",
+            Pattern::SphereField => "Vol au milieu de sphères qui ondulent",
+            Pattern::Pillars => "Vol entre des piliers qui se tordent",
+            Pattern::Rings => "Anneaux imbriqués qui tournent comme un gyroscope",
         }
     }
 }
@@ -155,6 +188,12 @@ impl Palette {
             Palette::Sunset => "Coucher de soleil",
             Palette::Mono => "Noir & blanc",
         }
+    }
+
+    /// Couleur de la palette en `t` (0..1, répété), comme dans le shader.
+    pub fn color(self, t: f32) -> [f32; 3] {
+        let [a, b, c, d] = self.coefs();
+        std::array::from_fn(|k| (a[k] + b[k] * (std::f32::consts::TAU * (c[k] * t + d[k])).cos()).clamp(0.0, 1.0))
     }
 
     /// Coefficients a, b, c, d de la palette.

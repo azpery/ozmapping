@@ -41,6 +41,62 @@ pub struct VideoInfo {
     pub height: u32,
     pub fps: f64,
     pub duration: f64,
+    /// Photo (image fixe) plutôt que vidéo.
+    pub still: bool,
+}
+
+/// Photo (image fixe) : jouée comme une vidéo d'une seule image. Le GIF reste une vidéo.
+pub fn is_still_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .is_some_and(|e| e != "gif" && crate::mask::IMAGE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Photo décodée, réduite à `OUTPUT_MAX`, avec ses dimensions d'origine.
+struct Still {
+    image: image::RgbaImage,
+    original: (u32, u32),
+}
+
+/// Décode une photo (dans le bon sens, HEIC compris), avec un petit cache : la miniature,
+/// l'aperçu et la sortie ne la décodent qu'une fois, et le mix auto passe d'une photo à l'autre
+/// sans attendre.
+fn still(path: &Path) -> Result<Arc<Still>> {
+    const CACHE_LEN: usize = 16;
+    static CACHE: OnceLock<Mutex<Vec<(PathBuf, Arc<Still>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    {
+        let mut c = cache.lock().unwrap();
+        if let Some(k) = c.iter().position(|(p, _)| p == path) {
+            let entry = c.remove(k);
+            let s = entry.1.clone();
+            c.push(entry); // le plus récent en dernier
+            return Ok(s);
+        }
+    }
+    let img = crate::cutout::load_image(path)?;
+    let original = (img.width(), img.height());
+    let (w, h) = fit_size(original.0, original.1, OUTPUT_MAX);
+    let image = if (w, h) == original {
+        img.into_rgba8()
+    } else {
+        img.resize_exact(w, h, image::imageops::FilterType::Triangle).into_rgba8()
+    };
+    let s = Arc::new(Still { image, original });
+    let mut c = cache.lock().unwrap();
+    c.retain(|(p, _)| p != path);
+    c.push((path.to_path_buf(), s.clone()));
+    if c.len() > CACHE_LEN {
+        c.remove(0);
+    }
+    Ok(s)
+}
+
+/// Taille qui tient dans `max` en gardant le ratio (sans agrandir).
+fn fit_size(w: u32, h: u32, max: (u32, u32)) -> (u32, u32) {
+    let scale = (max.0 as f64 / w.max(1) as f64).min(max.1 as f64 / h.max(1) as f64).min(1.0);
+    (((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1))
 }
 
 /// Trouve un exécutable ffmpeg/ffprobe : d'abord à côté de l'app (version livrée avec elle),
@@ -79,6 +135,16 @@ pub fn tool_command(name: &str) -> Command {
 /// Informations sur une vidéo (mises en cache : le mix auto change souvent de clip,
 /// et relancer ffprobe à chaque fois ferait saccader l'interface).
 pub fn probe(path: &Path) -> Result<VideoInfo> {
+    if is_still_image(path) {
+        let s = still(path)?;
+        return Ok(VideoInfo {
+            width: s.original.0,
+            height: s.original.1,
+            fps: 30.0,
+            duration: 0.0,
+            still: true,
+        });
+    }
     static CACHE: OnceLock<Mutex<HashMap<PathBuf, VideoInfo>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
     if let Some(info) = cache.lock().unwrap().get(path) {
@@ -145,6 +211,7 @@ fn probe_uncached(path: &Path) -> Result<VideoInfo> {
         height,
         fps,
         duration,
+        still: false,
     })
 }
 
@@ -218,6 +285,27 @@ impl VideoPlayer {
             child: Mutex::new(None),
             error: Mutex::new(None),
         });
+
+        if info.still {
+            // Photo : une seule image, publiée tout de suite ; pas de thread de lecture.
+            let s = still(path)?;
+            let (w, h) = fit_size(s.image.width(), s.image.height(), opts.max_size);
+            let data = if (w, h) == s.image.dimensions() {
+                s.image.as_raw().clone()
+            } else {
+                image::imageops::resize(&s.image, w, h, image::imageops::FilterType::Triangle).into_raw()
+            };
+            let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
+            *slot.lock().unwrap() = Some(Frame { data, width: w, height: h, id });
+            repaint();
+            return Ok(Self {
+                uid: NEXT_PLAYER_ID.fetch_add(1, Ordering::Relaxed),
+                path: path.to_path_buf(),
+                info,
+                slot,
+                shared,
+            });
+        }
 
         let decoder = Decoder {
             path: path.to_path_buf(),
@@ -612,6 +700,15 @@ impl Decoder {
 
 /// Extrait une miniature RGBA (w×h, avec bandes noires) vers 10 % de la vidéo.
 pub fn thumbnail(path: &Path, w: u32, h: u32) -> Result<Vec<u8>> {
+    if is_still_image(path) {
+        // Décoder la photo ici remplit aussi le cache : l'envoyer sur un calque sera immédiat.
+        let s = still(path)?;
+        let (tw, th) = fit_size(s.image.width(), s.image.height(), (w, h));
+        let small = image::imageops::resize(&s.image, tw.max(1), th.max(1), image::imageops::FilterType::Triangle);
+        let mut out = image::RgbaImage::from_pixel(w, h, image::Rgba([0, 0, 0, 255]));
+        image::imageops::overlay(&mut out, &small, ((w - tw) / 2) as i64, ((h - th) / 2) as i64);
+        return Ok(out.into_raw());
+    }
     let info = probe(path)?;
     let at = info.duration * 0.1;
     let out = tool_command("ffmpeg")
@@ -693,6 +790,29 @@ mod tests {
         rev.set_reverse(false);
         std::thread::sleep(Duration::from_millis(800));
         assert!(rev.position() > before, "{} -> {}", before, rev.position());
+    }
+
+    #[test]
+    fn plays_a_photo() {
+        let path = std::env::temp_dir().join(format!("ozmapping-photo-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(3000, 1000, image::Rgba([200, 30, 30, 255])).save(&path).unwrap();
+        let info = probe(&path).unwrap();
+        assert!(info.still);
+        assert_eq!((info.width, info.height), (3000, 1000));
+
+        let player = VideoPlayer::open(&path, PlayOptions::new(true, OUTPUT_MAX), || {}).unwrap();
+        {
+            let guard = player.slot.lock().unwrap();
+            let frame = guard.as_ref().expect("la photo doit être affichée tout de suite");
+            assert_eq!((frame.width, frame.height), (1920, 640));
+            assert_eq!(&frame.data[..4], &[200, 30, 30, 255]);
+        }
+        player.seek(1.0); // sans effet, sans plantage
+        assert!(!player.ended());
+
+        let thumb = thumbnail(&path, 160, 90).unwrap();
+        assert_eq!(thumb.len(), 160 * 90 * 4);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

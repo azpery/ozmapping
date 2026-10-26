@@ -340,6 +340,8 @@ pub enum Source {
     Audio(Option<String>),
     /// Tempo tapé.
     Tempo,
+    /// Manuel : chaque appui sur T donne un temps ; sans appui, plus rien ne bouge.
+    Manual,
 }
 
 /// État du rythme pour l'image en cours.
@@ -411,7 +413,10 @@ impl Rhythm {
         if self.source == Source::Off {
             self.set_source(Source::Tempo);
         }
-        self.tempo.tap(now);
+        // En manuel, le tap ne cale aucun tempo : il donne juste un temps.
+        if self.source != Source::Manual {
+            self.tempo.tap(now);
+        }
         self.forced_beat = true;
     }
 
@@ -419,7 +424,7 @@ impl Rhythm {
         match self.source {
             Source::Off => false,
             Source::Audio(_) => self.input.is_some(),
-            Source::Tempo => true,
+            Source::Tempo | Source::Manual => true,
         }
     }
 
@@ -437,6 +442,8 @@ impl Rhythm {
                 l.beats as i64
             }),
             Source::Tempo => Some(self.tempo.beat_at(now).floor() as i64),
+            // Pas d'horloge : seuls les taps donnent des temps.
+            Source::Manual => None,
         };
         if let Some(beats) = beats {
             if self.seen_beats != i64::MIN && beats > self.seen_beats {
@@ -458,7 +465,7 @@ impl Rhythm {
             };
         }
         pulse.env = if self.active() { (-(now - self.last_beat) as f32 * 7.0).exp() } else { 0.0 };
-        if self.source == Source::Tempo {
+        if matches!(self.source, Source::Tempo | Source::Manual) {
             // Pas de son : l'enveloppe du temps tient lieu d'intensité.
             pulse.level = pulse.env;
             pulse.bass = pulse.env;
@@ -576,6 +583,8 @@ impl React {
         // Lumières de la forme : elles s'allument sur les temps (si elles sont déjà utilisées).
         fx.shape_glow *= 1.0 + 1.5 * self.flash * env + d;
         fx.shape_ripple *= 1.0 + d;
+        fx.lines_glow *= 1.0 + 1.5 * self.flash * env + d;
+        fx.lines_wobble *= 1.0 + 2.0 * d;
         fx.hue += state.hue;
         fx.rotate += state.spin;
 
@@ -712,6 +721,19 @@ mod tests {
         };
         let high = run(Band::High);
         assert!((6..=9).contains(&high), "aigus : {high}");
+    }
+
+    #[test]
+    fn manual_beats_only_on_taps() {
+        let mut r = Rhythm::default();
+        r.set_source(Source::Manual);
+        r.tap(0.0);
+        assert!(r.update(0.0).beat, "un tap donne un temps");
+        let later = (1..300).filter(|i| r.update(*i as f64 / 60.0).beat).count();
+        assert_eq!(later, 0, "sans tap, plus aucun temps");
+        assert!(r.update(5.0).env < 0.01, "la pulsation retombe");
+        r.tap(5.0);
+        assert!(r.update(5.0).beat);
     }
 
     #[test]

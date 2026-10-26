@@ -103,7 +103,48 @@ impl Default for Warp {
     }
 }
 
+/// Cadrage de l'image dans la surface, quand leurs proportions diffèrent.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Fit {
+    /// L'image prend exactement la forme de la surface (déformée si besoin).
+    #[default]
+    Stretch,
+    /// L'image entière, sans déformation : bandes transparentes sur les côtés.
+    Contain,
+    /// Toute la surface, sans déformation : l'image est rognée.
+    Cover,
+}
+
+impl Fit {
+    pub const ALL: [Fit; 3] = [Fit::Stretch, Fit::Contain, Fit::Cover];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Fit::Stretch => "Étirer",
+            Fit::Contain => "Ajuster",
+            Fit::Cover => "Remplir",
+        }
+    }
+
+    pub fn hint(self) -> &'static str {
+        match self {
+            Fit::Stretch => "L'image prend toute la surface, quitte à être déformée",
+            Fit::Contain => "L'image entière, à ses proportions : bandes transparentes autour (fit)",
+            Fit::Cover => "Toute la surface, aux proportions de l'image : les bords sont rognés (fill)",
+        }
+    }
+}
+
 impl Warp {
+    /// Proportions (largeur / hauteur) de la surface sur une sortie de `out` pixels.
+    pub fn aspect(&self, out: (f32, f32)) -> f32 {
+        let [tl, tr, br, bl] = self.corners();
+        let dist = |a: Point, b: Point| ((a[0] - b[0]) * out.0).hypot((a[1] - b[1]) * out.1);
+        let w = (dist(tl, tr) + dist(bl, br)) / 2.0;
+        let h = (dist(tl, bl) + dist(tr, br)) / 2.0;
+        (w / h.max(1e-3)).clamp(0.05, 20.0)
+    }
+
     /// Grille régulière (en perspective) entre 4 coins.
     pub fn regular(cols: usize, rows: usize, corners: &[Point; 4]) -> Self {
         let h = square_to_quad(corners);
@@ -142,6 +183,19 @@ impl Warp {
             self.points[self.idx(self.rows, self.cols)],
             self.points[self.idx(self.rows, 0)],
         ]
+    }
+
+    /// Contour extérieur de la surface déformée, sur la sortie (pour tester si un point est dessus).
+    pub fn outline(&self) -> Vec<Point> {
+        const N: usize = 24;
+        let eval = self.evaluator();
+        let t = |k: usize| k as f32 / N as f32;
+        let mut out = Vec::with_capacity(4 * N);
+        out.extend((0..N).map(|k| eval(t(k), 0.0)));
+        out.extend((0..N).map(|k| eval(1.0, t(k))));
+        out.extend((0..N).map(|k| eval(1.0 - t(k), 1.0)));
+        out.extend((0..N).map(|k| eval(0.0, 1.0 - t(k))));
+        out
     }
 
     /// Évalue la surface : (u, v) dans 0..1 → position sur la sortie.
@@ -364,6 +418,16 @@ impl Mask {
 
     pub fn all_rings(&self) -> impl Iterator<Item = &[Point]> {
         (0..self.ring_count()).map(|k| self.ring(k))
+    }
+
+    /// Le point (coordonnées de sortie) laisse-t-il passer l'image ? Vrai partout sans masque.
+    pub fn contains(&self, p: Point) -> bool {
+        if !self.is_active() {
+            return true;
+        }
+        let winding: i32 = self.all_rings().map(|r| winding(r, p)).sum();
+        let inside = if self.nonzero { winding != 0 } else { winding % 2 != 0 };
+        inside != self.invert
     }
 
     pub fn total_points(&self) -> usize {
@@ -618,5 +682,47 @@ mod tests {
         let p = many.points[7];
         let (r, c) = (7 / 5, 7 % 5);
         assert!(close(p, many.evaluator()(c as f32 / 4.0, r as f32 / 3.0)));
+    }
+}
+
+/// Nombre d'enroulement du contour fermé `ring` autour de `p` (0 = dehors).
+pub fn winding(ring: &[Point], p: Point) -> i32 {
+    let mut w = 0;
+    for (k, a) in ring.iter().enumerate() {
+        let b = ring[(k + 1) % ring.len()];
+        let side = (b[0] - a[0]) * (p[1] - a[1]) - (p[0] - a[0]) * (b[1] - a[1]);
+        if a[1] <= p[1] {
+            if b[1] > p[1] && side > 0.0 {
+                w += 1;
+            }
+        } else if b[1] <= p[1] && side < 0.0 {
+            w -= 1;
+        }
+    }
+    w
+}
+
+#[cfg(test)]
+mod cover_tests {
+    use super::*;
+
+    #[test]
+    fn mask_contains_follows_shape_and_invert() {
+        let mut mask = Mask { enabled: true, ..Mask::default() }; // rectangle 0.2..0.8
+        assert!(mask.contains([0.5, 0.5]));
+        assert!(!mask.contains([0.1, 0.1]));
+        mask.invert = true;
+        assert!(!mask.contains([0.5, 0.5]));
+        assert!(mask.contains([0.1, 0.1]));
+        mask.enabled = false;
+        assert!(mask.contains([0.1, 0.1]), "sans masque, tout passe");
+    }
+
+    #[test]
+    fn default_warp_outline_covers_the_output() {
+        let o = Warp::default().outline();
+        assert_ne!(winding(&o, [0.01, 0.01]), 0);
+        assert_ne!(winding(&o, [0.99, 0.5]), 0);
+        assert_eq!(winding(&o, [1.2, 0.5]), 0);
     }
 }
