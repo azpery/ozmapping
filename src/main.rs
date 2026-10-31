@@ -10,6 +10,7 @@ mod generator;
 mod icons;
 mod mask;
 mod project;
+mod recorder;
 mod renderer;
 mod rhythm;
 mod screens;

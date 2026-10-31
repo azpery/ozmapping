@@ -206,6 +206,9 @@ pub struct Effects {
     /// Pointillés qui défilent sur le contour (0..1), et leur nombre (à la vitesse des comètes).
     pub shape_dashes: f32,
     pub shape_dash_count: f32,
+    /// Rotation de la forme du masque autour de son centre : angle fixe (°), rotation automatique (°/s).
+    pub mask_rotate: f32,
+    pub mask_spin: f32,
     /// Destruction : style, avancement manuel (0..1), boucle automatique (cycles/s, 0 = manuel),
     /// taille des morceaux (par hauteur de sortie), lueur des fissures.
     pub shatter: Shatter,
@@ -339,6 +342,8 @@ impl Default for Effects {
             shape_inner: 0.0,
             shape_dashes: 0.0,
             shape_dash_count: 30.0,
+            mask_rotate: 0.0,
+            mask_spin: 0.0,
             shatter: Shatter::Off,
             shatter_amount: 0.0,
             shatter_speed: 0.0,
@@ -458,6 +463,8 @@ impl Effects {
             shape_inner: l(a.shape_inner, b.shape_inner),
             shape_dashes: l(a.shape_dashes, b.shape_dashes),
             shape_dash_count: pick(a.shape_dash_count, b.shape_dash_count, t),
+            mask_rotate: l(a.mask_rotate, b.mask_rotate),
+            mask_spin: l(a.mask_spin, b.mask_spin),
             shatter: pick(a.shatter, b.shatter, t),
             shatter_amount: l(a.shatter_amount, b.shatter_amount),
             shatter_speed: l(a.shatter_speed, b.shatter_speed),
@@ -551,6 +558,8 @@ impl Effects {
             shape_inner: other.shape_inner,
             shape_dashes: other.shape_dashes,
             shape_dash_count: other.shape_dash_count,
+            mask_rotate: other.mask_rotate,
+            mask_spin: other.mask_spin,
             shatter: other.shatter,
             shatter_amount: other.shatter_amount,
             shatter_speed: other.shatter_speed,
@@ -590,6 +599,8 @@ impl Effects {
             shape_inner: other.shape_inner,
             shape_dashes: other.shape_dashes,
             shape_dash_count: other.shape_dash_count,
+            mask_rotate: other.mask_rotate,
+            mask_spin: other.mask_spin,
             ..self
         }
     }
@@ -1181,6 +1192,10 @@ pub fn mask_anim_presets() -> Vec<Preset> {
             e.shape_glow = 0.8;
             e.shape_breathe = 0.05;
             e.shape_breathe_rate = 0.3;
+        }),
+        p("Toupie", &|e| {
+            e.shape_glow = 0.8;
+            e.mask_spin = 45.0;
         }),
         p("Onde liquide", &|e| {
             e.shape_wave = 0.02;

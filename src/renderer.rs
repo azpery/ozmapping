@@ -38,6 +38,8 @@ pub struct LayerDraw {
     pub blend: BlendMode,
     /// Cadrage de l'image, et proportions de la surface sur la sortie.
     pub fit: Fit,
+    /// Rotation du média dans la surface, en degrés.
+    pub media_rotate: f32,
     pub surface_aspect: f32,
     pub grid: bool,
     pub phases: Phases,
@@ -110,6 +112,8 @@ pub struct Phases {
     /// Ondes de choc, en cycles (0..1) ; zoom du Droste, en répétitions (0..1).
     pub shock: f32,
     pub droste: f32,
+    /// Rotation automatique de la forme du masque, en degrés.
+    pub mask_spin: f32,
 }
 
 impl Phases {
@@ -145,6 +149,7 @@ impl Phases {
         self.shape_trace = step(self.shape_trace, fx.shape_trace_speed, 1.0);
         self.shape_breathe = step(self.shape_breathe, fx.shape_breathe_rate * tau, tau);
         self.shatter = step(self.shatter, fx.shatter_speed, 1.0);
+        self.mask_spin = step(self.mask_spin, fx.mask_spin, 360.0);
         self.lines_flow = step(self.lines_flow, fx.lines_flow_speed, 1.0);
         self.lines_wobble = step(self.lines_wobble, fx.lines_wobble_speed * tau, tau);
         self.rot3d_x = step(self.rot3d_x, fx.spin3d_x, 360.0);
@@ -214,6 +219,8 @@ pub struct Renderer {
     /// Programme des visuels générés (même source, compilée avec GEN_PASS).
     gen_program: glow::Program,
     gen_targets: HashMap<usize, GenTarget>,
+    /// Cible hors écran de l'enregistrement vidéo.
+    capture_target: Option<GenTarget>,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     black: glow::Texture,
@@ -250,9 +257,14 @@ uniform vec2 u_res;
 uniform sampler2D u_mask_tex;
 uniform int u_has_mask;
 uniform int u_mask_invert;
+// Rotation de la forme du masque (radians) autour de son centre (coordonnées de sortie).
+uniform float u_mask_angle;
+uniform vec2 u_mask_center;
 uniform float u_time;
 uniform vec2 u_tex_size;
 uniform int u_fit;
+// Rotation du média dans la surface (radians).
+uniform float u_media_rot;
 uniform float u_surface_aspect;
 uniform vec2 u_size_a;
 uniform vec2 u_size_b;
@@ -519,10 +531,23 @@ void emit(vec3 col, float a) {
     }
 }
 
+// Position lue dans le masque (et son champ de forme) : tourner la forme revient à lire
+// le masque tourné dans l'autre sens, autour de son centre, en tenant compte des proportions.
+vec2 mask_pos(vec2 pos) {
+    if (u_mask_angle == 0.0) return pos;
+    float aspect = u_res.x / max(u_res.y, 1.0);
+    vec2 q = (pos - u_mask_center) * vec2(aspect, 1.0);
+    float c = cos(u_mask_angle), s = sin(u_mask_angle);
+    q = mat2(c, -s, s, c) * q;
+    return u_mask_center + q / vec2(aspect, 1.0);
+}
+
 // Masque : image pré-calculée (bords adoucis compris), lue en coordonnées de sortie.
 float mask_value(vec2 pos) {
     if (u_has_mask == 0) return 1.0;
-    float m = texture(u_mask_tex, pos).r;
+    // Hors de l'image du masque (forme tournée qui dépasse) : en dehors de la forme.
+    bool outside = any(lessThan(pos, vec2(0.0))) || any(greaterThan(pos, vec2(1.0)));
+    float m = outside ? 0.0 : texture(u_mask_tex, pos).r;
     return u_mask_invert == 1 ? 1.0 - m : m;
 }
 
@@ -1126,6 +1151,20 @@ void main() {
 
 // Cadrage : coordonnées dans l'image (de taille `size`) d'un point de la surface.
 vec2 fit_uv(vec2 uv, vec2 size) {
+    if (u_media_rot != 0.0) {
+        // Média tourné : on cadre son rectangle englobant, puis on revient dans l'image.
+        float as_ = max(u_surface_aspect, 1e-3);
+        float am = size.x / max(size.y, 1.0);
+        float c = cos(u_media_rot), s = sin(u_media_rot);
+        // Étirer : l'image prend les proportions qui remplissent la surface une fois tournée.
+        if (u_fit == 0) am = abs(c) >= abs(s) ? as_ : 1.0 / as_;
+        float w = abs(c) * am + abs(s);
+        float h = abs(s) * am + abs(c);
+        float k = u_fit == 2 ? max(as_ / w, 1.0 / h) : min(as_ / w, 1.0 / h);
+        vec2 p = (uv - 0.5) * vec2(as_, 1.0) / k;
+        p = mat2(c, -s, s, c) * p;
+        return p / vec2(am, 1.0) + 0.5;
+    }
     if (u_fit == 0) return uv;
     float r = (size.x / max(size.y, 1.0)) / max(u_surface_aspect, 1e-3);
     vec2 s = vec2(1.0);
@@ -1141,7 +1180,8 @@ vec2 fit_uv(vec2 uv, vec2 size) {
 
 // 1 dans l'image, 0 dans les bandes du mode « Ajuster ».
 float in_frame(vec2 uv) {
-    if (u_fit != 1) return 1.0;
+    // Un média tourné laisse des coins vides, quel que soit le cadrage.
+    if (u_fit != 1 && u_media_rot == 0.0) return 1.0;
     return step(0.0, uv.x) * step(uv.x, 1.0) * step(0.0, uv.y) * step(uv.y, 1.0);
 }
 
@@ -1345,7 +1385,8 @@ void main() {
             if (abs(determinant(P)) > 1e-14) tex_uv = v_uv + U * inverse(P) * (pos - v_pos);
         }
     }
-    float m = mask_value(pos);
+    vec2 mpos = mask_pos(pos);
+    float m = mask_value(mpos);
 
     // Forme du masque : distance au contour, comptée positivement vers la zone visible.
     vec4 field = vec4(0.0);
@@ -1353,7 +1394,7 @@ void main() {
     vec3 light = vec3(0.0);
     vec3 scol = u_shape_color;
     if (u_has_shape == 1) {
-        field = texture(u_shape_tex, pos);
+        field = texture(u_shape_tex, mpos);
         dv = (u_mask_invert == 1 ? -field.r : field.r) + u_shape_grow;
         // Respiration : la forme est redessinée d'après sa distance, décalée.
         if (u_shape_grow != 0.0) m = smoothstep(-u_feather, u_feather, dv);
@@ -1402,7 +1443,7 @@ void main() {
     }
     vec2 quad_uv = tex_uv;
     vec2 uv = quad_uv;
-    if (u_fit == 1 && (u_has_a == 1 || u_has_b == 1)) {
+    if ((u_fit == 1 || u_media_rot != 0.0) && (u_has_a == 1 || u_has_b == 1)) {
         // Ajuster : les bandes autour de l'image laissent voir les calques de derrière.
         float ia = u_has_a == 1 ? in_frame(fit_uv(quad_uv, u_size_a)) : 0.0;
         float ib = u_has_b == 1 ? in_frame(fit_uv(quad_uv, u_size_b)) : 0.0;
@@ -1502,10 +1543,13 @@ void main() {
         // Onde qui suit la forme : l'image est poussée perpendiculairement au contour.
         vec2 t = u_shape_texel;
         vec2 g = vec2(
-            texture(u_shape_tex, pos + vec2(t.x, 0.0)).r - texture(u_shape_tex, pos - vec2(t.x, 0.0)).r,
-            texture(u_shape_tex, pos + vec2(0.0, t.y)).r - texture(u_shape_tex, pos - vec2(0.0, t.y)).r
+            texture(u_shape_tex, mpos + vec2(t.x, 0.0)).r - texture(u_shape_tex, mpos - vec2(t.x, 0.0)).r,
+            texture(u_shape_tex, mpos + vec2(0.0, t.y)).r - texture(u_shape_tex, mpos - vec2(0.0, t.y)).r
         );
         vec2 n = g / max(length(g), 1e-6);
+        // Direction lue dans la forme tournée : on la remet dans le sens de la sortie.
+        float mc = cos(u_mask_angle), ms = sin(u_mask_angle);
+        n = mat2(mc, ms, -ms, mc) * n;
         float w = sin(2.0 * PI * (dv * u_shape_freq - u_shape_ripple_phase));
         uv += n * vec2(t.x / t.y, 1.0) * w * u_shape_wave;
     }
@@ -1842,6 +1886,7 @@ impl Renderer {
                 program,
                 gen_program,
                 gen_targets: HashMap::new(),
+                capture_target: None,
                 vao,
                 vbo,
                 black,
@@ -1880,6 +1925,10 @@ impl Renderer {
         unsafe {
             gl.delete_program(self.program);
             gl.delete_program(self.gen_program);
+            if let Some(t) = self.capture_target.take() {
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
             for (_, t) in self.gen_targets.drain() {
                 gl.delete_framebuffer(t.fbo);
                 gl.delete_texture(t.texture);
@@ -2171,6 +2220,81 @@ impl Renderer {
             let top = (vp.from_bottom_px + vp.height_px).min(clip.from_bottom_px + clip.height_px);
             gl.enable(glow::SCISSOR_TEST);
             gl.scissor(left, bottom, (right - left).max(0), (top - bottom).max(0));
+            self.draw_scene(gl, (vp.width_px as f32, vp.height_px as f32), p);
+        }
+    }
+
+    /// Rend la sortie hors écran à la taille `size` et renvoie l'image (RGBA, lignes du bas
+    /// vers le haut). Sert à l'enregistrement vidéo.
+    pub fn capture(&mut self, gl: &glow::Context, size: (u32, u32), p: &DrawParams) -> Option<Vec<u8>> {
+        self.collect_garbage(gl, p);
+        unsafe {
+            self.render_generators(gl, p);
+            let prev_fbo = gl.get_parameter_framebuffer(glow::DRAW_FRAMEBUFFER_BINDING);
+            let prev_read = gl.get_parameter_framebuffer(glow::READ_FRAMEBUFFER_BINDING);
+            let mut prev_vp = [0i32; 4];
+            gl.get_parameter_i32_slice(glow::VIEWPORT, &mut prev_vp);
+            let scissor = gl.is_enabled(glow::SCISSOR_TEST);
+            let mut prev_box = [0i32; 4];
+            gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut prev_box);
+
+            if self.capture_target.as_ref().is_some_and(|t| t.size != size) {
+                let t = self.capture_target.take().unwrap();
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
+            if self.capture_target.is_none() {
+                let texture = Self::create_texture(gl).ok()?;
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D,
+                    0,
+                    glow::RGBA8 as i32,
+                    size.0 as i32,
+                    size.1 as i32,
+                    0,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(None),
+                );
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                let fbo = gl.create_framebuffer().ok()?;
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+                self.capture_target = Some(GenTarget { fbo, texture, size, last: None });
+            }
+            let fbo = self.capture_target.as_ref()?.fbo;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(0, 0, size.0 as i32, size.1 as i32);
+            self.draw_scene(gl, (size.0 as f32, size.1 as f32), p);
+
+            let mut pixels = vec![0u8; size.0 as usize * size.1 as usize * 4];
+            gl.read_pixels(
+                0,
+                0,
+                size.0 as i32,
+                size.1 as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+
+            gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, prev_fbo);
+            gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev_read);
+            gl.viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+            gl.scissor(prev_box[0], prev_box[1], prev_box[2], prev_box[3]);
+            if !scissor {
+                gl.disable(glow::SCISSOR_TEST);
+            }
+            Some(pixels)
+        }
+    }
+
+    /// Compose les calques dans la cible actuelle (taille `res` en pixels ; le découpage
+    /// est déjà réglé par l'appelant).
+    unsafe fn draw_scene(&mut self, gl: &glow::Context, res: (f32, f32), p: &DrawParams) {
+        unsafe {
             if p.white {
                 gl.clear_color(1.0, 1.0, 1.0, 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
@@ -2186,7 +2310,7 @@ impl Renderer {
             let program = self.program;
             let loc = |name: &str| gl.get_uniform_location(program, name);
             gl.uniform_1_i32(loc("u_solid").as_ref(), 0);
-            gl.uniform_2_f32(loc("u_res").as_ref(), vp.width_px as f32, vp.height_px as f32);
+            gl.uniform_2_f32(loc("u_res").as_ref(), res.0, res.1);
 
             for (k, layer) in p.layers.iter().enumerate() {
                 self.paint_layer(gl, k, layer, p.time);
@@ -2287,6 +2411,7 @@ impl Renderer {
             gl.uniform_2_f32(loc("u_size_a").as_ref(), sa.0 as f32, sa.1 as f32);
             gl.uniform_2_f32(loc("u_size_b").as_ref(), sb.0 as f32, sb.1 as f32);
             i("u_fit", layer.fit as i32);
+            f("u_media_rot", layer.media_rotate.rem_euclid(360.0).to_radians());
             f("u_surface_aspect", layer.surface_aspect);
             i("u_grid", layer.grid as i32);
             f("u_opacity", layer.opacity.clamp(0.0, 1.0));
@@ -2354,6 +2479,9 @@ impl Renderer {
             f("u_shape_trace_phase", ph.shape_trace);
             f("u_shape_trace_dir", if fx.shape_trace_speed < 0.0 { -1.0 } else { 1.0 });
             f("u_shape_grow", fx.shape_breathe * ph.shape_breathe.sin());
+            // Pivot : le centre de la forme (le même point que pour la destruction).
+            f("u_mask_angle", (fx.mask_rotate + ph.mask_spin).to_radians());
+            gl.uniform_2_f32(loc("u_mask_center").as_ref(), layer.shatter_center[0], layer.shatter_center[1]);
             f("u_shape_rainbow", fx.shape_rainbow.clamp(0.0, 1.0));
             f("u_shape_echo", fx.shape_echo.max(0.0));
             f("u_shape_inner", fx.shape_inner.max(0.0));
@@ -2429,6 +2557,28 @@ pub fn paint_callback(rect: egui::Rect, renderer: Arc<Mutex<Renderer>>, params: 
         rect,
         callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
             renderer.lock().unwrap().paint(painter.gl(), &info, &params);
+        })),
+    }
+}
+
+/// Callback qui, si une image est due, rend la sortie hors écran et l'ajoute à l'enregistrement.
+pub fn capture_callback(
+    rect: egui::Rect,
+    renderer: Arc<Mutex<Renderer>>,
+    params: DrawParams,
+    recorder: Arc<Mutex<crate::recorder::Recorder>>,
+) -> egui::PaintCallback {
+    egui::PaintCallback {
+        rect,
+        callback: Arc::new(egui_glow::CallbackFn::new(move |_info, painter| {
+            let mut rec = recorder.lock().unwrap();
+            if rec.frames >= rec.frames_due() {
+                return;
+            }
+            let size = rec.size;
+            if let Some(frame) = renderer.lock().unwrap().capture(painter.gl(), size, &params) {
+                rec.push(frame);
+            }
         })),
     }
 }

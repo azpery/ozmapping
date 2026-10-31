@@ -1,0 +1,4 @@
+# Windows : le runtime Visual C++ (VCRUNTIME140.dll) est intégré à l'exécutable,
+# pour que l'app se lance sans installer « Microsoft Visual C++ Redistributable ».
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

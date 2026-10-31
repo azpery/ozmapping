@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 
 pub type Point = [f32; 2];
 
+/// Agrandissement uniforme autour de `center` (identique en largeur et en hauteur, en pixels aussi).
+fn scale_points<'a>(points: impl Iterator<Item = &'a mut Point>, center: Point, factor: f32) {
+    for p in points {
+        p[0] = center[0] + (p[0] - center[0]) * factor;
+        p[1] = center[1] + (p[1] - center[1]) * factor;
+    }
+}
+
 pub const MAX_GRID: usize = 8;
 /// Nombre total de points d'un masque (tous contours confondus).
 pub const MAX_MASK_POINTS: usize = 2000;
@@ -284,6 +292,17 @@ impl Warp {
         out
     }
 
+    /// Centre de la surface (moyenne des 4 coins).
+    pub fn center(&self) -> Point {
+        let c = self.corners();
+        [(c[0][0] + c[1][0] + c[2][0] + c[3][0]) / 4.0, (c[0][1] + c[1][1] + c[2][1] + c[3][1]) / 4.0]
+    }
+
+    /// Agrandit (`factor` > 1) ou réduit la surface autour du point `center`.
+    pub fn scale(&mut self, center: Point, factor: f32) {
+        scale_points(self.points.iter_mut(), center, factor);
+    }
+
     pub fn translate(&mut self, d: Point) {
         for p in &mut self.points {
             p[0] += d[0];
@@ -435,6 +454,24 @@ impl Mask {
     }
 
     /// Moyenne des points de tous les contours.
+    /// Tourne tous les contours de `degrees` autour du centre de la forme.
+    /// `aspect` (largeur / hauteur de la sortie) garde les proportions : un carré reste un carré.
+    pub fn rotate(&mut self, degrees: f32, aspect: f32) {
+        let [cx, cy] = self.centroid();
+        let (s, c) = degrees.to_radians().sin_cos();
+        let turn = |p: &mut Point| {
+            let (x, y) = ((p[0] - cx) * aspect, p[1] - cy);
+            *p = [cx + (x * c - y * s) / aspect, cy + x * s + y * c];
+        };
+        self.points.iter_mut().for_each(turn);
+        self.rings.iter_mut().flatten().for_each(turn);
+    }
+
+    /// Agrandit (`factor` > 1) ou réduit tous les contours autour du point `center`.
+    pub fn scale(&mut self, center: Point, factor: f32) {
+        scale_points(self.points.iter_mut().chain(self.rings.iter_mut().flatten()), center, factor);
+    }
+
     pub fn centroid(&self) -> Point {
         let n = self.total_points().max(1) as f32;
         self.all_rings().flatten().fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n])
@@ -566,6 +603,82 @@ pub fn edit_warp(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, salt: &str) {
         p[1] = (p[1] + d[1]).clamp(-1.0, 2.0);
         let active = resp.hovered() || resp.dragged();
         draw_point(ui, pos, ACCENT, active, corner.is_some(), corner.map(|k| (k + 1).to_string()));
+    }
+}
+
+/// Édition de l'ensemble média + masque : un cadre autour des deux.
+/// Glisser un coin = redimensionner (autour du coin opposé ; Alt : autour du centre),
+/// glisser la croix = déplacer. Le masque reste à la même place sur le média.
+pub fn edit_both(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, mask: &mut Mask, salt: &str) {
+    let base_id = ui.scope_id().with(("both", salt));
+    let frame_color = Color32::from_rgb(120, 200, 255);
+    draw_warp_outline(ui, rect, warp, ACCENT);
+    if mask.enabled {
+        for ring in mask.all_rings() {
+            let pts = ring.iter().map(|p| to_screen(rect, *p)).collect();
+            ui.painter().add(Shape::closed_line(pts, Stroke::new(1.5, MASK_COLOR)));
+        }
+    }
+
+    // Cadre englobant (coordonnées de sortie, 0..1).
+    let outline = warp.outline();
+    let mask_pts: Vec<Point> = if mask.enabled { mask.all_rings().flatten().copied().collect() } else { Vec::new() };
+    let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+    for p in outline.iter().chain(mask_pts.iter()) {
+        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+    }
+    if lo[0] > hi[0] {
+        return;
+    }
+    let bb = Rect::from_min_max(to_screen(rect, lo), to_screen(rect, hi));
+    ui.painter().rect_stroke(bb, 0.0, Stroke::new(1.5, frame_color), egui::StrokeKind::Middle);
+
+    let to_norm = |p: Pos2| -> Point { [(p.x - rect.min.x) / rect.width().max(1.0), (p.y - rect.min.y) / rect.height().max(1.0)] };
+    let mut scale = |pivot: Point, factor: f32| {
+        warp.scale(pivot, factor);
+        mask.scale(pivot, factor);
+    };
+
+    let d = center_handle(ui, rect, base_id.with("center"), bb.center(), frame_color);
+    if d != [0.0, 0.0] {
+        warp.translate(d);
+        for k in 0..mask.ring_count() {
+            for p in mask.ring_mut(k) {
+                p[0] += d[0];
+                p[1] += d[1];
+            }
+        }
+        return;
+    }
+
+    let corners = [bb.left_top(), bb.right_top(), bb.right_bottom(), bb.left_bottom()];
+    for (k, &pos) in corners.iter().enumerate() {
+        let (resp, d) = handle(ui, rect, base_id.with(("corner", k)), pos, 22.0);
+        let cursor = if k % 2 == 0 { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw };
+        let resp = resp.on_hover_cursor(cursor).on_hover_text("Glisser : redimensionner le média et le masque · Alt : depuis le centre");
+        let active = resp.hovered() || resp.dragged();
+        let side = if active { 12.0 } else { 9.0 };
+        ui.painter().rect(
+            Rect::from_center_size(pos, Vec2::splat(side)),
+            1.0,
+            if active { frame_color } else { Color32::from_black_alpha(170) },
+            Stroke::new(1.5, frame_color),
+            egui::StrokeKind::Middle,
+        );
+        if d == [0.0, 0.0] {
+            continue;
+        }
+        // Agrandissement uniforme : la projection du déplacement sur la diagonale (en pixels).
+        let pivot_px = if ui.input(|i| i.modifiers.alt) { bb.center() } else { corners[(k + 2) % 4] };
+        let from = pos - pivot_px;
+        let to = from + Vec2::new(d[0] * rect.width(), d[1] * rect.height());
+        let factor = (to.dot(from) / from.length_sq().max(1.0)).max(0.05);
+        // Pas plus petit qu'une vingtaine de pixels.
+        let factor = if from.length() * factor < 20.0 { 1.0 } else { factor };
+        if factor != 1.0 {
+            scale(to_norm(pivot_px), factor);
+        }
     }
 }
 

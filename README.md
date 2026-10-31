@@ -98,6 +98,8 @@ Le build Windows se fait sur GitHub Actions (workflow « Build ») : onglet **Ac
 
 **Jauge CPU** (en haut à droite) : la charge de l'app et de ses décodeurs ffmpeg, en pourcentage de la machine (vert, orange puis rouge). La partie grise montre la charge du reste de la machine. Le survol donne le détail (nombre de décodeurs, de cœurs).
 
+**Enregistrer** (barre du haut) : enregistre la sortie dans une vidéo MP4 (H.264), du démarrage à l'arrêt — un passage ou tout un spectacle. On choisit la définition (720p, 1080p, 4K, aux proportions de la sortie), les images par seconde (25, 30, 60) et, si on veut, une durée maximale qui arrête l'enregistrement toute seule. Pendant l'enregistrement, le bouton devient « ● REC » avec le temps écoulé : un clic l'arrête. La vidéo est rendue à part, à la définition choisie (indépendamment de la taille des fenêtres) ; elle n'a pas de son. Il faut ffmpeg, comme pour la lecture.
+
 **Projet** (menu Projet). Les fichiers `.ozmap` sont du JSON : médias, calques (avec leur vidéo), effets, formes, presets et réglages. Les médias rangés dans le dossier du projet sont enregistrés en chemins relatifs, ce qui permet de déplacer le dossier. Un « * » dans le titre signale des modifications non enregistrées. La session en cours est aussi restaurée automatiquement au lancement.
 
 | Raccourci | Action |

@@ -27,6 +27,8 @@ pub struct LayerConfig {
     pub blend: BlendMode,
     /// Cadrage de l'image dans la surface (étirer, ajuster, remplir).
     pub fit: Fit,
+    /// Rotation du média dans la surface, en degrés (le cadrage en tient compte).
+    pub media_rotate: f32,
     pub effects: Effects,
     /// Navigation automatique entre les effets.
     pub auto: AutoFx,
@@ -64,6 +66,7 @@ pub struct Cell {
     pub mask: Option<Mask>,
     pub react: Option<React>,
     pub mix: Option<AutoMix>,
+    pub media_rotate: Option<f32>,
     /// Lecture : vitesse et sens.
     pub speed: Option<f32>,
     pub reverse: Option<bool>,
@@ -87,6 +90,7 @@ impl Default for Cell {
             mask: None,
             react: None,
             mix: None,
+            media_rotate: None,
             speed: None,
             reverse: None,
             paused: None,
@@ -117,6 +121,7 @@ impl Default for LayerConfig {
             opacity: 1.0,
             blend: BlendMode::Normal,
             fit: Fit::Stretch,
+            media_rotate: 0.0,
             effects: Effects::default(),
             auto: AutoFx::default(),
             mix: AutoMix::default(),
