@@ -486,8 +486,8 @@ impl OzApp {
 
         ui.add_space(6.0);
         ui.label(egui::RichText::new(with_icon(ic::SCISSORS, "Séquences")).strong().color(TEXT));
-        ui.add(egui::Slider::new(&mut mix.seg_min, 0.3..=20.0).logarithmic(true).text("Durée min").suffix(" s"));
-        ui.add(egui::Slider::new(&mut mix.seg_max, 0.3..=20.0).logarithmic(true).text("Durée max").suffix(" s"));
+        fit_slider(ui, "Durée min", egui::Slider::new(&mut mix.seg_min, 0.3..=20.0).logarithmic(true).suffix(" s"));
+        fit_slider(ui, "Durée max", egui::Slider::new(&mut mix.seg_max, 0.3..=20.0).logarithmic(true).suffix(" s"));
         percent_slider(ui, &mut mix.same_clip_chance, "Rester sur la même vidéo")
             .on_hover_text("Sinon on passe à une autre vidéo cochée");
         ui.add_space(4.0);
@@ -495,12 +495,12 @@ impl OzApp {
         percent_slider(ui, &mut mix.reverse_chance, "À l'envers");
         percent_slider(ui, &mut mix.speed_chance, "Vitesse variable")
             .on_hover_text("Part des séquences jouées à une autre vitesse que la normale");
-        ui.add(egui::Slider::new(&mut mix.speed_min, 0.1..=4.0).logarithmic(true).text("Vitesse min").suffix("×"));
-        ui.add(egui::Slider::new(&mut mix.speed_max, 0.1..=4.0).logarithmic(true).text("Vitesse max").suffix("×"));
+        fit_slider(ui, "Vitesse min", egui::Slider::new(&mut mix.speed_min, 0.1..=4.0).logarithmic(true).suffix("×"));
+        fit_slider(ui, "Vitesse max", egui::Slider::new(&mut mix.speed_max, 0.1..=4.0).logarithmic(true).suffix("×"));
         ui.add_space(4.0);
         ui.label(egui::RichText::new(with_icon(ic::SHUFFLE, "Transitions")).strong().color(TEXT));
         percent_slider(ui, &mut mix.cut_chance, "Coupes franches").on_hover_text("Sinon fondu enchaîné");
-        ui.add(egui::Slider::new(&mut mix.fade, 0.05..=3.0).text("Durée des fondus").suffix(" s"));
+        fit_slider(ui, "Durée des fondus", egui::Slider::new(&mut mix.fade, 0.05..=3.0).suffix(" s"));
         if ui.small_button("Réglages par défaut").clicked() {
             let (enabled, clips) = (mix.enabled, std::mem::take(&mut mix.clips));
             *mix = AutoMix { enabled, clips, ..AutoMix::default() };
@@ -570,9 +570,9 @@ pub(super) fn auto_ui(ui: &mut egui::Ui, auto: &mut effects::AutoFx, timer: f32,
         }
     });
     ui.label(egui::RichText::new(auto.theme.description()).small().color(TEXT_WEAK));
-    ui.add(egui::Slider::new(&mut auto.interval, 1.0..=60.0).text("Changer toutes les").suffix(" s"));
-    ui.add(egui::Slider::new(&mut auto.transition, 0.0..=10.0).text("Fondu").suffix(" s"));
-    ui.add(egui::Slider::new(&mut auto.intensity, 0.3..=1.5).text("Intensité"))
+    fit_slider(ui, "Changer toutes les", egui::Slider::new(&mut auto.interval, 1.0..=60.0).suffix(" s"));
+    fit_slider(ui, "Fondu", egui::Slider::new(&mut auto.transition, 0.0..=10.0).suffix(" s"));
+    fit_slider(ui, "Intensité", egui::Slider::new(&mut auto.intensity, 0.3..=1.5))
         .on_hover_text("Dosage des effets générés : faible = subtil, fort = extrême");
     if auto.theme == AutoTheme::All {
         percent_slider(ui, &mut auto.novelty, "Effets inédits")

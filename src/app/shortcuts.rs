@@ -21,6 +21,14 @@ impl OzApp {
             self.new_project(ctx);
         }
 
+        // Annuler / rétablir (dans un champ de texte, Cmd+Z annule la frappe : on le laisse faire).
+        if !ctx.egui_wants_keyboard_input() {
+            if cmd(true, Key::Z) || cmd(false, Key::Y) {
+                self.redo(ctx);
+            } else if cmd(false, Key::Z) {
+                self.undo(ctx);
+            }
+        }
         if ctx.egui_wants_keyboard_input() || ctx.input(|i| i.modifiers.command) {
             return;
         }

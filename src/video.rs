@@ -746,6 +746,9 @@ mod tests {
 
     /// Vidéo de test de 3 s générée par ffmpeg (test ignoré si ffmpeg est absent).
     fn test_video() -> Option<PathBuf> {
+        // Un seul test à la fois la fabrique : sinon un autre lirait le fichier en cours d'écriture.
+        static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = MAKING.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::temp_dir().join(format!("ozmapping-test-{}.mp4", std::process::id()));
         if !path.exists() {
             let ok = tool_command("ffmpeg")

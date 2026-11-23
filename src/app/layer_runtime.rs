@@ -49,6 +49,17 @@ pub(super) struct LayerRuntime {
     pub(super) gen_next_secs: Option<f32>,
     /// Temps écoulé depuis le dernier changement automatique de motif.
     pub(super) gen_timer: f32,
+    /// Taches de peinture : cadence des gouttes, et gouttes de l'image en cours.
+    pub(super) paint: crate::paint::Spawner,
+    pub(super) paint_draw: crate::paint::PaintDraw,
+    /// Route cartoon : tracé de la route, et ce qu'on en dessine sur l'image en cours.
+    pub(super) road: crate::road::Track,
+    pub(super) road_draw: crate::road::RoadDraw,
+    /// Visage qui parle : parole, clignements et regard, et ce qu'on en dessine sur l'image en cours.
+    pub(super) speaker: crate::face::Speaker,
+    pub(super) face_draw: crate::face::FaceDraw,
+    /// Photo plaquée sur le visage : le fichier demandé et l'image chargée (None : illisible).
+    pub(super) face_photo: Option<(std::path::PathBuf, Option<crate::face::FacePhoto>)>,
     /// Destruction déclenchée à la main (« Casser ! ») : avancement du cycle (0..1).
     pub(super) shatter_shot: Option<f32>,
     /// Dernière case du tableau jouée sur ce calque.

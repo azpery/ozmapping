@@ -270,6 +270,15 @@ impl Cutout {
         }
     }
 
+    /// Photo calée sur l'image projetée : où tombent ses 4 coins sur la sortie (haut-gauche,
+    /// haut-droit, bas-droit, bas-gauche). None : la photo entière est ajustée à la sortie.
+    pub fn photo_corners(&self) -> Result<Option<[Point; 4]>> {
+        let Some(q) = &self.projection else { return Ok(None) };
+        let to_output = crate::surface::quad_to_unit(q).context("coins de l'image projetée mal placés (quadrilatère plat)")?;
+        let (w, h) = (self.width as f64, self.height as f64);
+        Ok(Some([[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]].map(|p| to_output(p).map(|v| v as f32))))
+    }
+
     // -------------------------------------------------------------- automatique
 
     /// Cadre l'objet voulu (en pixels de l'image de travail) : le détourage automatique ne

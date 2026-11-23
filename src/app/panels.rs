@@ -5,77 +5,102 @@ use super::*;
 impl OzApp {
     pub(super) fn top_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(ic::PROJECTOR_SCREEN).size(22.0).color(ACCENT));
-            ui.label(egui::RichText::new("OZ Mapping").size(18.0).strong().color(TEXT));
-            ui.add_space(6.0);
-            ui.menu_button(with_icon(ic::FOLDER_OPEN, "Projet"), |ui| {
-                if ui.button(with_icon(ic::FILE_PLUS, &format!("Nouveau          {CMD}+N"))).clicked() {
-                    ui.close();
-                    self.new_project(&ctx);
-                }
-                if ui.button(with_icon(ic::FOLDER_OPEN, &format!("Ouvrir…           {CMD}+O"))).clicked() {
-                    ui.close();
-                    self.open_project(&ctx);
-                }
-                ui.separator();
-                if ui.button(with_icon(ic::FLOPPY_DISK, &format!("Enregistrer       {CMD}+S"))).clicked() {
-                    ui.close();
-                    self.save(false);
-                }
-                if ui.button(with_icon(ic::FLOPPY_DISK, &format!("Enregistrer sous…  Maj+{CMD}+S"))).clicked() {
-                    ui.close();
-                    self.save(true);
-                }
-            });
-            ui.separator();
-            ui.toggle_value(&mut self.output_open, with_icon(ic::MONITOR, "Sortie"))
-                .on_hover_text("Ouvrir / fermer la fenêtre de sortie");
-            self.screen_menu(ui);
-            ui.separator();
-            self.tap_widget(ui);
-            let mut fs = self.output_fullscreen;
-            if ui
-                .toggle_value(&mut fs, with_icon(ic::CORNERS_OUT, "Plein écran"))
-                .on_hover_text("Sortie en plein écran (F)")
-                .changed()
-            {
-                self.set_fullscreen(&ctx, fs);
-            }
-            self.record_widget(ui);
-            ui.separator();
-            let bo = ui
-                .toggle_value(&mut self.blackout, with_icon(ic::MOON, "Blackout"))
-                .on_hover_text("Fondu au noir (B)");
-            if self.blackout {
-                bo.highlight();
-            }
-            let white = ui
-                .toggle_value(&mut self.white_screen, with_icon(ic::SUN, "Blanc"))
-                .on_hover_text("Projeter un écran blanc (W) : pour photographier l'image projetée ou régler le projecteur");
-            if self.white_screen {
-                white.highlight();
-            }
-            let bypass = ui
-                .toggle_value(&mut self.bypass_fx, with_icon(ic::PROHIBIT, "Sans effets"))
-                .on_hover_text("Affiche les vidéos sans aucun effet, sur tous les calques (E).\nLes réglages sont conservés.");
-            if self.bypass_fx {
-                bypass.highlight();
-            }
-            ui.toggle_value(&mut self.grid, with_icon(ic::GRID_FOUR, "Mire"))
-                .on_hover_text("Mire de calibration (G)");
-            if ui
-                .toggle_value(&mut self.edit_mapping, with_icon(ic::POLYGON, "Forme"))
-                .on_hover_text("Éditer la déformation ou le masque sur l'aperçu et la sortie (M)")
-                .clicked()
-                && self.edit_mapping
-            {
-                self.show_shape_tab(self.edit_target);
-            }
-            ui.separator();
-            ui.label(egui::RichText::new(ic::SUN).size(15.0)).on_hover_text("Luminosité générale (master)");
-            ui.add(egui::Slider::new(&mut self.project.master, 0.0..=1.0).show_value(false));
-
+        ui.horizontal_top(|ui| {
+            // Place réservée à droite pour la charge et les images/s ; les boutons passent
+            // sur une deuxième ligne plutôt que de les recouvrir.
+            const RIGHT_W: f32 = 230.0;
+            let left_w = (ui.available_width() - RIGHT_W).max(240.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_w, 0.0),
+                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                |ui| {
+                    ui.set_max_width(left_w);
+                    ui.label(egui::RichText::new(ic::PROJECTOR_SCREEN).size(22.0).color(ACCENT));
+                    ui.label(egui::RichText::new("OZ Mapping").size(18.0).strong().color(TEXT));
+                    ui.add_space(6.0);
+                    ui.menu_button(with_icon(ic::FOLDER_OPEN, "Projet"), |ui| {
+                        if ui.button(with_icon(ic::FILE_PLUS, &format!("Nouveau          {CMD}+N"))).clicked() {
+                            ui.close();
+                            self.new_project(&ctx);
+                        }
+                        if ui.button(with_icon(ic::FOLDER_OPEN, &format!("Ouvrir…           {CMD}+O"))).clicked() {
+                            ui.close();
+                            self.open_project(&ctx);
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(self.history.can_undo(), egui::Button::new(with_icon(ic::ARROW_COUNTER_CLOCKWISE, &format!("Annuler            {CMD}+Z"))))
+                            .clicked()
+                        {
+                            ui.close();
+                            self.undo(&ctx);
+                        }
+                        if ui
+                            .add_enabled(self.history.can_redo(), egui::Button::new(with_icon(ic::ARROWS_CLOCKWISE, &format!("Rétablir     Maj+{CMD}+Z"))))
+                            .clicked()
+                        {
+                            ui.close();
+                            self.redo(&ctx);
+                        }
+                        ui.separator();
+                        if ui.button(with_icon(ic::FLOPPY_DISK, &format!("Enregistrer       {CMD}+S"))).clicked() {
+                            ui.close();
+                            self.save(false);
+                        }
+                        if ui.button(with_icon(ic::FLOPPY_DISK, &format!("Enregistrer sous…  Maj+{CMD}+S"))).clicked() {
+                            ui.close();
+                            self.save(true);
+                        }
+                    });
+                    ui.separator();
+                    ui.toggle_value(&mut self.output_open, with_icon(ic::MONITOR, "Sortie"))
+                        .on_hover_text("Ouvrir / fermer la fenêtre de sortie");
+                    self.screen_menu(ui);
+                    ui.separator();
+                    self.tap_widget(ui);
+                    let mut fs = self.output_fullscreen;
+                    if ui
+                        .toggle_value(&mut fs, with_icon(ic::CORNERS_OUT, "Plein écran"))
+                        .on_hover_text("Sortie en plein écran (F)")
+                        .changed()
+                    {
+                        self.set_fullscreen(&ctx, fs);
+                    }
+                    self.record_widget(ui);
+                    ui.separator();
+                    let bo = ui
+                        .toggle_value(&mut self.blackout, with_icon(ic::MOON, "Blackout"))
+                        .on_hover_text("Fondu au noir (B)");
+                    if self.blackout {
+                        bo.highlight();
+                    }
+                    let white = ui
+                        .toggle_value(&mut self.white_screen, with_icon(ic::SUN, "Blanc"))
+                        .on_hover_text("Projeter un écran blanc (W) : pour photographier l'image projetée ou régler le projecteur");
+                    if self.white_screen {
+                        white.highlight();
+                    }
+                    let bypass = ui
+                        .toggle_value(&mut self.bypass_fx, with_icon(ic::PROHIBIT, "Sans effets"))
+                        .on_hover_text("Affiche les vidéos sans aucun effet, sur tous les calques (E).\nLes réglages sont conservés.");
+                    if self.bypass_fx {
+                        bypass.highlight();
+                    }
+                    ui.toggle_value(&mut self.grid, with_icon(ic::GRID_FOUR, "Mire"))
+                        .on_hover_text("Mire de calibration (G)");
+                    if ui
+                        .toggle_value(&mut self.edit_mapping, with_icon(ic::POLYGON, "Forme"))
+                        .on_hover_text("Éditer la déformation ou le masque sur l'aperçu et la sortie (M)")
+                        .clicked()
+                        && self.edit_mapping
+                    {
+                        self.show_shape_tab(self.edit_target);
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new(ic::SUN).size(15.0)).on_hover_text("Luminosité générale (master)");
+                    ui.add(egui::Slider::new(&mut self.project.master, 0.0..=1.0).show_value(false));
+                },
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(egui::RichText::new(format!("{:.0} i/s", self.fps)).small().color(TEXT_WEAK))
                     .on_hover_text("Images par seconde de l'interface");
@@ -449,6 +474,8 @@ impl OzApp {
                     (RightTab::Shape, ic::POLYGON, "Forme"),
                     (RightTab::Mix, ic::FILM_REEL, "Mix"),
                     (RightTab::Rhythm, ic::WAVES, "Rythme"),
+                    (RightTab::Leds, ic::LIGHTBULB, "LEDs"),
+                    (RightTab::Midi, ic::SQUARES_FOUR, "MIDI"),
                 ] {
                     if side_tab(ui, icon, name, self.right_tab == tab).clicked() {
                         self.right_tab = tab;
@@ -460,12 +487,23 @@ impl OzApp {
 
     /// Contenu de l'onglet latéral choisi, avec ses onglets horizontaux.
     pub(super) fn settings_pane(&mut self, ui: &mut egui::Ui) {
+        // Les LEDs ne dépendent pas du calque sélectionné.
+        if !matches!(self.right_tab, RightTab::Leds | RightTab::Midi) {
+            self.layer_badge(ui);
+        }
+        self.settings_body(ui);
+    }
+
+    fn layer_badge(&mut self, ui: &mut egui::Ui) {
         ui.label(
             egui::RichText::new(with_icon(ic::STACK, &self.project.layers[self.sel()].name))
                 .color(ACCENT)
                 .small(),
         )
         .on_hover_text("Calque sélectionné : les réglages ci-dessous s'appliquent à lui");
+    }
+
+    fn settings_body(&mut self, ui: &mut egui::Ui) {
         ui.add_space(2.0);
         // Onglets horizontaux : les sections de l'onglet latéral.
         let sections = self.right_tab.sections();
@@ -490,16 +528,23 @@ impl OzApp {
         }
         let sel = self.sel();
         let before = self.fx_target(sel);
-        egui::ScrollArea::vertical()
+        // Défilement horizontal en dernier recours : un réglage trop large reste dans
+        // sa colonne au lieu d'élargir le panneau et de décaler tout son contenu.
+        // Barre de défilement à côté du contenu (pas par-dessus) : les boutons alignés à droite
+        // restent cliquables.
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+        egui::ScrollArea::both()
             .id_salt("right")
             .auto_shrink([false, false])
             .show(ui, |ui| match self.right_tab {
                 RightTab::Effects => self.effects_ui(ui),
                 RightTab::Visuals => self.generator_ui(ui),
-                RightTab::Photo => self.lines_fx_ui(ui),
+                RightTab::Photo => self.photo_ui(ui),
                 RightTab::Shape => self.shape_ui(ui),
                 RightTab::Mix => self.mix_ui(ui),
                 RightTab::Rhythm => self.rhythm_ui(ui),
+                RightTab::Leds => self.leds_ui(ui),
+                RightTab::Midi => self.midi_ui(ui),
             });
         // Un effet vient d'être choisi sur un calque qui ne se voit pas : on le signale.
         // (« Aucun » ne compte pas : retirer les effets d'un calque caché n'a rien d'étonnant.)

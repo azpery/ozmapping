@@ -213,9 +213,23 @@ impl OzApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let target = &layer_names[ed.layer.min(layer_names.len() - 1)];
-                let label = with_icon(ic::CHECK_SQUARE, &format!("Appliquer au calque « {target} »"));
-                if ui.add(theme::primary_button(label)).clicked() {
-                    apply = Some(ed.cut.rings(aspect));
+                let label = with_icon(ic::CHECK_SQUARE, &format!("Mapper l'objet sur « {target} »"));
+                if ui
+                    .add(theme::primary_button(label))
+                    .on_hover_text(
+                        "La photo détourée s'affiche sur le calque, son masque calé dessus. Vous la placez ensuite où \
+                         vous voulez sur la sortie (image et masque bougent ensemble), puis vous choisissez une animation.",
+                    )
+                    .clicked()
+                {
+                    apply = Some((ed.cut.rings(aspect), true));
+                }
+                if ui
+                    .button("Masque seul")
+                    .on_hover_text("Ne garder que la forme comme masque du calque, sans y afficher la photo")
+                    .clicked()
+                {
+                    apply = Some((ed.cut.rings(aspect), false));
                 }
                 if ui.button("Fermer").clicked() {
                     close = true;
@@ -223,21 +237,68 @@ impl OzApp {
             });
         });
         match apply {
-            Some(Ok((rings, nonzero))) => {
+            Some((Ok((rings, nonzero)), with_photo)) => {
                 let layer = self.cutout.as_ref().map_or(self.sel(), |ed| ed.layer);
-                self.apply_mask_rings(layer, rings, nonzero);
-                self.cutout = None;
+                let photo = self.cutout.as_ref().filter(|_| with_photo).map(|ed| (ed.path.clone(), ed.cut.photo_corners()));
+                match photo {
+                    Some((_, Err(e))) => self.status = Some(format!("Détourage : {e:#}")),
+                    Some((path, Ok(corners))) => {
+                        self.map_object(ctx, layer, &path, corners, rings, nonzero);
+                        self.cutout = None;
+                    }
+                    None => {
+                        self.apply_mask_rings(layer, rings, nonzero);
+                        self.cutout = None;
+                    }
+                }
             }
-            Some(Err(e)) => self.status = Some(format!("Détourage : {e:#}")),
+            Some((Err(e), _)) => self.status = Some(format!("Détourage : {e:#}")),
             None if close => self.cutout = None,
             None => {}
         }
+    }
+
+    /// Mapping d'un objet photographié : la photo joue sur le calque, son masque détouré calé
+    /// dessus, et l'ensemble passe en mode placement (image et masque bougent ensemble).
+    /// `corners` : coins de la photo sur la sortie quand elle est calée sur l'image projetée.
+    fn map_object(
+        &mut self,
+        ctx: &egui::Context,
+        layer: usize,
+        path: &Path,
+        corners: Option<[surface::Point; 4]>,
+        rings: Vec<Vec<surface::Point>>,
+        nonzero: bool,
+    ) {
+        let layer = layer.min(self.project.layers.len() - 1);
+        let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        self.add_media([path.clone()]);
+        self.launch_any(ctx, layer, &MediaDrag::File(path));
+        // Le masque a été tracé sur la photo entière : elle doit occuper exactement la même place.
+        let cfg = &mut self.project.layers[layer];
+        cfg.media_rotate = 0.0;
+        match corners {
+            Some(c) => {
+                cfg.warp = Warp::regular(1, 1, &c);
+                cfg.fit = Fit::Stretch;
+            }
+            None => {
+                cfg.warp = Warp::default();
+                cfg.fit = Fit::Contain;
+            }
+        }
+        self.apply_mask_rings(layer, rings, nonzero);
+        self.right_tab = RightTab::Photo;
+        self.edit_mapping = true;
+        self.edit_both = true;
     }
 }
 
 /// Détourage d'une photo en cours (fenêtre « Masque depuis une photo »).
 pub(super) struct CutoutEditor {
     pub(super) cut: Cutout,
+    /// Fichier de la photo (pour l'afficher ensuite sur le calque).
+    pub(super) path: PathBuf,
     pub(super) name: String,
     pub(super) tex: Option<egui::TextureHandle>,
     pub(super) dirty: bool,

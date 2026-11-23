@@ -34,6 +34,8 @@ mod files;
 mod grid;
 mod layer_runtime;
 mod layers;
+mod leds_ui;
+mod midi_ui;
 mod output;
 mod panels;
 mod playback;
@@ -42,6 +44,7 @@ mod recording;
 mod rhythm_ui;
 mod shape_ui;
 mod shortcuts;
+mod undo;
 mod visuals_ui;
 mod widgets;
 
@@ -49,6 +52,8 @@ use cutout_ui::*;
 use files::*;
 use grid::*;
 use layer_runtime::*;
+use leds_ui::*;
+use midi_ui::*;
 use output::*;
 use widgets::*;
 
@@ -67,6 +72,8 @@ struct Session {
     rhythm_source: rhythm::Source,
     rhythm_band: rhythm::Band,
     bpm: Option<f32>,
+    /// Contrôleur MIDI : port et commandes assignées (indépendants du projet).
+    midi: crate::midi::MidiSetup,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -83,10 +90,12 @@ enum RightTab {
     Shape,
     Mix,
     Rhythm,
+    Leds,
+    Midi,
 }
 
 impl RightTab {
-    const COUNT: usize = 6;
+    const COUNT: usize = 8;
 
     /// Onglets horizontaux de chaque onglet latéral (vide : une seule page).
     fn sections(self) -> &'static [(&'static str, &'static str)] {
@@ -108,6 +117,8 @@ impl RightTab {
                 (ic::SHUFFLE, "Enchaînement"),
                 (ic::SHAPES, "Sur le masque"),
                 (ic::LIGHTNING, "Destruction"),
+                (ic::SPEEDOMETER, "Route"),
+                (ic::EYE, "Visage"),
             ],
             RightTab::Shape => &[
                 (ic::FRAME_CORNERS, "Cadrage"),
@@ -115,7 +126,8 @@ impl RightTab {
                 (ic::SHAPES, "Masque"),
             ],
             RightTab::Rhythm => &[(ic::WAVES, "Source"), (ic::SPARKLE, "Réaction")],
-            RightTab::Photo | RightTab::Mix => &[],
+            RightTab::Leds => &[(ic::CUBE, "Scène"), (ic::LIGHTBULB, "LEDs"), (ic::WIFI_HIGH, "Contrôleurs"), (ic::PLAY, "Sortie")],
+            RightTab::Photo | RightTab::Mix | RightTab::Midi => &[],
         }
     }
 }
@@ -159,6 +171,11 @@ pub struct OzApp {
     screens_at: f64,
     rhythm: Rhythm,
     cutout: Option<CutoutEditor>,
+    /// LEDs WLED : simulateur, envoi en direct.
+    led: LedRuntime,
+    /// Contrôleur MIDI : connexion, dessin ; et ses commandes assignées (gardées entre sessions).
+    midi: MidiRuntime,
+    midi_setup: crate::midi::MidiSetup,
 
     blackout: bool,
     blackout_level: f32,
@@ -191,8 +208,13 @@ pub struct OzApp {
     /// Résultat du dernier enregistrement (fichier écrit, ou erreur), rempli en arrière-plan.
     rec_result: Arc<Mutex<Option<Result<PathBuf, String>>>>,
 
+    /// Annuler / rétablir.
+    history: undo::History,
     preset_name: String,
     mask_preset_name: String,
+    /// Calage en trois clics de la photo du visage : demandé, puis en cours.
+    face_calib_wanted: bool,
+    face_calib: Option<visuals_ui::FaceCalib>,
     builtin_presets: Vec<Preset>,
     random_seed: u64,
     status: Option<String>,
@@ -250,6 +272,9 @@ impl OzApp {
             screens_at: 0.0,
             rhythm: Rhythm::default(),
             cutout: None,
+            led: LedRuntime::default(),
+            midi: MidiRuntime::default(),
+            midi_setup: crate::midi::MidiSetup::default(),
             blackout: false,
             blackout_level: 0.0,
             white_screen: false,
@@ -270,8 +295,11 @@ impl OzApp {
             rec_fps: 30,
             rec_max_secs: 0.0,
             rec_result: Arc::new(Mutex::new(None)),
+            history: undo::History::default(),
             preset_name: String::new(),
             mask_preset_name: String::new(),
+            face_calib_wanted: false,
+            face_calib: None,
             builtin_presets: effects::builtin_presets(),
             random_seed: 0x9E37_79B9_7F4A_7C15,
             status,
@@ -297,6 +325,7 @@ impl OzApp {
             app.rhythm.tempo.bpm = bpm;
         }
         app.rhythm.band = session.rhythm_band;
+        app.midi_setup = session.midi.clone();
         if session.rhythm_source != rhythm::Source::Off {
             app.rhythm.set_source(session.rhythm_source.clone());
         }
@@ -339,8 +368,20 @@ impl OzApp {
 impl eframe::App for OzApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        self.undo_begin(&ctx);
         self.tick(&ctx);
+        self.midi_tick(&ctx);
+        self.leds_tick(&ctx);
+        // TEMP-DEBUG-REC
+        if let Ok(path) = std::env::var("OZ_DEBUG_REC") {
+            if self.recorder.is_none() && ctx.cumulative_frame_nr() == 30 {
+                if let Ok(r) = recorder::Recorder::start(std::path::Path::new(&path), (960, 540), 30, 20.0) {
+                    self.recorder = Some(Arc::new(Mutex::new(r)));
+                }
+            }
+        }
         if self.cutout.is_none() {
+            self.scene_shortcuts(&ctx);
             self.handle_shortcuts(&ctx);
         }
 
@@ -390,10 +431,18 @@ impl eframe::App for OzApp {
                         if ui.small_button(ic::X).clicked() {
                             *self.rec_result.lock().unwrap() = None;
                         }
+                    } else if self.right_tab == RightTab::Leds {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Scène 3D :  flèches déplacer (Maj ×10)  ·  PgHaut/PgBas monter/descendre  ·  Q/E ou [ ] tourner de 15°  ·  Suppr supprimer  ·  {CMD}+D dupliquer  ·  D dessiner un tracé  ·  V changer de vue  ·  Échap désélectionner"
+                            ))
+                            .small()
+                            .color(TEXT_WEAK),
+                        );
                     } else {
                         ui.label(
                             egui::RichText::new(format!(
-                                "Espace pause  ·  R envers  ·  0 sans effet  ·  E tout sans effets  ·  A auto  ·  B blackout  ·  M forme  ·  F plein écran  ·  {CMD}+S enregistrer"
+                                "Espace pause  ·  R envers  ·  0 sans effet  ·  E tout sans effets  ·  A auto  ·  B blackout  ·  M forme  ·  F plein écran  ·  {CMD}+Z annuler  ·  {CMD}+S enregistrer"
                             ))
                             .small()
                             .color(TEXT_WEAK),
@@ -422,11 +471,19 @@ impl eframe::App for OzApp {
             .show(ui, |ui| self.right_panel(ui));
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(BG))
-            .show(ui, |ui| self.preview(ui));
+            .show(ui, |ui| {
+                self.leds_capture(ui);
+                if self.right_tab == RightTab::Leds {
+                    self.leds_central(ui);
+                } else {
+                    self.preview(ui);
+                }
+            });
 
         self.media_drag_preview(&ctx);
         self.cutout_window(&ctx);
 
+        self.undo_end(&ctx);
         if self.output_open {
             ctx.show_viewport_immediate(
                 output_viewport_id(),
@@ -447,6 +504,7 @@ impl eframe::App for OzApp {
             rhythm_source: self.rhythm.source.clone(),
             rhythm_band: self.rhythm.band,
             bpm: Some(self.rhythm.tempo.bpm),
+            midi: self.midi_setup.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &session);
     }

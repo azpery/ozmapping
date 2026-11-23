@@ -1422,3 +1422,74 @@ mod tests {
         assert!(with, "le thème Vitesse doit pouvoir utiliser le stroboscope s'il est autorisé");
     }
 }
+
+/// Animation proposée pour un objet photographié et détouré : effets, contours animés,
+/// animation du masque et, parfois, un visuel généré mélangé à la photo.
+pub struct ObjectLook {
+    pub name: &'static str,
+    pub hint: &'static str,
+    pub effects: Effects,
+    /// Visuel généré et sa part par-dessus la photo.
+    pub visual: Option<(crate::generator::Pattern, f32)>,
+}
+
+pub fn object_looks() -> Vec<ObjectLook> {
+    use crate::generator::Pattern;
+    let (builtin, anims) = (builtin_presets(), mask_anim_presets());
+    let find = |list: &[Preset], name: &str| list.iter().find(|p| p.name == name).map(|p| p.effects).unwrap_or_default();
+    let fx = |name: &str| find(&builtin, name);
+    // Animation du masque `name` ajoutée aux effets `e`.
+    let anim = |e: Effects, name: &str| e.with_mask_anim_of(&find(&anims, name));
+    let lines = |mut e: Effects, style: usize| {
+        e.set_lines_style(style);
+        e
+    };
+    let d = Effects::default();
+    let look = |name, hint, effects, visual| ObjectLook { name, hint, effects, visual };
+    vec![
+        look("Naturel", "La photo seule, sans animation", d, None),
+        look("Contours dorés", "Les arêtes de l'objet s'allument en doré et frémissent", lines(d, 0), None),
+        look("Dessin vivant", "L'objet devient un dessin au trait blanc qui ondule", lines(d, 1), None),
+        look("Arc-en-ciel", "Contours aux couleurs qui défilent, teintes de la photo qui tournent", lines(Effects { hue_speed: 0.08, ..d }, 2), None),
+        look("Vagues de lumière", "Des vagues partent du centre et allument les contours à leur passage", anim(lines(d, 3), "Ondes"), None),
+        look("Couleurs qui tournent", "Les couleurs de l'objet font le tour de l'arc-en-ciel", Effects { hue_speed: 0.15, saturation: 1.4, ..d }, None),
+        look("Aura", "Un halo lumineux autour de la silhouette", anim(d, "Aura"), None),
+        look("Néon", "La silhouette cernée d'un néon arc-en-ciel", anim(d, "Néon arc-en-ciel"), None),
+        look("Comètes", "Des points lumineux font le tour de l'objet", anim(d, "Comètes"), None),
+        look("Respiration", "L'objet grossit et rétrécit doucement, comme s'il respirait", anim(fx("Respiration"), "Respiration"), None),
+        look("Onde liquide", "L'image ondule comme vue à travers l'eau", anim(fx("Liquide"), "Onde liquide"), None),
+        look("Relief", "La lumière rasante donne du volume aux détails", fx("Relief"), None),
+        look("Thermique", "L'objet vu par une caméra thermique", fx("Thermique"), None),
+        look("Glitch", "L'image saute et se décale par blocs", fx("Glitch numérique"), None),
+        look("Fête", "Contours arc-en-ciel et silhouette qui clignote", anim(lines(d, 2), "Fête"), None),
+        look(
+            "Verre brisé",
+            "L'objet se brise en éclats puis se reconstruit, en boucle",
+            Effects { shatter: Shatter::Glass, shatter_speed: 0.12, ..d },
+            None,
+        ),
+        look(
+            "Voyage temporel",
+            "Le vortex du temps, ses horloges et ses années tournent dans la silhouette",
+            anim(lines(d, 0), "Néon arc-en-ciel"),
+            Some((Pattern::TimeWarp, 0.6)),
+        ),
+        look("Peinture", "Des taches de peinture tombent sur l'objet au rythme du son", d, Some((Pattern::Paint, 1.0))),
+        look("Lave", "Des bulles de couleur glissent sur l'objet", lines(d, 1), Some((Pattern::Lava, 0.5))),
+        look("Plasma", "Des ondes de couleur traversent l'objet", d, Some((Pattern::Plasma, 0.45))),
+    ]
+}
+
+#[cfg(test)]
+mod object_look_tests {
+    use super::*;
+
+    #[test]
+    fn every_look_but_the_plain_one_changes_something() {
+        let looks = object_looks();
+        assert_eq!(looks[0].effects, Effects::default());
+        for l in &looks[1..] {
+            assert!(l.effects != Effects::default() || l.visual.is_some(), "« {} » ne fait rien", l.name);
+        }
+    }
+}

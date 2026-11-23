@@ -41,10 +41,17 @@ pub enum Pattern {
     SphereField,
     Pillars,
     Rings,
+    // Simulation (garde son état d'une image à l'autre)
+    Paint,
+    // Scène 3D pilotée en direct (voir `road`)
+    Road,
+    TimeWarp,
+    // Tête en 3D animée par l'application (voir `face`)
+    Face,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 31] = [
+    pub const ALL: [Pattern; 35] = [
         Pattern::Off,
         Pattern::Plasma,
         Pattern::Spiral,
@@ -76,6 +83,10 @@ impl Pattern {
         Pattern::SphereField,
         Pattern::Pillars,
         Pattern::Rings,
+        Pattern::Paint,
+        Pattern::Road,
+        Pattern::TimeWarp,
+        Pattern::Face,
     ];
 
     pub fn label(self) -> &'static str {
@@ -111,6 +122,10 @@ impl Pattern {
             Pattern::SphereField => "Sphères infinies",
             Pattern::Pillars => "Colonnes torsadées",
             Pattern::Rings => "Anneaux 3D",
+            Pattern::Paint => "Taches de peinture",
+            Pattern::Road => "Route cartoon",
+            Pattern::TimeWarp => "Voyage temporel",
+            Pattern::Face => "Visage qui parle",
         }
     }
 
@@ -147,6 +162,23 @@ impl Pattern {
             Pattern::SphereField => "Vol au milieu de sphères qui ondulent",
             Pattern::Pillars => "Vol entre des piliers qui se tordent",
             Pattern::Rings => "Anneaux imbriqués qui tournent comme un gyroscope",
+            Pattern::Paint => {
+                "Gouttes et taches de peinture qui tombent au rythme du son et se mélangent \
+                 (temps et basses = grosses taches, aigus = éclaboussures fines, volume = remous)"
+            }
+            Pattern::Road => {
+                "Voyage en voiture sur une route de dessin animé psychédélique : virages, bosses, météo, \
+                 éclairs, voiture et décor se pilotent en direct (Visuels › Route)"
+            }
+            Pattern::TimeWarp => {
+                "Vortex du temps d'où jaillissent des horloges affolées et des compteurs d'années \
+                 (vitesse négative = on remonte le temps, Détail = nombre d'horloges)"
+            }
+            Pattern::Face => {
+                "Tête en 3D qui parle, cligne des yeux et regarde autour d'elle, à projeter sur une tête de \
+                 mannequin ou une boule de cristal : âge, genre, cheveux, expression et parole se règlent \
+                 dans Visuels › Visage"
+            }
         }
     }
 }
@@ -233,6 +265,10 @@ pub struct Generator {
     /// Durée d'un motif en mode auto, et du fondu vers le suivant, en secondes.
     pub interval: f32,
     pub transition: f32,
+    /// Réglages du visuel « Route cartoon ».
+    pub road: crate::road::RoadSettings,
+    /// Réglages du visuel « Visage qui parle ».
+    pub face: crate::face::FaceSettings,
 }
 
 impl Default for Generator {
@@ -249,6 +285,8 @@ impl Default for Generator {
             auto: false,
             interval: 15.0,
             transition: 3.0,
+            road: Default::default(),
+            face: Default::default(),
         }
     }
 }
@@ -256,5 +294,12 @@ impl Default for Generator {
 impl Generator {
     pub fn is_active(&self) -> bool {
         self.pattern != Pattern::Off
+    }
+}
+
+impl Pattern {
+    /// Visuels 3D (lancer de rayons), calculés en plus basse définition.
+    pub fn is_3d(self) -> bool {
+        (Pattern::Mandelbulb as i32..=Pattern::Rings as i32).contains(&(self as i32))
     }
 }

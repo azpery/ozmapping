@@ -46,11 +46,39 @@ pub(super) fn cpu_gauge(ui: &mut egui::Ui, stats: CpuStats) {
     ui.label(egui::RichText::new(ic::CPU).size(16.0).color(color));
 }
 
+/// Place prévue pour la case de valeur d'un slider (« 30 % », « 12 temps »…).
+const SLIDER_VALUE_W: f32 = 64.0;
+/// Barre de slider la plus courte qu'on s'autorise.
+const SLIDER_MIN_W: f32 = 40.0;
+
+/// Raccourcit la barre des sliders de `ui` pour que barre + valeur + `label` + `extra`
+/// tiennent dans la largeur disponible (le libellé d'un slider ne passe jamais à la ligne).
+fn fit_slider_width(ui: &mut egui::Ui, label: &str, extra: f32) {
+    let label_w = egui::WidgetText::from(label)
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+        .size()
+        .x;
+    let gap = ui.spacing().item_spacing.x;
+    let room = ui.available_width() - label_w - SLIDER_VALUE_W - 2.0 * gap - extra;
+    let s = ui.spacing_mut();
+    s.slider_width = room.clamp(SLIDER_MIN_W, s.slider_width.max(SLIDER_MIN_W));
+}
+
+/// Slider avec libellé dont la barre s'adapte à la largeur du panneau.
+pub(super) fn fit_slider(ui: &mut egui::Ui, label: &str, slider: egui::Slider<'_>) -> egui::Response {
+    ui.scope(|ui| {
+        fit_slider_width(ui, label, 0.0);
+        ui.add(slider.text(label))
+    })
+    .inner
+}
+
 /// Slider de pourcentage (valeur stockée entre 0 et 1).
 pub(super) fn percent_slider(ui: &mut egui::Ui, value: &mut f32, label: &str) -> egui::Response {
-    ui.add(
+    fit_slider(
+        ui,
+        label,
         egui::Slider::new(value, 0.0..=1.0)
-            .text(label)
             .custom_formatter(|v, _| format!("{:.0} %", v * 100.0))
             .custom_parser(|s| s.trim().trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)),
     )
@@ -59,6 +87,8 @@ pub(super) fn percent_slider(ui: &mut egui::Ui, value: &mut f32, label: &str) ->
 /// Slider d'effet avec bouton de remise à zéro. Renvoie true si l'utilisateur l'a modifié.
 pub(super) fn fx_slider(ui: &mut egui::Ui, label: &str, value: &mut f32, range: std::ops::RangeInclusive<f32>, default: f32) -> bool {
     ui.horizontal(|ui| {
+        // Place gardée pour le bouton de réinitialisation.
+        fit_slider_width(ui, label, 28.0);
         // Clamping « Edits » : le slider ne réécrit pas la valeur tant qu'on n'y touche pas
         // (sinon il l'arrondit à chaque image et interrompt les transitions de preset).
         let mut changed = ui

@@ -277,6 +277,54 @@ impl OzApp {
         // Rythme : réactions sur les temps.
         let pulse = self.rhythm.update(self.clock());
         let rhythm_on = self.rhythm.active();
+
+        // Taches de peinture : gouttes de cette image, d'après le son.
+        let mut seed = self.next_random();
+        let mut rand = move || {
+            // xorshift64 : rapide, suffisant pour placer des gouttes.
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / (1u64 << 24) as f32
+        };
+        for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
+            if rt.gen_shown.0 != Pattern::Paint && rt.gen_from.0 != Pattern::Paint {
+                rt.paint = Default::default();
+                continue;
+            }
+            let g = &cfg.generator;
+            let look = crate::paint::Look {
+                palette: rt.gen_shown.1,
+                hue: g.hue + rt.gen_hue,
+                scale: g.scale,
+                detail: g.detail,
+            };
+            rt.paint_draw = rt.paint.step(rhythm_on.then_some(&pulse), dt, g.speed, &look, &mut rand);
+        }
+        // Route cartoon : la route avance, la météo et les éclairs suivent.
+        for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
+            if rt.gen_shown.0 != Pattern::Road && rt.gen_from.0 != Pattern::Road {
+                continue;
+            }
+            let g = &cfg.generator;
+            rt.road_draw = rt.road.step(&g.road, dt, g.speed, g.detail, rhythm_on && pulse.beat, &mut rand);
+        }
+        // Visage qui parle : la bouche articule (seule ou d'après le son), les yeux clignent.
+        for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
+            if rt.gen_shown.0 != Pattern::Face && rt.gen_from.0 != Pattern::Face {
+                continue;
+            }
+            let g = &cfg.generator;
+            rt.face_draw = rt.speaker.step(&g.face, dt, g.speed, rhythm_on.then_some(pulse.level), &mut rand);
+            // Photo plaquée : chargée quand le fichier choisi change.
+            if rt.face_photo.as_ref().map(|(p, _)| p) != cfg.face_photo.as_ref() {
+                rt.face_photo = cfg.face_photo.clone().map(|p| {
+                    let photo = crate::face::FacePhoto::load(&p).map_err(|e| eprintln!("photo du visage : {e:#}")).ok();
+                    (p, photo)
+                });
+            }
+            rt.face_draw.photo = rt.face_photo.as_ref().and_then(|(_, p)| p.as_ref()).map_or(0, |p| p.key);
+        }
         let counts_beats = self.rhythm.source != rhythm::Source::Manual;
         for i in 0..self.layers.len() {
             let (react, auto_on, mix_on) = {
@@ -423,7 +471,11 @@ impl OzApp {
                     scale: cfg.generator.scale,
                     detail: cfg.generator.detail,
                     aspect,
+                    paint: rt.paint_draw,
+                    road: rt.road_draw,
+                    face: rt.face_draw,
                 },
+                face_photo: rt.face_photo.as_ref().and_then(|(_, p)| p.clone()).filter(|_| rt.face_draw.photo != 0),
                 // Destruction : réglage manuel, boucle ou « Casser ! », le plus avancé des trois.
                 shatter: effects
                     .shatter_amount

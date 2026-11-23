@@ -38,6 +38,8 @@ pub struct LayerConfig {
     pub react: React,
     /// Visuel généré (utilisable sans vidéo).
     pub generator: Generator,
+    /// Photo plaquée sur le visuel « Visage qui parle » (le visage de quelqu'un, vu de face).
+    pub face_photo: Option<PathBuf>,
     pub warp: Warp,
     pub mask: Mask,
     /// Vidéo chargée sur ce calque (relancée à l'ouverture du projet).
@@ -127,6 +129,7 @@ impl Default for LayerConfig {
             mix: AutoMix::default(),
             react: React::default(),
             generator: Generator::default(),
+            face_photo: None,
             warp: Warp::default(),
             mask: Mask::default(),
             clip: None,
@@ -152,6 +155,8 @@ pub struct Project {
     /// Nombre de colonnes du tableau.
     pub columns: usize,
     pub chain: Chain,
+    /// LEDs pilotées par des contrôleurs WLED (installation modélisée en 3D).
+    pub leds: crate::leds::LedSetup,
 }
 
 impl Default for Project {
@@ -168,6 +173,7 @@ impl Default for Project {
             master: 1.0,
             columns: 8,
             chain: Chain::default(),
+            leds: crate::leds::LedSetup::default(),
         }
     }
 }
@@ -217,6 +223,7 @@ impl Project {
             self.layers.push(LayerConfig::default());
         }
         self.columns = self.columns.clamp(1, MAX_COLUMNS);
+        self.leds.sanitize();
         for l in &mut self.layers {
             l.warp.sanitize();
             l.mask.sanitize();

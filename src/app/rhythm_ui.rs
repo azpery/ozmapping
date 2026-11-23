@@ -168,9 +168,10 @@ impl OzApp {
             percent_slider(ui, &mut react.shake, "Secousse RVB").on_hover_text("Décalage des couleurs sur les temps et les aigus");
             percent_slider(ui, &mut react.drive, "Suit le volume")
                 .on_hover_text("Ondes, liquide, tourbillon et saturation s'amplifient avec le volume (avec le tempo : sur les temps)");
-            ui.add(
+            fit_slider(
+                ui,
+                "Saut de teinte",
                 egui::Slider::new(&mut react.hue, 0.0..=0.5)
-                    .text("Saut de teinte")
                     .custom_formatter(|v, _| format!("{:.0}°", v * 360.0)),
             )
             .on_hover_text("La teinte tourne d'autant à chaque temps");
@@ -180,18 +181,19 @@ impl OzApp {
             percent_slider(ui, &mut react.glitch, "Glitch").on_hover_text("L'image se casse en pixels sur chaque temps");
             percent_slider(ui, &mut react.shock, "Onde de choc").on_hover_text("Ondulation qui part sur chaque temps");
             percent_slider(ui, &mut react.kaleido, "Kaléido").on_hover_text("Le kaléidoscope s'ouvre sur chaque temps");
-            ui.add(
+            fit_slider(
+                ui,
+                "Rotation par temps",
                 egui::Slider::new(&mut react.spin, 0.0..=1.0)
-                    .text("Rotation par temps")
                     .custom_formatter(|v, _| format!("{:.0}°", v * 90.0)),
             )
             .on_hover_text("L'image tourne d'autant à chaque temps, en glissant");
             ui.checkbox(&mut react.flip, "Miroir un temps sur deux");
             ui.add_space(4.0);
             ui.label(egui::RichText::new("Enchaînements sur les temps (0 = désactivé)").small().color(TEXT_WEAK));
-            ui.add(egui::Slider::new(&mut react.auto_beats, 0..=32).text("AUTO : effet suivant tous les").suffix(" temps"))
+            fit_slider(ui, "Effet AUTO tous les", egui::Slider::new(&mut react.auto_beats, 0..=32).suffix(" temps"))
                 .on_hover_text("Remplace l'intervalle en secondes du mode AUTO (onglet Effets)");
-            ui.add(egui::Slider::new(&mut react.mix_beats, 0..=32).text("Mix auto : coupe tous les").suffix(" temps"))
+            fit_slider(ui, "Coupe du mix tous les", egui::Slider::new(&mut react.mix_beats, 0..=32).suffix(" temps"))
                 .on_hover_text("Remplace les durées de séquence du mix auto (onglet Mix)");
         });
         if self.rhythm.source == rhythm::Source::Manual {

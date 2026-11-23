@@ -126,6 +126,7 @@ impl OzApp {
                 WARN,
             );
         }
+        self.leds_overlay(&painter, rect);
         self.shape_editor(ui, rect, "preview");
     }
 

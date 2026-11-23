@@ -11,7 +11,10 @@ use eframe::egui_glow;
 use eframe::glow::{self, HasContext as _};
 
 use crate::effects::{BlendMode, Effects};
+use crate::face_mesh::FaceRenderer;
 use crate::generator::{Palette, Pattern};
+use crate::paint::{MAX_DROPS, PaintDraw};
+use crate::road::RoadDraw;
 use crate::surface::Fit;
 use crate::video::FrameSlot;
 
@@ -30,6 +33,8 @@ pub struct LayerDraw {
     pub mix: f32,
     /// Maillage de la surface déformée : [x, y, u, v] par sommet (voir `Warp::mesh`).
     pub mesh: Arc<Vec<f32>>,
+    /// Photo plaquée sur le visuel « Visage qui parle » (voir `FaceDraw::photo`).
+    pub face_photo: Option<crate::face::FacePhoto>,
     pub mask: Option<MaskDraw>,
     /// Champ de forme du masque, seulement si une animation de forme est utilisée.
     pub shape: Option<ShapeDraw>,
@@ -68,11 +73,27 @@ pub struct GenDraw {
     pub detail: f32,
     /// Largeur / hauteur du motif (celles de la sortie, pour des cercles ronds).
     pub aspect: f32,
+    /// Taches de peinture : gouttes de l'image et pas de simulation.
+    pub paint: PaintDraw,
+    /// Route cartoon : la route devant la caméra, la météo, la voiture.
+    pub road: RoadDraw,
+    /// Visage qui parle : le personnage et son animation.
+    pub face: crate::face::FaceDraw,
 }
 
 impl GenDraw {
     pub fn is_active(&self) -> bool {
         self.from != Pattern::Off || self.to != Pattern::Off
+    }
+
+    /// Le visuel « Taches de peinture » est affiché (seul ou pendant un fondu).
+    pub fn uses_paint(&self) -> bool {
+        self.from == Pattern::Paint || self.to == Pattern::Paint
+    }
+
+    /// Le visuel « Visage qui parle » est affiché (seul ou pendant un fondu).
+    pub fn uses_face(&self) -> bool {
+        self.from == Pattern::Face || self.to == Pattern::Face
     }
 }
 
@@ -214,13 +235,36 @@ struct GenTarget {
     last: Option<GenDraw>,
 }
 
+/// État de la simulation de peinture d'un calque : deux jeux de textures, l'image précédente
+/// est lue pendant qu'on écrit la suivante. Peinture = K/S des pigments × épaisseur (rgb) et
+/// épaisseur (a) ; eau = humidité (r).
+struct PaintSim {
+    fbo: [glow::Framebuffer; 2],
+    paint: [glow::Texture; 2],
+    water: [glow::Texture; 2],
+    size: (u32, u32),
+    /// Jeu qui contient l'état courant.
+    cur: usize,
+    /// Dernière image simulée (voir `PaintDraw::frame`), et temps de simulation cumulé.
+    frame: u64,
+    time: f32,
+}
+
 pub struct Renderer {
     program: glow::Program,
     /// Programme des visuels générés (même source, compilée avec GEN_PASS).
     gen_program: glow::Program,
     gen_targets: HashMap<usize, GenTarget>,
+    /// Simulation des taches de peinture (programme, état par calque).
+    paint_program: glow::Program,
+    paint_sims: HashMap<usize, PaintSim>,
+    /// Tête du visuel « Visage qui parle », créée au premier usage (ou l'erreur qui l'a empêché).
+    face: Option<FaceRenderer>,
+    face_error: Option<String>,
     /// Cible hors écran de l'enregistrement vidéo.
     capture_target: Option<GenTarget>,
+    /// Cible hors écran des LEDs (petite image lue à chaque rendu).
+    led_target: Option<GenTarget>,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     black: glow::Texture,
@@ -239,6 +283,208 @@ void main() {
     v_pos = a_pos;
     v_uv = a_uv;
     gl_Position = vec4(a_pos.x * 2.0 - 1.0, 1.0 - a_pos.y * 2.0, 0.0, 1.0);
+}
+"#;
+
+/// Simulation des taches de peinture, une étape par image. Lit l'état précédent (peinture et
+/// eau), écrit le suivant : remous et coulures de la peinture fraîche, diffusion de l'eau dans
+/// les fibres du papier (le pigment suit), auréole (le pigment file vers les bords qui sèchent),
+/// séchage, effacement très lent, puis les gouttes de l'image.
+const PAINT_SIM_SHADER: &str = r#"
+precision highp float;
+layout(location = 0) out vec4 o_paint;
+layout(location = 1) out vec4 o_water;
+
+uniform sampler2D u_paint;
+uniform sampler2D u_water;
+uniform vec2 u_texel;
+uniform float u_aspect;
+uniform float u_dt;
+uniform float u_time;
+uniform float u_flow;
+uniform int u_count;
+uniform vec4 u_drop_a[16]; // centre (x, y), rayon, graine
+uniform vec4 u_drop_b[16]; // K/S du pigment (rgb), quantité
+uniform float u_drop_s[16]; // éclaboussures
+uniform int u_imp_count;
+uniform vec4 u_imp[8]; // impacts récents : centre (x, y), rayon, âge (s)
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+vec2 hash2(vec2 p) {
+    return fract(sin(vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)))) * 43758.5453);
+}
+float noise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x), u.y);
+}
+float potential(vec2 p, float t) {
+    return noise(p + vec2(t * 0.07, -t * 0.05)) + 0.5 * noise(p * 2.1 + vec2(-t * 0.11, t * 0.09) + 7.3);
+}
+
+// Union douce de deux distances signées (cou arrondi entre le corps et les doigts).
+float smin(float a, float b, float k) {
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    return mix(b, a, h) - k * h * (1.0 - h);
+}
+// Distance signée à un doigt effilé : segment de a à b, rayon ra au départ, rb au bout.
+float taper(vec2 p, vec2 a, vec2 b, float ra, float rb) {
+    vec2 pa = p - a, ba = b - a;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h) - mix(ra, rb, h);
+}
+
+// Goutte au point d (centré, en hauteurs d'image). x = présence (0..1), y = bombé (0..1),
+// z = eau apportée (les gouttelettes projetées sont peu mouillées : elles ne s'étalent pas).
+// Forme d'un vrai impact : corps aux bords en lobes, couronne de doigts effilés terminés par
+// un bourrelet, gouttelettes projetées plus loin. La chute est un peu oblique : la tache
+// s'allonge et éclabousse surtout vers l'avant.
+vec3 drop_shape(vec2 d, float r, float seed, float splatter) {
+    if (length(d) > r * 5.0 + 0.01) return vec3(0.0);
+    float aa = u_texel.y * 0.75;
+    vec2 hs = hash2(vec2(seed * 0.37, 5.1));
+    float phi = hs.x * 6.2831853;
+    float ob = hs.y * hs.y; // 0 = chute verticale, 1 = très oblique
+    vec2 fw = vec2(cos(phi), sin(phi));
+    vec2 q = vec2(dot(d, fw), dot(d, vec2(-fw.y, fw.x))); // repère de la goutte : +x = avant
+
+    // Corps : ellipse poussée vers l'avant ; bord lu sur un cercle (pas de couture à ±π).
+    vec2 qb = vec2((q.x - r * 0.2 * ob) / (1.0 + 0.4 * ob), q.y);
+    float lb = length(qb);
+    vec2 dir = qb / max(lb, 1e-5);
+    float wob = 1.0 + 0.3 * (noise(dir * 1.6 + seed) - 0.5) + 0.12 * (noise(dir * 5.0 + seed * 1.7) - 0.5)
+        + 0.04 * (noise(dir * 15.0 + seed * 3.1) - 0.5);
+    float body = lb - r * wob;
+
+    // Couronne : doigts effilés, plus longs vers l'avant, avec un bourrelet au bout.
+    int nf = int(5.0 + 11.0 * splatter);
+    for (int j = 0; j < 16; j++) {
+        if (j >= nf) break;
+        vec2 h = hash2(vec2(seed + 1.7, float(j) * 2.13));
+        float ang = (float(j) + 0.7 * h.x) / float(nf) * 6.2831853;
+        vec2 dj = vec2(cos(ang), sin(ang));
+        float len = r * splatter * (0.15 + 0.85 * h.y * h.y) * (1.0 + 1.3 * ob * max(dj.x, 0.0));
+        if (len < r * 0.06) continue;
+        vec2 a = dj * r * 0.7;
+        vec2 b = dj * (r * 0.95 + len);
+        float tip = r * (0.04 + 0.05 * h.x);
+        float f = min(taper(q, a, b, r * 0.14, r * 0.025), length(q - b) - tip);
+        body = smin(body, f, r * 0.08);
+    }
+
+    // Gouttelettes projetées, étirées en traînées dans le sens de la projection.
+    float sat = 1e5;
+    float sat_depth = 0.0;
+    int ns = int(splatter * 26.0);
+    for (int j = 0; j < 26; j++) {
+        if (j >= ns) break;
+        vec2 h = hash2(vec2(seed, float(j) * 1.37));
+        float h3 = hash(vec2(float(j) * 3.1, seed * 0.7));
+        float ang = (h.x - 0.5) * 6.2831853 * (1.0 - 0.55 * ob);
+        vec2 dj = vec2(cos(ang), sin(ang));
+        float dist = r * (1.35 + 2.7 * h.y * h.y) * (1.0 + 0.7 * ob * max(dj.x, 0.0));
+        float rs = r * (0.02 + 0.07 * h3 * h3) * (1.3 - 0.6 * h.y);
+        vec2 p = q - dj * dist;
+        vec2 l = vec2(dot(p, dj) / (1.0 + 2.5 * h.y * h3), dot(p, vec2(-dj.y, dj.x)));
+        float ds = length(l) - rs;
+        if (ds < sat) {
+            sat = ds;
+            sat_depth = clamp(-ds / rs, 0.0, 1.0);
+        }
+    }
+
+    // Bord net (la peinture a une tranche) ; bombé selon la profondeur sous le bord : les
+    // doigts fins sont plus minces que le corps.
+    float sd = min(body, sat);
+    float m = 1.0 - smoothstep(-aa, aa, sd);
+    if (m <= 0.0) return vec3(0.0);
+    if (body <= sat) {
+        float k = clamp(-body / (r * 0.5), 0.0, 1.0);
+        return vec3(m, sqrt(k * (2.0 - k)), m);
+    }
+    return vec3(m, 0.7 * sqrt(sat_depth * (2.0 - sat_depth)), m * 0.45);
+}
+
+void main() {
+    vec2 tc = gl_FragCoord.xy * u_texel;
+    vec2 asp = vec2(u_aspect, 1.0);
+    // Pas de diffusion relatif à 60 images/s (borné pour rester stable).
+    float k = clamp(u_dt * 60.0, 0.0, 3.0);
+    float w0 = texture(u_water, tc).r;
+
+    // Pente de l'eau (auréole) et remous sans divergence (rotationnel d'un bruit).
+    float wx = texture(u_water, tc + vec2(u_texel.x, 0.0)).r - texture(u_water, tc - vec2(u_texel.x, 0.0)).r;
+    float wy = texture(u_water, tc + vec2(0.0, u_texel.y)).r - texture(u_water, tc - vec2(0.0, u_texel.y)).r;
+    vec2 p = tc * asp * 2.5;
+    float e = 0.02;
+    vec2 curl = vec2(potential(p + vec2(0.0, e), u_time) - potential(p - vec2(0.0, e), u_time),
+                     potential(p - vec2(e, 0.0), u_time) - potential(p + vec2(e, 0.0), u_time)) / (2.0 * e);
+    // Vitesses en hauteurs d'image par seconde. La peinture fraîche bouge librement ; la
+    // sèche se laisse un peu entraîner par les remous et les impacts.
+    float mobile = 0.3 + 0.7 * w0;
+    vec2 vel = curl * 0.085 * u_flow * mobile;
+    // Onde des impacts : un anneau qui s'élargit et chasse la peinture vers l'extérieur.
+    for (int i = 0; i < 8; i++) {
+        if (i >= u_imp_count) break;
+        vec4 im = u_imp[i];
+        vec2 d = (tc - im.xy) * asp;
+        float len = length(d);
+        float age = im.w;
+        float front = im.z * (1.1 + 4.5 * age);
+        float width = im.z * (0.6 + 1.5 * age);
+        float wave = exp(-pow((len - front) / width, 2.0)) * exp(-age * 5.0);
+        vel += d / max(len, 1e-4) * wave * im.z * 9.0 * mobile;
+    }
+    // Auréole et coulures : seulement la peinture mouillée.
+    vel -= vec2(wx, wy) * 0.25 * w0;
+    vel.y += 0.09 * smoothstep(0.45, 1.0, w0) * w0; // coulures (y vers le bas)
+    vec2 src = tc - vel * u_dt / asp;
+
+    vec4 pnt = texture(u_paint, src);
+    float w = texture(u_water, src).r;
+
+    // Diffusion : l'eau s'étend dans les fibres tant qu'elle est abondante, le pigment suit
+    // là où les deux côtés sont mouillés.
+    float fib = 0.5 * noise(tc * asp * vec2(90.0, 30.0)) + 0.5 * noise(tc * asp * vec2(25.0, 70.0) + 4.0);
+    float rate = min((0.3 + 0.7 * fib) * 0.2 * k, 0.24);
+    vec4 dp = vec4(0.0);
+    float dw = 0.0;
+    for (int i = 0; i < 4; i++) {
+        vec2 o = vec2(i == 0 ? 1.0 : (i == 1 ? -1.0 : 0.0), i == 2 ? 1.0 : (i == 3 ? -1.0 : 0.0));
+        vec2 tn = src + o * u_texel;
+        float wn = texture(u_water, tn).r;
+        dp += (texture(u_paint, tn) - pnt) * min(w, wn);
+        dw += (wn - w) * smoothstep(0.5, 0.95, max(w, wn));
+    }
+    pnt += dp * rate;
+    w += dw * rate * 0.35;
+
+    // Séchage ; la peinture s'efface lentement, plus vite là où elle s'accumule.
+    w *= exp(-0.5 * u_dt);
+    pnt *= exp(-(0.08 + 0.1 * max(pnt.a - 1.8, 0.0)) * u_dt);
+    if (pnt.a < 0.003) pnt = vec4(0.0);
+
+    // Gouttes de l'image. Sur de la peinture fraîche, les pigments se mélangent (moyenne des
+    // K/S, en veines comme quand on mêle deux peintures) ; sur de la peinture sèche, la
+    // nouvelle couche la recouvre, d'autant mieux qu'elle est épaisse.
+    for (int i = 0; i < 16; i++) {
+        if (i >= u_count) break;
+        vec4 a = u_drop_a[i];
+        vec4 b = u_drop_b[i];
+        vec3 sh = drop_shape((tc - a.xy) * asp, a.z, a.w, u_drop_s[i]);
+        if (sh.x <= 0.0) continue;
+        // Bombé : la goutte est plus épaisse au centre (relief et reflet de la peinture fraîche).
+        float t = b.a * sh.x * (0.55 + 0.45 * sh.y);
+        float th = pnt.a + t;
+        vec3 mixed = (pnt.rgb + b.rgb * t) / max(th, 1e-4);
+        float dry = 1.0 - smoothstep(0.15, 0.6, w);
+        float veins = smoothstep(0.3, 0.7, noise(tc * asp * 34.0 + a.w * 3.7));
+        float cover = max(dry * (1.0 - exp(-3.0 * t)), (1.0 - dry) * 0.55 * veins);
+        pnt = vec4(mix(mixed, b.rgb, cover) * th, th);
+        w = max(w, sh.z);
+    }
+    o_paint = max(pnt, vec4(0.0));
+    o_water = vec4(clamp(w, 0.0, 1.0), 0.0, 0.0, 1.0);
 }
 "#;
 
@@ -397,6 +643,10 @@ uniform float u_gen_detail;
 uniform float u_gen_aspect;
 uniform vec3 u_pal_a[4];
 uniform vec3 u_pal_b[4];
+// Taches de peinture : état de la simulation (voir PAINT_SIM_SHADER).
+uniform sampler2D u_paint_tex;
+uniform sampler2D u_water_tex;
+uniform vec2 u_paint_texel;
 
 const float PI = 3.14159265359;
 
@@ -581,7 +831,7 @@ float fbm(vec2 p) {
 vec2 march3d(int kind, vec2 p, float t); // visuels 3D, plus bas
 
 vec2 pattern(int kind, vec2 p, float t) {
-    if (kind >= 23) return march3d(kind, p, t);
+    if (kind >= 23 && kind <= 30) return march3d(kind, p, t);
     float d = u_gen_detail;
     float r = length(p);
     float a = atan(p.y, p.x);
@@ -1123,10 +1373,670 @@ vec3 palette(vec3 pal[4], float x) {
     return clamp(pal[0] + pal[1] * cos(2.0 * PI * (pal[2] * x + pal[3])), 0.0, 1.0);
 }
 
-vec3 generate(int kind, vec3 pal[4], vec2 uv) {
+// Hauteur de la peinture : épaisseur, plus le bombé de la peinture encore mouillée.
+float paint_height(vec2 uv) {
+    return texture(u_paint_tex, uv).a + texture(u_water_tex, uv).r * 0.6;
+}
+
+// Taches de peinture : rendu de la simulation. Couleur des pigments mélangés (Kubelka-Munk),
+// grain du papier, auréole au bord des taches, relief, reflet de l'atelier dans la peinture
+// fraîche, satiné une fois sèche, et ombre portée des couches épaisses.
+// Renvoie une couleur prémultipliée : hors des taches, on voit ce qu'il y a dessous.
+vec4 paint_display(vec2 uv) {
+    vec2 tx = u_paint_texel;
+    vec3 light = normalize(vec3(-0.5, -0.6, 1.0)); // en haut à gauche (y vers le bas)
+    vec4 s = texture(u_paint_tex, uv);
+    float th = s.a;
+    // Ombre portée : la peinture plus épaisse côté lumière fait de l'ombre, sur la peinture
+    // comme sur ce qu'il y a dessous.
+    vec2 ld = normalize(light.xy) * tx;
+    float occ = 0.0;
+    for (int i = 1; i <= 4; i++) {
+        float f = float(i) * 1.5;
+        occ = max(occ, texture(u_paint_tex, uv + ld * f).a - th - f * 0.2);
+    }
+    float shadow = clamp(occ * 0.5, 0.0, 0.3);
+    if (th < 0.002) return vec4(0.0, 0.0, 0.0, shadow);
+
+    float wet = texture(u_water_tex, uv).r;
+    // Grain du papier, à la définition de la sortie (la simulation est plus grossière).
+    vec2 gp = uv * vec2(u_gen_aspect, 1.0);
+    float grain = noise(gp * 520.0) * 0.45 + noise(gp * 190.0 + 3.1) * 0.35 + noise(gp * 55.0 + 7.7) * 0.2;
+    float fib = noise(gp * vec2(1400.0, 160.0) + 1.3);
+    grain = mix(grain, fib, 0.25);
+    // Bord net, opacité selon l'épaisseur ; les couches fines laissent voir le grain du papier
+    // (le pigment se dépose dans les creux).
+    float edge = smoothstep(0.015, 0.06, th);
+    float thin = exp(-th * 1.5);
+    float alpha = edge * (1.0 - exp(-th * 3.0)) * mix(1.0, 0.6 + 0.55 * grain, thin);
+
+    // Couleur : K/S moyen des pigments, repassé en réflectance (Kubelka-Munk).
+    vec3 ks = s.rgb / max(th, 1e-3);
+    float blur = 0.0;
+    for (int i = 0; i < 4; i++) {
+        vec2 o = vec2(i == 0 ? 1.0 : (i == 1 ? -1.0 : 0.0), i == 2 ? 1.0 : (i == 3 ? -1.0 : 0.0));
+        blur += texture(u_paint_tex, uv + o * tx * 3.5).a;
+    }
+    blur *= 0.25;
+    // Auréole : le pigment s'est concentré juste à l'intérieur du bord.
+    float ring = clamp((th - blur) * 0.9, 0.0, 0.6);
+    ks *= 1.0 + ring * 1.2;
+    // Couche épaisse : couleur plus dense.
+    ks *= mix(1.0, 1.3, smoothstep(1.5, 5.0, th));
+    vec3 body = 1.0 + ks - sqrt(ks * ks + 2.0 * ks);
+
+    // Relief (y vers le bas) : pente de la hauteur, à deux échelles (bord net, bombé doux).
+    vec2 g = vec2(0.0);
+    for (int i = 0; i < 2; i++) {
+        float e = i == 0 ? 1.0 : 2.5;
+        vec2 dx = vec2(tx.x * e, 0.0), dy = vec2(0.0, tx.y * e);
+        g += vec2(paint_height(uv + dx) - paint_height(uv - dx), paint_height(uv + dy) - paint_height(uv - dy)) / e;
+    }
+    // Peinture sèche : la surface prend la texture du papier ; fraîche, elle reste lisse.
+    float rough = mix(0.25, 0.02, smoothstep(0.05, 0.5, wet));
+    g = g * 1.1 + (vec2(noise(gp * 260.0), noise(gp * 260.0 + 9.0)) - 0.5) * rough;
+    vec3 n = normalize(vec3(-g, 1.0));
+    float diff = dot(n, light) / light.z;
+    // Occlusion : les creux entre les couches reçoivent moins de lumière.
+    float cav = clamp((blur - th) * 0.35, 0.0, 0.25);
+    vec3 col = body * clamp(0.72 + 0.3 * diff, 0.0, 1.35) * (1.0 - cav) * (1.0 - shadow * 0.8) * (0.95 + 0.05 * grain);
+
+    // Reflets. Fraîche : la peinture est un miroir bombé où se reflète la fenêtre de l'atelier
+    // (rectangle net) et un halo autour, plus fort en incidence rasante (Fresnel).
+    // Sèche : satiné, un reflet large et faible.
+    vec3 r = reflect(vec3(0.0, 0.0, -1.0), n);
+    vec2 o = r.xy / max(r.z, 0.05) - light.xy / light.z;
+    float window = (1.0 - smoothstep(0.09, 0.12, abs(o.x))) * (1.0 - smoothstep(0.14, 0.17, abs(o.y)));
+    float halo = exp(-dot(o, o) * 6.0);
+    float fres = 0.04 + 0.96 * pow(1.0 - clamp(n.z, 0.0, 1.0), 5.0);
+    float wet_spec = (window * 0.85 + halo * 0.18) * (0.7 + 0.6 * fres);
+    vec3 h = normalize(light + vec3(0.0, 0.0, 1.0));
+    float dry_spec = pow(max(dot(n, h), 0.0), 10.0) * 0.06;
+    float gloss = smoothstep(0.05, 0.6, wet);
+    float spec = mix(dry_spec, wet_spec, gloss) * (1.0 - shadow);
+
+    // La peinture couvre `alpha` ; autour, l'ombre portée assombrit ce qu'il y a dessous.
+    float cover = alpha + (1.0 - alpha) * shadow;
+    return vec4(col * alpha + vec3(spec) * edge, cover);
+}
+
+// ------------------------------------------------------------ Route cartoon
+// Une route en 3D vue depuis la voiture. Le tracé vient de l'application (voir road.rs) :
+// décalage latéral et hauteur de la route tous les ROAD_STEP devant la caméra.
+#define ROAD_N 96
+uniform vec4 u_road_pts[ROAD_N];
+uniform vec4 u_road_a; // distance parcourue, cap, braquage, inclinaison
+uniform vec4 u_road_b; // nuages, pluie, lumière du jour, brouillard
+uniform vec4 u_road_c; // éclair, graine de l'éclair, collines, délire
+uniform vec4 u_road_d; // voiture, couleur de la voiture, décor, densité du décor
+uniform vec4 u_road_e; // position de l'éclair, plafond du relief
+
+const float ROAD_STEP = 3.0;
+const float ROAD_W = 4.5;      // demi-largeur de la chaussée
+const float ROAD_FAR = 280.0;  // distance d'affichage
+const float ROAD_CAM = 2.4;    // hauteur de la caméra
+const float ROAD_FOC = 1.25;   // focale
+const float ROAD_HILL = 38.0;  // hauteur des collines à fond
+const float ROAD_PERIOD = 8192.0;
+const vec3 ROAD_INK = vec3(0.05, 0.02, 0.10);
+const vec3 ROAD_NIGHT = vec3(0.16, 0.14, 0.36);
+
+// Centre (x) et hauteur (y) de la route à la distance z devant la caméra.
+vec2 road_at(float z) {
+    float f = clamp(z / ROAD_STEP, 0.0, float(ROAD_N) - 1.001);
+    int i = int(f);
+    return mix(u_road_pts[i].xy, u_road_pts[i + 1].xy, f - float(i));
+}
+
+// Bruit lisse qui se répète le long de la route (la distance repart de zéro tous les 8192).
+float road_noise(vec2 p, float period) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float y0 = mod(i.y, period), y1 = mod(i.y + 1.0, period);
+    return mix(mix(hash(vec2(i.x, y0)), hash(vec2(i.x + 1.0, y0)), f.x),
+               mix(hash(vec2(i.x, y1)), hash(vec2(i.x + 1.0, y1)), f.x), f.y);
+}
+
+// Hauteur du sol à `u` du centre de la route, à la distance parcourue `s` (yr = hauteur de la route).
+float road_ground(float u, float s, float yr) {
+    float side = smoothstep(ROAD_W + 5.0, ROAD_W + 70.0, abs(u));
+    float n = road_noise(vec2(u, s) / 64.0, 128.0) * 0.75 + road_noise(vec2(u + 300.0, s) / 16.0, 512.0) * 0.25;
+    return yr + u_road_c.z * ROAD_HILL * side * max(n - 0.12, 0.0);
+}
+
+float road_box(vec2 p, vec2 b, float r) {
+    vec2 q = abs(p) - b + r;
+    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+float road_seg(vec2 p, vec2 a, vec2 b) {
+    vec2 pa = p - a, ba = b - a;
+    return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0));
+}
+// Aplat de couleur cerné d'un trait d'encre, par-dessus `acc` (alpha = couverture).
+void road_layer(inout vec4 acc, float d, vec3 fill, float line, float aa) {
+    float o = smoothstep(aa, 0.0, d - line);
+    acc.rgb = mix(acc.rgb, ROAD_INK, o);
+    acc.a = max(acc.a, o);
+    acc.rgb = mix(acc.rgb, fill, smoothstep(aa, 0.0, d));
+}
+
+// Dégradé du ciel en bandes (h = hauteur au-dessus de l'horizon), sans astres ni nuages.
+vec3 road_sky_base(vec3 pal[4], float x, float h, float t) {
+    float psy = u_road_c.w;
+    float wob = (sin(x * 5.0 + t * 0.7) * 0.02 + sin(x * 11.0 - t * 1.1) * 0.01) * psy;
+    float band = floor(max(h + wob, 0.0) * 9.0) / 9.0;
+    vec3 c = palette(pal, 0.58 + band * 0.45 + u_gen_hue + sin(t * 0.13) * 0.08 * psy);
+    vec3 day = c * 0.82 + 0.18;
+    vec3 night = c * vec3(0.10, 0.09, 0.26) + vec3(0.01, 0.0, 0.05);
+    vec3 col = mix(night, day, u_road_b.z);
+    // Temps couvert : plus gris, plus sombre.
+    float gloom = u_road_b.x * (0.12 + 0.25 * u_road_b.y);
+    return mix(col, vec3(dot(col, vec3(0.3, 0.6, 0.1))) * 0.6, gloom);
+}
+
+vec3 road_sky(vec3 pal[4], vec2 sp, float t) {
+    float day = u_road_b.z, clouds = u_road_b.x, psy = u_road_c.w, flash = u_road_c.x;
+    float h = sp.y;
+    float aa = 1.5 / 720.0;
+    // Le ciel défile quand la route tourne.
+    float pan = sp.x + u_road_a.y * 1.2;
+    vec3 col = road_sky_base(pal, sp.x, h, t);
+
+    // Étoiles.
+    vec2 sg = vec2(pan, h) * 70.0;
+    vec2 sc = floor(sg);
+    float star = step(0.975, hash(sc)) * smoothstep(0.35, 0.1, length(fract(sg) - 0.5));
+    col += star * (1.0 - day) * (1.0 - clouds) * (0.6 + 0.4 * sin(t * 3.0 + hash(sc + 3.0) * 40.0));
+
+    // Soleil rayonnant (jour) ou lune (nuit), qui suit le cap.
+    float sx = mod(0.35 - u_road_a.y * 1.2 + 1.6, 3.2) - 1.6;
+    vec2 q = sp - vec2(sx, 0.30);
+    float d = length(q);
+    float seen = 1.0 - clouds * 0.85;
+    if (day > 0.5) {
+        float ang = atan(q.y, q.x);
+        float reach = 0.20 + 0.03 * sin(t * 2.0) + 0.05 * psy;
+        float ray = step(0.0, sin(ang * 14.0 + t * 0.6)) * smoothstep(reach, reach - 0.01, d);
+        vec3 ring = palette(pal, 0.12 + floor(d * 28.0 - t * 1.5 * psy) * 0.09 * psy + u_gen_hue);
+        col = mix(col, mix(vec3(1.0, 0.9, 0.3), ring, 0.5 * psy), ray * 0.55 * seen);
+        vec4 sun = vec4(col, 0.0);
+        road_layer(sun, d - 0.085, mix(vec3(1.0, 0.92, 0.35), palette(pal, 0.12 + u_gen_hue), 0.3), 0.006, aa);
+        col = mix(col, sun.rgb, sun.a * seen);
+    } else {
+        vec4 moon = vec4(col, 0.0);
+        road_layer(moon, max(d - 0.07, 0.062 - length(q - vec2(0.035, 0.02))), vec3(0.97, 0.95, 0.8), 0.005, aa);
+        col = mix(col, moon.rgb, moon.a * seen);
+        col += vec3(0.5, 0.5, 0.8) * 0.02 / (d + 0.08) * seen * (1.0 - day);
+    }
+
+    // Nuages de dessin animé : un bruit seuillé, deux tons et un trait.
+    vec2 cp = vec2(pan * 1.3 + t * 0.012, h * 3.6) * 1.6;
+    float n = fbm(cp) + smoothstep(0.0, 0.5, h) * 0.06;
+    float th = mix(0.86, 0.30, clouds);
+    if (n > th - 0.02) {
+        float gloom = u_road_b.y * 0.6 + max(clouds - 0.7, 0.0);
+        vec3 lightc = mix(vec3(1.0), vec3(0.42, 0.40, 0.52), clamp(gloom, 0.0, 1.0));
+        vec3 shadec = lightc * vec3(0.78, 0.74, 0.92);
+        vec3 cc = n > th + 0.07 ? lightc : shadec;
+        cc *= mix(ROAD_NIGHT * 1.6, vec3(1.0), day);
+        cc = mix(cc, palette(pal, n * 2.0 + u_gen_hue + t * 0.03), 0.25 * psy);
+        cc += flash * 0.5;
+        float edge = smoothstep(th - 0.02, th - 0.012, n);
+        col = mix(col, ROAD_INK, edge);
+        col = mix(col, cc, smoothstep(th - 0.004, th + 0.004, n));
+    }
+
+    // Éclair : un zigzag du haut du ciel jusqu'à l'horizon, et sa branche.
+    if (flash > 0.01) {
+        float seed = u_road_c.y;
+        float bx = u_road_e.x * 0.5 * u_gen_aspect;
+        float path = bx + (noise(vec2(h * 9.0, seed)) - 0.5) * 0.30 + (noise(vec2(h * 34.0, seed + 5.0)) - 0.5) * 0.06;
+        float bd = abs(sp.x - path);
+        float fork = path + (0.34 - h) * 0.55 * (fract(seed) < 0.5 ? -1.0 : 1.0)
+            + (noise(vec2(h * 40.0, seed + 9.0)) - 0.5) * 0.05;
+        if (h < 0.34) bd = min(bd, abs(sp.x - fork) * 1.6);
+        float core = smoothstep(0.007, 0.002, bd);
+        col += (core * vec3(1.0) + vec3(0.55, 0.45, 1.0) * 0.012 / (bd + 0.012)) * flash;
+        col += flash * 0.30;
+    }
+
+    // Montagnes lointaines : deux silhouettes en aplat.
+    for (int l = 0; l < 2; l++) {
+        float fl = float(l);
+        float k = l == 0 ? 1.0 : 1.7;
+        float mh = (0.025 + 0.15 * u_road_c.z) * (l == 0 ? 1.0 : 0.6)
+            * (noise(vec2(pan * k * 2.2 + fl * 17.0, fl)) * 0.7 + noise(vec2(pan * k * 6.5, 3.0 + fl)) * 0.3);
+        vec3 mc = palette(pal, 0.82 + fl * 0.13 + floor((mh - h) * 45.0) * 0.03 * psy + u_gen_hue) * (0.75 - 0.2 * fl);
+        mc *= mix(ROAD_NIGHT, vec3(1.0), day);
+        mc = mix(mc, road_sky_base(pal, sp.x, 0.0, t), 0.35 - 0.15 * fl);
+        mc += flash * 0.2;
+        vec4 m = vec4(col, 0.0);
+        road_layer(m, h - mh, mc, 0.003, aa);
+        col = m.rgb;
+    }
+    return col;
+}
+
+// Décor du bord de la route. q : x centré, y de 0 (pied) à 1 (sommet).
+vec4 road_prop(int kind, vec2 q, vec3 pal[4], float rnd, float aa, float t) {
+    vec4 acc = vec4(0.0);
+    float ln = 0.028;
+    vec3 c1 = palette(pal, rnd + u_gen_hue + 0.1);
+    vec3 c2 = palette(pal, rnd + u_gen_hue + 0.55);
+    // Tout se balance un peu, davantage vers le haut.
+    q.x += sin(t * 1.6 + rnd * 20.0) * 0.05 * q.y * q.y * (0.3 + u_road_c.w);
+    if (kind == 1) {
+        // Arbre : tronc et feuillage en boules.
+        road_layer(acc, road_box(q - vec2(0.0, 0.22), vec2(0.055, 0.24), 0.02), c2 * 0.55, ln, aa);
+        float crown = min(length(q - vec2(0.0, 0.68)) - 0.29, min(length(q - vec2(-0.2, 0.52)) - 0.2, length(q - vec2(0.2, 0.52)) - 0.2));
+        road_layer(acc, crown, c1 * 0.8, ln, aa);
+        road_layer(acc, length(q - vec2(-0.06, 0.74)) - 0.17, c1, 0.0, aa);
+    } else if (kind == 2) {
+        // Palmier : tronc courbe et palmes.
+        vec2 p = q - vec2(0.12 * q.y * q.y, 0.0);
+        road_layer(acc, road_box(p - vec2(0.0, 0.4), vec2(0.035, 0.42), 0.02), c2 * 0.6, ln, aa);
+        vec2 top = vec2(0.0, 0.8);
+        float leaves = 1e3;
+        for (int i = 0; i < 6; i++) {
+            float a = (float(i) - 2.5) * 0.62;
+            vec2 tip = top + vec2(sin(a) * 0.5, cos(a) * 0.22 - abs(sin(a)) * 0.22);
+            leaves = min(leaves, road_seg(p, top, tip) - 0.045 * (1.0 - 0.6 * clamp(length(p - top) / 0.5, 0.0, 1.0)));
+        }
+        road_layer(acc, leaves, c1, ln, aa);
+    } else if (kind == 3) {
+        // Champignon : pied clair, chapeau à pois.
+        road_layer(acc, road_box(q - vec2(0.0, 0.26), vec2(0.10, 0.28), 0.08), vec3(0.97, 0.92, 0.8), ln, aa);
+        vec2 cq = (q - vec2(0.0, 0.52)) / vec2(1.0, 0.95);
+        road_layer(acc, max(length(cq) - 0.44, 0.52 - q.y), c1, ln, aa);
+        float dots = min(length(q - vec2(-0.2, 0.68)) - 0.07, min(length(q - vec2(0.16, 0.76)) - 0.085, length(q - vec2(0.02, 0.6)) - 0.05));
+        dots = min(dots, length(q - vec2(0.3, 0.6)) - 0.045);
+        road_layer(acc, max(dots, 0.54 - q.y), vec3(1.0, 0.98, 0.9), 0.0, aa);
+    } else if (kind == 4) {
+        // Cactus : un fût et deux bras.
+        float body = road_seg(q, vec2(0.0, 0.1), vec2(0.0, 0.85)) - 0.10;
+        float arm_l = min(road_seg(q, vec2(-0.08, 0.42), vec2(-0.3, 0.42)), road_seg(q, vec2(-0.3, 0.42), vec2(-0.3, 0.68))) - 0.065;
+        float arm_r = min(road_seg(q, vec2(0.08, 0.3), vec2(0.28, 0.3)), road_seg(q, vec2(0.28, 0.3), vec2(0.28, 0.56))) - 0.065;
+        road_layer(acc, min(body, min(arm_l, arm_r)), c1 * 0.85, ln, aa);
+        road_layer(acc, road_seg(q, vec2(-0.03, 0.2), vec2(-0.03, 0.8)) - 0.02, c1 * 1.15, 0.0, aa);
+    } else {
+        // Cristaux : trois pointes à facettes.
+        float main = abs(q.x) / 0.2 + abs(q.y - 0.5) / 0.5 - 1.0;
+        float left = abs(q.x + 0.25) / 0.13 + abs(q.y - 0.26) / 0.26 - 1.0;
+        float right = abs(q.x - 0.25) / 0.12 + abs(q.y - 0.32) / 0.32 - 1.0;
+        float cr = min(main * 0.2, min(left * 0.13, right * 0.12));
+        vec3 facet = q.x < (main < 0.0 ? 0.0 : (q.x < 0.0 ? -0.25 : 0.25)) ? c1 * 1.15 + 0.1 : c1 * 0.7;
+        road_layer(acc, cr, facet, ln, aa);
+    }
+    return acc;
+}
+
+// Voiture vue de dos. q : centré sur la caisse, largeur ≈ 1.
+vec4 road_car(int car, vec2 q, vec3 pal[4], float aa) {
+    vec4 acc = vec4(0.0);
+    float day = u_road_b.z;
+    float ln = 0.016;
+    vec3 body = palette(pal, u_road_d.y + u_gen_hue + 0.02);
+    vec3 trim = palette(pal, u_road_d.y + u_gen_hue + 0.5);
+    vec3 glass = vec3(0.30, 0.78, 0.95);
+    vec3 red = vec3(1.0, 0.16, 0.22);
+    // Caisse (bw, bh, arrondi), habitacle (cw, ch, arrondi), taille des roues.
+    float bw = 0.56, bh = 0.13, br = 0.07, cw = 0.36, ch = 0.11, cr = 0.09, wheel = 1.0;
+    vec3 top = body;
+    if (car == 2) { bw = 0.45; bh = 0.20; br = 0.10; cw = 0.42; ch = 0.22; cr = 0.15; top = vec3(0.98, 0.95, 0.86); }
+    if (car == 3) { bw = 0.52; bh = 0.17; br = 0.04; cw = 0.33; ch = 0.15; cr = 0.05; wheel = 1.3; }
+    if (car == 4) { bw = 0.46; bh = 0.17; br = 0.16; cw = 0.33; ch = 0.19; cr = 0.19; }
+    float by = -0.10;
+    float cy = by + bh + ch - 0.05;
+    // Roues.
+    for (int k = 0; k < 2; k++) {
+        float side = k == 0 ? -1.0 : 1.0;
+        vec2 w = vec2(side * (bw - 0.11), by - bh - 0.01);
+        road_layer(acc, road_box(q - w, vec2(0.075, 0.09) * wheel, 0.04), vec3(0.10, 0.08, 0.13), ln, aa);
+    }
+    // Coccinelle : ailes rondes de chaque côté.
+    if (car == 4) {
+        for (int k = 0; k < 2; k++) {
+            float side = k == 0 ? -1.0 : 1.0;
+            road_layer(acc, length(q - vec2(side * (bw - 0.04), by - 0.02)) - 0.17, body * 0.85, ln, aa);
+        }
+    }
+    // Habitacle et lunette arrière.
+    road_layer(acc, road_box(q - vec2(0.0, cy), vec2(cw, ch), cr), top, ln, aa);
+    float win = road_box(q - vec2(0.0, cy + 0.015), vec2(cw - 0.06, ch - 0.055), max(cr - 0.04, 0.02));
+    vec3 gl = mix(glass, vec3(1.0), step(0.86, fract((q.x + q.y) * 2.3)) * 0.6);
+    road_layer(acc, win, gl * mix(0.45, 1.0, day), ln * 0.7, aa);
+    // Sportive : aileron.
+    if (car == 1) {
+        for (int k = 0; k < 2; k++) {
+            float side = k == 0 ? -1.0 : 1.0;
+            road_layer(acc, road_box(q - vec2(side * 0.40, by + bh + 0.04), vec2(0.018, 0.05), 0.005), trim * 0.7, ln * 0.7, aa);
+        }
+        road_layer(acc, road_box(q - vec2(0.0, by + bh + 0.085), vec2(0.52, 0.022), 0.015), trim, ln, aa);
+    }
+    // Caisse, avec une bande plus sombre en bas.
+    road_layer(acc, road_box(q - vec2(0.0, by), vec2(bw, bh), br), body, ln, aa);
+    float inside = road_box(q - vec2(0.0, by), vec2(bw, bh), br);
+    if (inside < -0.012 && q.y < by - bh * 0.35) acc.rgb = mix(acc.rgb, body * 0.72, 0.9);
+    if (car == 2) {
+        // Combi : le V de la face arrière et un rond central.
+        float v = abs(q.y - (by + bh * 0.7) + abs(q.x) * 0.55) - 0.012;
+        road_layer(acc, max(v, inside + 0.02), top, 0.0, aa);
+        road_layer(acc, abs(length(q - vec2(0.0, by + 0.03)) - 0.065) - 0.012, top, 0.008, aa);
+    }
+    if (car == 3) {
+        // Pick-up : le hayon en creux.
+        road_layer(acc, road_box(q - vec2(0.0, by + 0.03), vec2(bw - 0.14, bh - 0.07), 0.02), body * 0.85, ln * 0.7, aa);
+    }
+    // Pare-chocs et plaque.
+    road_layer(acc, road_box(q - vec2(0.0, by - bh + 0.02), vec2(bw + 0.015, 0.032), 0.03), vec3(0.82, 0.82, 0.9), ln, aa);
+    road_layer(acc, road_box(q - vec2(0.0, by - bh + 0.085), vec2(0.10, 0.035), 0.01), vec3(0.98, 0.96, 0.8), ln * 0.6, aa);
+    // Feux arrière.
+    float glow = 0.0;
+    for (int k = 0; k < 2; k++) {
+        float side = k == 0 ? -1.0 : 1.0;
+        vec2 lp = vec2(side * (bw - 0.13), by + bh * 0.3);
+        float ld = length(q - lp) - 0.05;
+        if (car == 1) ld = road_box(q - vec2(side * (bw - 0.19), by + bh * 0.35), vec2(0.13, 0.03), 0.03);
+        if (car == 3) ld = road_box(q - vec2(side * (bw - 0.05), by + 0.02), vec2(0.03, 0.09), 0.02);
+        road_layer(acc, ld, red, ln * 0.7, aa);
+        glow += exp(-max(ld, 0.0) * 14.0);
+    }
+    // De nuit, la voiture s'assombrit et ses feux rayonnent.
+    acc.rgb *= mix(ROAD_NIGHT * 2.2, vec3(1.0), day);
+    acc.rgb += red * glow * (1.0 - day) * 0.8;
+    return acc;
+}
+
+vec4 road_scene(vec3 pal[4], vec2 uv) {
+    float t = u_gen_time;
+    vec2 sp = vec2((uv.x - 0.5) * u_gen_aspect, 0.5 - uv.y);
+    float aa = 1.5 / 720.0;
+    float pos = u_road_a.x, psy = u_road_c.w, day = u_road_b.z, rain = u_road_b.y, flash = u_road_c.x;
+    // L'horizon monte et descend avec la pente.
+    float horizon = 0.10 - u_road_a.w;
+    vec2 rd = vec2(sp.x, sp.y - horizon) / ROAD_FOC;
+
+    // Lancer de rayon sur le relief : pas de plus en plus grands, puis dichotomie.
+    float zhit = -1.0, z0 = 0.6;
+    for (int i = 0; i < 64; i++) {
+        float z = exp(log(ROAD_FAR) * float(i + 1) / 64.0);
+        vec2 r = road_at(z);
+        float py = ROAD_CAM + rd.y * z;
+        if (py < road_ground(rd.x * z - r.x, pos + z, r.y)) {
+            float a = z0, b = z;
+            for (int j = 0; j < 7; j++) {
+                float m = 0.5 * (a + b);
+                vec2 rm = road_at(m);
+                if (ROAD_CAM + rd.y * m < road_ground(rd.x * m - rm.x, pos + m, rm.y)) b = m; else a = m;
+            }
+            zhit = 0.5 * (a + b);
+            break;
+        }
+        if (rd.y > 0.0 && py > u_road_e.y) break;
+        z0 = z;
+    }
+
+    vec3 haze = road_sky_base(pal, sp.x, 0.0, t);
+    float depth = zhit > 0.0 ? zhit : ROAD_FAR * 1.04;
+    float far = smoothstep(ROAD_FAR * 0.62, ROAD_FAR * 0.98, depth);
+    float gloom = u_road_b.x * (0.08 + 0.18 * rain);
+    vec3 col;
+    if (zhit > 0.0) {
+        float z = zhit;
+        vec2 r = road_at(z);
+        float x = rd.x * z;
+        float u = x - r.x, s = pos + z;
+        float au = abs(u);
+        float lw = 0.05 + z * 0.006; // épaisseur des traits : grossit avec la distance
+        vec3 g;
+        if (au < ROAD_W + 0.9) {
+            // Chaussée : bitume en bandes, lignes de bord, tirets, bordure rayée.
+            vec3 asphalt = mix(vec3(0.17, 0.11, 0.26), vec3(0.22, 0.15, 0.33), mod(floor(s / 8.0), 2.0));
+            asphalt = mix(asphalt, palette(pal, 0.72 + u_gen_hue + t * 0.02) * 0.45, 0.4 * psy);
+            asphalt = mix(asphalt, haze * 0.75, rain * 0.4);
+            g = asphalt;
+            if (au > ROAD_W - 0.6 && au < ROAD_W - 0.32) g = vec3(0.96);
+            if (au < 0.15 && mod(s, 8.0) < 4.0) g = vec3(1.0, 0.86, 0.2);
+            if (au > ROAD_W) g = mod(floor(s / 4.0), 2.0) < 1.0 ? palette(pal, 0.05 + u_gen_hue) : vec3(0.97);
+            if (abs(au - ROAD_W) < lw * 0.5 || au > ROAD_W + 0.9 - lw) g = ROAD_INK;
+        } else {
+            // Paysage : bandes de couleur qui défilent, courbes de niveau, ombrage en aplats.
+            float hgt = road_ground(u, s, r.y) - r.y;
+            float wave = psy * 5.0 * sin(u * 0.07 + t * 0.9);
+            float stripe = floor((s + wave) / 16.0);
+            float ping = abs(mod(stripe, 12.0) - 6.0) / 6.0;
+            float level = floor(hgt / 5.0);
+            g = palette(pal, 0.22 + ping * 0.30 + level * 0.11 + u_gen_hue + sin(t * 0.2) * 0.1 * psy);
+            g *= mod(stripe, 2.0) < 1.0 ? 1.0 : 0.84;
+            float dh = road_ground(u + 1.0, s, r.y) - road_ground(u - 1.0, s, r.y);
+            g *= 0.74 + 0.16 * step(-0.06, dh) + 0.16 * step(0.06, dh);
+        }
+        // Nuit : tout s'assombrit, sauf dans le faisceau des phares.
+        float beam = (1.0 - day) * exp(-z / 50.0) * smoothstep(10.0, 2.0, abs(x));
+        g *= mix(ROAD_NIGHT, vec3(1.0), clamp(day + beam, 0.0, 1.0));
+        g = mix(g, vec3(dot(g, vec3(0.3, 0.6, 0.1))) * 0.65, gloom);
+        g += flash * 0.22;
+        float fog = 1.0 - exp(-z * (0.0008 + u_road_b.w * 0.018));
+        col = mix(g, haze, max(fog, far));
+    } else {
+        col = road_sky(pal, vec2(sp.x, sp.y - horizon), t);
+    }
+    // Trait d'encre sur les crêtes (là où la profondeur saute).
+    float jump = fwidth(log(depth));
+    col = mix(col, ROAD_INK, smoothstep(0.10, 0.22, jump) * (1.0 - far));
+
+    // Décor : du plus loin au plus près, de chaque côté de la route.
+    int decor = int(u_road_d.z + 0.5);
+    if (decor > 0) {
+        float first = floor(pos / 16.0);
+        for (int i = 17; i >= 0; i--) {
+            for (int k = 0; k < 2; k++) {
+                float side = k == 0 ? -1.0 : 1.0;
+                float idx = first + float(i) + 1.0;
+                vec2 rn = hash2(vec2(mod(idx, 512.0), side * 7.0 + 3.0));
+                if (rn.x > u_road_d.w) continue;
+                float z = idx * 16.0 - pos + (rn.y - 0.5) * 8.0;
+                if (z < 1.5 || z > ROAD_FAR - 8.0 || z > depth) continue;
+                vec2 r = road_at(z);
+                float lat = ROAD_W + 2.0 + 2.6 * fract(rn.y * 7.3);
+                float size = (4.5 + 4.0 * fract(rn.x * 13.7 / max(u_road_d.w, 0.05))) / z;
+                vec2 foot = vec2((r.x + side * lat) / z, (r.y - ROAD_CAM) / z + horizon / ROAD_FOC) * ROAD_FOC;
+                size *= ROAD_FOC;
+                vec2 q = (sp - foot) / size;
+                if (abs(q.x) > 0.75 || q.y < -0.06 || q.y > 1.12) continue;
+                float rnd = fract(rn.x * 91.7 + rn.y * 3.1);
+                int kind = decor == 6 ? 1 + int(fract(rn.y * 57.3) * 5.0) : decor;
+                vec4 prop = road_prop(kind, q, pal, rnd, aa / size, t);
+                float beam = (1.0 - day) * exp(-z / 50.0);
+                prop.rgb *= mix(ROAD_NIGHT, vec3(1.0), clamp(day + beam, 0.0, 1.0));
+                prop.rgb = mix(prop.rgb, vec3(dot(prop.rgb, vec3(0.3, 0.6, 0.1))) * 0.65, gloom);
+                prop.rgb += flash * 0.22 * prop.a;
+                float fog = 1.0 - exp(-z * (0.0008 + u_road_b.w * 0.018));
+                float pfar = smoothstep(ROAD_FAR * 0.62, ROAD_FAR * 0.95, z);
+                prop.rgb = mix(prop.rgb, haze, max(fog, pfar));
+                col = mix(col, prop.rgb, prop.a * (1.0 - smoothstep(ROAD_FAR * 0.88, ROAD_FAR * 0.96, z)));
+            }
+        }
+    }
+
+    // Voiture : elle penche dans les virages et tressaute un peu.
+    int car = int(u_road_d.x + 0.5);
+    if (car > 0) {
+        float steer = u_road_a.z;
+        float bounce = sin(pos * 1.3) * 0.0025 + sin(pos * 0.37) * 0.003;
+        vec2 q = (sp - vec2(steer * 0.11, -0.335 + bounce)) / 0.31;
+        q = rot2(steer * 0.07) * q;
+        // Ombre au sol.
+        float sh = length((q - vec2(0.0, -0.36)) / vec2(0.66, 0.07));
+        col *= 1.0 - 0.55 * smoothstep(1.0, 0.6, sh);
+        vec4 c = road_car(car, q, pal, aa / 0.31);
+        c.rgb += flash * 0.15 * c.a;
+        col = mix(col, c.rgb, c.a);
+    }
+
+    // Pluie : trois rideaux de traits obliques.
+    if (rain > 0.01) {
+        for (int l = 0; l < 3; l++) {
+            float fl = float(l);
+            float sc = 26.0 + 20.0 * fl;
+            vec2 q = vec2(sp.x + sp.y * 0.2, sp.y) * vec2(sc, sc * 0.13);
+            q.y += t * (6.0 + 2.5 * fl);
+            vec2 id = floor(q), f = fract(q);
+            float on = step(1.0 - rain * 0.5, hash(vec2(id.x + fl * 31.0, mod(id.y, 512.0))));
+            float streak = smoothstep(0.14, 0.0, abs(f.x - 0.5)) * smoothstep(0.0, 0.2, f.y) * smoothstep(1.0, 0.6, f.y);
+            col = mix(col, vec3(0.82, 0.88, 1.0), on * streak * 0.38);
+        }
+    }
+    return vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+
+// ------------------------------------------------------------ Voyage temporel
+// Un vortex qui aspire vers le fond du temps ; des horloges affolées et des compteurs d'années
+// en jaillissent. Vitesse négative : on remonte le temps, tout repart vers le centre.
+
+// Chiffre à sept segments. q : x de -0.5 à 0.5, y de -1 à 1.
+float time_digit(vec2 q, int d) {
+    int m = int[10](0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F)[d];
+    float dist = 1e3;
+    if ((m & 1) != 0) dist = min(dist, road_seg(q, vec2(-0.22, 0.72), vec2(0.22, 0.72)));
+    if ((m & 2) != 0) dist = min(dist, road_seg(q, vec2(0.3, 0.62), vec2(0.3, 0.1)));
+    if ((m & 4) != 0) dist = min(dist, road_seg(q, vec2(0.3, -0.1), vec2(0.3, -0.62)));
+    if ((m & 8) != 0) dist = min(dist, road_seg(q, vec2(-0.22, -0.72), vec2(0.22, -0.72)));
+    if ((m & 16) != 0) dist = min(dist, road_seg(q, vec2(-0.3, -0.1), vec2(-0.3, -0.62)));
+    if ((m & 32) != 0) dist = min(dist, road_seg(q, vec2(-0.3, 0.62), vec2(-0.3, 0.1)));
+    if ((m & 64) != 0) dist = min(dist, road_seg(q, vec2(-0.22, 0.0), vec2(0.22, 0.0)));
+    return dist - 0.075;
+}
+
+// Horloge dont les aiguilles s'emballent. q : rayon 1.
+vec4 time_clock(vec2 q, vec3 pal[4], float rnd, float t, float aa) {
+    vec4 acc = vec4(0.0);
+    float d = length(q);
+    road_layer(acc, d - 1.0, palette(pal, rnd + u_gen_hue), 0.06, aa);
+    road_layer(acc, d - 0.82, vec3(1.0, 0.97, 0.86), 0.035, aa);
+    // Douze graduations, plus longues aux quarts.
+    float turn = atan(q.x, q.y) / (2.0 * PI);
+    float k = fract(turn * 12.0 + 0.5) - 0.5;
+    float quarter = step(abs(fract(turn * 4.0 + 0.5) - 0.5), 0.04);
+    float tick = max(abs(k) * d * (2.0 * PI / 12.0) - 0.03, abs(d - 0.66 + 0.04 * quarter) - 0.07 - 0.04 * quarter);
+    road_layer(acc, tick, ROAD_INK, 0.0, aa);
+    float ah = t * (1.2 + rnd * 2.0) * (rnd < 0.5 ? -1.0 : 1.0) + rnd * 40.0;
+    road_layer(acc, road_seg(q, vec2(0.0), vec2(sin(ah), cos(ah)) * 0.40) - 0.065, ROAD_INK, 0.0, aa);
+    road_layer(acc, road_seg(q, vec2(0.0), vec2(sin(ah * 12.0), cos(ah * 12.0)) * 0.62) - 0.04, ROAD_INK, 0.0, aa);
+    road_layer(acc, d - 0.10, palette(pal, rnd + 0.5 + u_gen_hue), 0.03, aa);
+    return acc;
+}
+
+// Compteur d'années qui défile, façon tableau de bord de machine à voyager dans le temps.
+vec4 time_year(vec2 q, vec3 pal[4], float rnd, float t, float aa) {
+    vec4 acc = vec4(0.0);
+    road_layer(acc, road_box(q, vec2(1.0, 0.42), 0.1), palette(pal, rnd + u_gen_hue) * 0.9, 0.05, aa);
+    road_layer(acc, road_box(q, vec2(0.9, 0.32), 0.05), vec3(0.07, 0.03, 0.12), 0.025, aa);
+    float year = mod(floor(1000.0 + rnd * 1100.0 + t * (3.0 + rnd * 9.0)), 3000.0);
+    float fx = (q.x + 0.86) / 0.43;
+    int j = int(clamp(floor(fx), 0.0, 3.0));
+    int digit = int(mod(floor(year / pow(10.0, float(3 - j)) + 0.001), 10.0));
+    vec2 dq = vec2(fract(fx) - 0.5, q.y / 0.27);
+    if (fx > 0.0 && fx < 4.0) {
+        float dd = time_digit(dq, digit) * 0.27;
+        vec3 lit = palette(pal, rnd + 0.45 + u_gen_hue) * 0.6 + 0.4;
+        acc.rgb = mix(acc.rgb, lit, smoothstep(aa, 0.0, dd));
+        acc.rgb += lit * 0.25 * exp(-max(dd, 0.0) * 30.0);
+    }
+    return acc;
+}
+
+vec4 time_scene(vec3 pal[4], vec2 uv) {
+    float t = u_gen_time;
+    vec2 p = vec2((uv.x - 0.5) * u_gen_aspect, 0.5 - uv.y) / max(u_gen_scale, 0.05);
+    float aa = 1.5 / 900.0 / max(u_gen_scale, 0.05);
+    float r = length(p), a = atan(p.y, p.x);
+    // Vortex : la profondeur grandit vers le centre, les bras s'y enroulent.
+    float depth = 0.35 / (r + 0.03);
+    float tw = a / (2.0 * PI) + depth * 0.22 + t * 0.04;
+    float arms = sin(2.0 * PI * tw * 5.0 + sin(depth * 2.0 - t * 2.0) * 0.8);
+    float band = floor((tw * 5.0 + depth * 0.6 - t * 0.5) * 2.0) / 2.0;
+    // Aller-retour sur cinq bandes : la couleur se referme sans couture après un tour complet.
+    float shade = abs(fract(band / 5.0) * 2.0 - 1.0);
+    vec3 col = palette(pal, shade * 0.6 + depth * 0.05 + u_gen_hue) * (0.35 + 0.65 * smoothstep(-0.3, 0.3, arms));
+    // Traînées de lumière qui filent le long du tunnel.
+    float ang = fract(a / (2.0 * PI));
+    float lane = floor(ang * 90.0);
+    float run = fract(depth * (0.5 + hash(vec2(lane, 1.0))) - t * (0.6 + hash(vec2(lane, 2.0))) + hash(vec2(lane, 3.0)));
+    float streak = step(0.72, hash(vec2(lane, 4.0))) * smoothstep(0.75, 1.0, run) * smoothstep(0.5, 0.25, abs(fract(ang * 90.0) - 0.5));
+    col += streak * (palette(pal, lane * 0.13 + u_gen_hue) * 0.5 + 0.5) * smoothstep(0.03, 0.2, r);
+    // Cadrans qui avancent : cercles gradués, tournant chacun dans son sens.
+    for (int k = 0; k < 3; k++) {
+        float fk = float(k);
+        float z = fract(t * 0.13 + fk / 3.0);
+        float rr = 0.03 + z * z * z * 1.3;
+        float w = 0.004 + rr * 0.035;
+        float turn = fract(ang + t * 0.05 * (mod(fk, 2.0) < 1.0 ? 1.0 : -1.0) * (1.0 + fk));
+        float marks = step(abs(fract(turn * 60.0) - 0.5), 0.12) * step(abs(r - rr * 0.94), w * 1.2)
+            + step(abs(fract(turn * 12.0) - 0.5), 0.05) * step(abs(r - rr * 0.90), w * 2.4);
+        float ring = smoothstep(w, w * 0.5, abs(r - rr)) + min(marks, 1.0);
+        vec3 rc = palette(pal, fk * 0.31 + 0.6 + u_gen_hue) * 0.4 + 0.6;
+        col = mix(col, rc, min(ring, 1.0) * smoothstep(0.0, 0.1, z) * smoothstep(1.0, 0.8, z) * 0.85);
+    }
+    // Le fond du temps : un cœur éblouissant.
+    col *= smoothstep(0.0, 0.22, r) * 0.9 + 0.1;
+    col += vec3(1.0, 0.95, 0.85) * 0.035 / (r * r * 6.0 + 0.03) * (0.8 + 0.2 * sin(t * 5.0));
+
+    // Horloges et compteurs d'années, éjectés en spirale.
+    int count = 5 + int(u_gen_detail * 12.0);
+    for (int i = 0; i < 17; i++) {
+        if (i >= count) break;
+        float fi = float(i);
+        vec2 rn = hash2(vec2(fi * 3.7 + 1.0, 9.0));
+        float z = fract(t * (0.09 + rn.x * 0.08) + rn.y);
+        float dir = rn.y * 2.0 * PI * 3.0 + fi * 2.4 + z * 1.6;
+        float size = 0.012 + z * z * 0.20;
+        vec2 c = vec2(cos(dir), sin(dir)) * (0.04 + z * z * 0.95);
+        vec2 q = (p - c) / size;
+        if (abs(q.x) > 1.15 || abs(q.y) > 1.15) continue;
+        q = rot2((rn.x - 0.5) * 0.8 + sin(t * 0.7 + fi) * 0.25) * q;
+        float rnd = fract(rn.x * 17.3 + fi * 0.21);
+        vec4 item = mod(fi, 3.0) < 1.0 ? time_year(q, pal, rnd, t, aa / size) : time_clock(q, pal, rnd, t, aa / size);
+        // Tout près du centre, l'objet sort encore de la lumière.
+        item.rgb = mix(vec3(1.0, 0.97, 0.9), item.rgb, smoothstep(0.0, 0.25, z));
+        col = mix(col, item.rgb, item.a * smoothstep(0.02, 0.12, z) * smoothstep(1.0, 0.88, z));
+    }
+    return vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+
+// ------------------------------------------------------------------ visage qui parle
+//
+// La tête est un maillage dessiné à part dans une texture (voir face_mesh.rs) ; ici, on l'affiche
+// et on lui ajoute son halo.
+uniform sampler2D u_face_tex;
+uniform vec2 u_face_halo; // intensité du halo, 1 = aux couleurs de la palette
+
+vec4 face_scene(vec3 pal[4], vec2 uv) {
+    // La texture de la tête a son origine en bas.
+    vec2 q = vec2(uv.x, 1.0 - uv.y);
+    vec4 c = texture(u_face_tex, q);
+    if (u_face_halo.x <= 0.0) return c;
+    // Halo : la silhouette floutée déborde autour de la tête.
+    float blur = 0.0;
+    for (int i = 0; i < 20; i++) {
+        float a = float(i) * 2.399963;
+        float r = 0.01 + 0.08 * sqrt((float(i) + 0.5) / 20.0);
+        blur += texture(u_face_tex, q + vec2(cos(a) / u_gen_aspect, sin(a)) * r).a;
+    }
+    vec3 gc = u_face_halo.y > 0.5 ? palette(pal, 0.55 + u_gen_hue) : vec3(1.0, 0.93, 0.82);
+    float glow = u_face_halo.x * blur / 20.0 * (1.0 - c.a);
+    return vec4(c.rgb + gc * glow * 0.8, max(c.a, glow * 0.7));
+}
+
+// Couleur prémultipliée du motif et sa couverture (1 sauf pour la peinture et le visage).
+vec4 generate(int kind, vec3 pal[4], vec2 uv) {
+    if (kind == 31) return paint_display(uv);
+    if (kind == 32) return road_scene(pal, uv);
+    if (kind == 33) return time_scene(pal, uv);
+    if (kind == 34) return face_scene(pal, uv);
     vec2 p = (uv - 0.5) * vec2(u_gen_aspect, 1.0) * u_gen_scale;
     vec2 v = pattern(kind, p, u_gen_time);
-    return palette(pal, v.x + u_gen_hue) * v.y;
+    return vec4(palette(pal, v.x + u_gen_hue) * v.y, 1.0);
 }
 
 // Passe du générateur : fondu entre l'ancien et le nouveau motif. Alpha = part de motif
@@ -1142,8 +2052,9 @@ void main() {
         float w = k == 0 ? 1.0 - u_gen_fade : u_gen_fade;
         if (kind == 0 || w <= 0.0) continue;
         for (int j = 0; j < 4; j++) pal[j] = k == 0 ? u_pal_a[j] : u_pal_b[j];
-        col += generate(kind, pal, uv) * w;
-        cover += w;
+        vec4 g = generate(kind, pal, uv);
+        col += g.rgb * w;
+        cover += g.a * w;
     }
     out_color = vec4(col, cover);
 }
@@ -1833,14 +2744,11 @@ void main() {
 "#;
 
 impl Renderer {
-    unsafe fn compile(gl: &glow::Context, header: &str) -> Result<glow::Program, String> {
+    unsafe fn compile(gl: &glow::Context, header: &str, fragment: &str) -> Result<glow::Program, String> {
         unsafe {
             let program = gl.create_program()?;
             let mut shaders = Vec::new();
-            for (kind, src) in [
-                (glow::VERTEX_SHADER, VERTEX_SHADER),
-                (glow::FRAGMENT_SHADER, FRAGMENT_SHADER),
-            ] {
+            for (kind, src) in [(glow::VERTEX_SHADER, VERTEX_SHADER), (glow::FRAGMENT_SHADER, fragment)] {
                 let shader = gl.create_shader(kind)?;
                 gl.shader_source(shader, &format!("{header}{src}"));
                 gl.compile_shader(shader);
@@ -1864,8 +2772,9 @@ impl Renderer {
 
     pub fn new(gl: &glow::Context) -> Result<Self, String> {
         unsafe {
-            let program = Self::compile(gl, "#version 330\n")?;
-            let gen_program = Self::compile(gl, "#version 330\n#define GEN_PASS\n")?;
+            let program = Self::compile(gl, "#version 330\n", FRAGMENT_SHADER)?;
+            let gen_program = Self::compile(gl, "#version 330\n#define GEN_PASS\n", FRAGMENT_SHADER)?;
+            let paint_program = Self::compile(gl, "#version 330\n", PAINT_SIM_SHADER)?;
 
             let vao = gl.create_vertex_array()?;
             let vbo = gl.create_buffer()?;
@@ -1886,7 +2795,12 @@ impl Renderer {
                 program,
                 gen_program,
                 gen_targets: HashMap::new(),
+                paint_program,
+                paint_sims: HashMap::new(),
+                face: None,
+                face_error: None,
                 capture_target: None,
+                led_target: None,
                 vao,
                 vbo,
                 black,
@@ -1925,6 +2839,17 @@ impl Renderer {
         unsafe {
             gl.delete_program(self.program);
             gl.delete_program(self.gen_program);
+            gl.delete_program(self.paint_program);
+            if let Some(mut face) = self.face.take() {
+                face.destroy(gl);
+            }
+            for (_, sim) in self.paint_sims.drain() {
+                Self::delete_paint_sim(gl, &sim);
+            }
+            if let Some(t) = self.led_target.take() {
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
             if let Some(t) = self.capture_target.take() {
                 gl.delete_framebuffer(t.fbo);
                 gl.delete_texture(t.texture);
@@ -2089,6 +3014,18 @@ impl Renderer {
             }
             keep
         });
+        if let Some(face) = &mut self.face {
+            face.retain(gl, |k| p.layers.get(k).is_some_and(|l| l.generator.uses_face()));
+            let photos: HashSet<u64> = p.layers.iter().filter_map(|l| l.face_photo.as_ref()).map(|f| f.key).collect();
+            face.retain_photos(gl, |key| photos.contains(&key));
+        }
+        self.paint_sims.retain(|k, sim| {
+            let keep = p.layers.get(*k).is_some_and(|l| l.generator.uses_paint());
+            if !keep {
+                unsafe { Self::delete_paint_sim(gl, sim) };
+            }
+            keep
+        });
         let shapes: HashSet<u64> = p.layers.iter().filter_map(|l| l.shape.as_ref()).map(|s| s.key).collect();
         self.shape_textures.retain(|key, t| {
             let keep = shapes.contains(key);
@@ -2128,8 +3065,18 @@ impl Renderer {
                     continue;
                 }
                 // Les visuels 3D (lancer de rayons) sont calculés en plus basse définition.
-                let is_3d = |pt: Pattern| pt as i32 >= Pattern::Mandelbulb as i32;
-                let h: u32 = if is_3d(g.from) || is_3d(g.to) { 540 } else { 900 };
+                // La route, dessinée au trait, garde une définition intermédiaire.
+                let uses = |f: fn(Pattern) -> bool| f(g.from) || f(g.to);
+                let h: u32 = if uses(Pattern::is_3d) {
+                    540
+                } else if uses(|p| p == Pattern::Face) {
+                    // Le visage est un maillage, peu coûteux : pleine définition.
+                    1080
+                } else if uses(|p| p == Pattern::Road) {
+                    720
+                } else {
+                    900
+                };
                 let size = (((h as f32) * g.aspect.clamp(0.2, 5.0)) as u32, h);
                 let Some(target) = self.gen_target(gl, k, size) else {
                     continue;
@@ -2139,10 +3086,42 @@ impl Renderer {
                 }
                 target.last = Some(*g);
                 let fbo = target.fbo;
+                // Taches de peinture : une étape de simulation, dont le résultat est lu ensuite.
+                let paint = if g.uses_paint() { self.step_paint(gl, k, g) } else { None };
+                // Visage qui parle : la tête est dessinée dans sa propre texture, lue ensuite (unité 5).
+                let face = if g.uses_face() { self.render_face(gl, k, size, g, layer.face_photo.as_ref()) } else { None };
+                if g.uses_face() {
+                    gl.bind_vertex_array(Some(self.vao));
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&full), glow::STREAM_DRAW);
+                }
+                gl.use_program(Some(self.gen_program));
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
                 gl.viewport(0, 0, size.0 as i32, size.1 as i32);
                 Self::set_gen_uniforms(gl, self.gen_program, g);
+                if let Some((tex, size)) = paint {
+                    let loc = |name: &str| gl.get_uniform_location(self.gen_program, name);
+                    for (unit, (name, t)) in [("u_paint_tex", tex[0]), ("u_water_tex", tex[1])].into_iter().enumerate() {
+                        gl.active_texture(glow::TEXTURE0 + unit as u32);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                        gl.uniform_1_i32(loc(name).as_ref(), unit as i32);
+                    }
+                    gl.uniform_2_f32(loc("u_paint_texel").as_ref(), 1.0 / size.0 as f32, 1.0 / size.1 as f32);
+                }
+                if g.uses_face() {
+                    gl.active_texture(glow::TEXTURE5);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(face.unwrap_or(self.black)));
+                    gl.uniform_1_i32(gl.get_uniform_location(self.gen_program, "u_face_tex").as_ref(), 5);
+                    gl.active_texture(glow::TEXTURE0);
+                }
                 gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                if paint.is_some() {
+                    for unit in 0..2 {
+                        gl.active_texture(glow::TEXTURE0 + unit);
+                        gl.bind_texture(glow::TEXTURE_2D, None);
+                    }
+                    gl.active_texture(glow::TEXTURE0);
+                }
             }
             gl.bind_framebuffer(glow::FRAMEBUFFER, prev_fbo);
             gl.viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
@@ -2153,6 +3132,28 @@ impl Renderer {
                 gl.enable(glow::BLEND);
             }
         }
+    }
+
+    /// Dessine la tête du visuel « Visage qui parle » du calque `k` (ressources créées au premier usage).
+    unsafe fn render_face(
+        &mut self,
+        gl: &glow::Context,
+        k: usize,
+        size: (u32, u32),
+        g: &GenDraw,
+        photo: Option<&crate::face::FacePhoto>,
+    ) -> Option<glow::Texture> {
+        if self.face.is_none() && self.face_error.is_none() {
+            match FaceRenderer::new(gl) {
+                Ok(f) => self.face = Some(f),
+                Err(e) => {
+                    eprintln!("{e}");
+                    self.face_error = Some(e);
+                }
+            }
+        }
+        let palette = if g.to == Pattern::Face { g.to_palette } else { g.from_palette };
+        unsafe { self.face.as_mut()?.render(gl, k, size, &g.face, (palette, g.hue, g.time, g.scale), photo) }
     }
 
     /// Texture + framebuffer du visuel généré du calque `k`, (re)créés à la bonne taille.
@@ -2186,6 +3187,133 @@ impl Renderer {
         }
     }
 
+    unsafe fn delete_paint_sim(gl: &glow::Context, sim: &PaintSim) {
+        unsafe {
+            for k in 0..2 {
+                gl.delete_framebuffer(sim.fbo[k]);
+                gl.delete_texture(sim.paint[k]);
+                gl.delete_texture(sim.water[k]);
+            }
+        }
+    }
+
+    /// Textures de simulation du calque `k` (remises à zéro si la taille change).
+    unsafe fn paint_sim(&mut self, gl: &glow::Context, k: usize, size: (u32, u32)) -> Option<&mut PaintSim> {
+        unsafe {
+            if self.paint_sims.get(&k).is_some_and(|s| s.size != size) {
+                let sim = self.paint_sims.remove(&k).unwrap();
+                Self::delete_paint_sim(gl, &sim);
+            }
+            if !self.paint_sims.contains_key(&k) {
+                let tex = |format: u32, components: u32| -> Option<glow::Texture> {
+                    let t = gl.create_texture().ok()?;
+                    gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        format as i32,
+                        size.0 as i32,
+                        size.1 as i32,
+                        0,
+                        components,
+                        glow::HALF_FLOAT,
+                        glow::PixelUnpackData::Slice(None),
+                    );
+                    Some(t)
+                };
+                let mut sim = PaintSim {
+                    fbo: [gl.create_framebuffer().ok()?, gl.create_framebuffer().ok()?],
+                    paint: [tex(glow::RGBA16F, glow::RGBA)?, tex(glow::RGBA16F, glow::RGBA)?],
+                    water: [tex(glow::R16F, glow::RED)?, tex(glow::R16F, glow::RED)?],
+                    size,
+                    cur: 0,
+                    frame: 0,
+                    time: 0.0,
+                };
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                for k in 0..2 {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sim.fbo[k]));
+                    gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(sim.paint[k]), 0);
+                    gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, Some(sim.water[k]), 0);
+                    gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1]);
+                    if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                        Self::delete_paint_sim(gl, &sim);
+                        return None;
+                    }
+                    gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                }
+                sim.cur = 0;
+                self.paint_sims.insert(k, sim);
+            }
+            self.paint_sims.get_mut(&k)
+        }
+    }
+
+    /// Avance la simulation de peinture du calque `k` d'une image (une seule fois par image,
+    /// même si l'aperçu et la sortie la demandent). Renvoie les textures de l'état courant
+    /// (peinture, eau) et leur taille.
+    unsafe fn step_paint(&mut self, gl: &glow::Context, k: usize, g: &GenDraw) -> Option<([glow::Texture; 2], (u32, u32))> {
+        unsafe {
+            // Définition de la simulation : le grain fin est ajouté au rendu.
+            let h = 640u32;
+            let size = (((h as f32) * g.aspect.clamp(0.2, 5.0)) as u32, h);
+            let program = self.paint_program;
+            let sim = self.paint_sim(gl, k, size)?;
+            let pd = &g.paint;
+            if sim.frame != pd.frame {
+                sim.frame = pd.frame;
+                let dt = pd.dt.clamp(0.0, 0.1);
+                sim.time += dt;
+                let (read, write) = (sim.cur, 1 - sim.cur);
+                gl.use_program(Some(program));
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(sim.fbo[write]));
+                gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1]);
+                gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+                let loc = |name: &str| gl.get_uniform_location(program, name);
+                for (unit, (name, t)) in [("u_paint", sim.paint[read]), ("u_water", sim.water[read])].into_iter().enumerate() {
+                    gl.active_texture(glow::TEXTURE0 + unit as u32);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    gl.uniform_1_i32(loc(name).as_ref(), unit as i32);
+                }
+                gl.uniform_2_f32(loc("u_texel").as_ref(), 1.0 / size.0 as f32, 1.0 / size.1 as f32);
+                gl.uniform_1_f32(loc("u_aspect").as_ref(), size.0 as f32 / size.1 as f32);
+                gl.uniform_1_f32(loc("u_dt").as_ref(), dt);
+                gl.uniform_1_f32(loc("u_time").as_ref(), sim.time);
+                gl.uniform_1_f32(loc("u_flow").as_ref(), pd.flow);
+                let n = (pd.count as usize).min(MAX_DROPS);
+                gl.uniform_1_i32(loc("u_count").as_ref(), n as i32);
+                if n > 0 {
+                    let drops = &pd.drops[..n];
+                    let a: Vec<f32> = drops.iter().flat_map(|d| [d.pos[0], d.pos[1], d.radius, d.seed]).collect();
+                    let b: Vec<f32> = drops.iter().flat_map(|d| [d.ks[0], d.ks[1], d.ks[2], d.amount]).collect();
+                    let s: Vec<f32> = drops.iter().map(|d| d.splatter).collect();
+                    gl.uniform_4_f32_slice(loc("u_drop_a[0]").as_ref(), &a);
+                    gl.uniform_4_f32_slice(loc("u_drop_b[0]").as_ref(), &b);
+                    gl.uniform_1_f32_slice(loc("u_drop_s[0]").as_ref(), &s);
+                }
+                let ni = (pd.impact_count as usize).min(crate::paint::MAX_IMPACTS);
+                gl.uniform_1_i32(loc("u_imp_count").as_ref(), ni as i32);
+                if ni > 0 {
+                    let imp: Vec<f32> = pd.impacts[..ni].iter().flatten().copied().collect();
+                    gl.uniform_4_f32_slice(loc("u_imp[0]").as_ref(), &imp);
+                }
+                gl.draw_arrays(glow::TRIANGLES, 0, 6);
+                for unit in 0..2 {
+                    gl.active_texture(glow::TEXTURE0 + unit);
+                    gl.bind_texture(glow::TEXTURE_2D, None);
+                }
+                gl.active_texture(glow::TEXTURE0);
+                sim.cur = write;
+            }
+            Some(([sim.paint[sim.cur], sim.water[sim.cur]], size))
+        }
+    }
+
     unsafe fn set_gen_uniforms(gl: &glow::Context, program: glow::Program, g: &GenDraw) {
         unsafe {
             let loc = |name: &str| gl.get_uniform_location(program, name);
@@ -2202,6 +3330,21 @@ impl Renderer {
             for (name, pal) in [("u_pal_a", g.from_palette), ("u_pal_b", g.to_palette)] {
                 let flat: Vec<f32> = pal.coefs().iter().flatten().copied().collect();
                 gl.uniform_3_f32_slice(loc(&format!("{name}[0]")).as_ref(), &flat);
+            }
+            if g.from == Pattern::Road || g.to == Pattern::Road {
+                let r = &g.road;
+                let pts: Vec<f32> = r.pts.iter().flat_map(|p| [p[0], p[1], 0.0, 0.0]).collect();
+                gl.uniform_4_f32_slice(loc("u_road_pts[0]").as_ref(), &pts);
+                let v4 = |name: &str, v: [f32; 4]| gl.uniform_4_f32(loc(name).as_ref(), v[0], v[1], v[2], v[3]);
+                v4("u_road_a", [r.pos, r.heading, r.steer, r.pitch]);
+                v4("u_road_b", [r.clouds, r.rain, r.daylight, r.fog]);
+                v4("u_road_c", [r.flash, r.bolt_seed, r.hills, r.psyche]);
+                v4("u_road_d", [r.car as i32 as f32, r.car_hue, r.decor as i32 as f32, r.density]);
+                v4("u_road_e", [r.bolt_x, r.ceiling, 0.0, 0.0]);
+            }
+            if g.from == Pattern::Face || g.to == Pattern::Face {
+                let palette = matches!(g.face.look, crate::face::Look::Ghost | crate::face::Look::Hologram);
+                gl.uniform_2_f32(loc("u_face_halo").as_ref(), g.face.aura, palette as i32 as f32);
             }
         }
     }
@@ -2227,6 +3370,27 @@ impl Renderer {
     /// Rend la sortie hors écran à la taille `size` et renvoie l'image (RGBA, lignes du bas
     /// vers le haut). Sert à l'enregistrement vidéo.
     pub fn capture(&mut self, gl: &glow::Context, size: (u32, u32), p: &DrawParams) -> Option<Vec<u8>> {
+        let mut target = self.capture_target.take();
+        let out = self.capture_into(gl, &mut target, size, p);
+        self.capture_target = target;
+        out
+    }
+
+    /// Comme `capture`, dans une cible à part : l'image lue pour les LEDs.
+    pub fn capture_leds(&mut self, gl: &glow::Context, size: (u32, u32), p: &DrawParams) -> Option<Vec<u8>> {
+        let mut target = self.led_target.take();
+        let out = self.capture_into(gl, &mut target, size, p);
+        self.led_target = target;
+        out
+    }
+
+    fn capture_into(
+        &mut self,
+        gl: &glow::Context,
+        target: &mut Option<GenTarget>,
+        size: (u32, u32),
+        p: &DrawParams,
+    ) -> Option<Vec<u8>> {
         self.collect_garbage(gl, p);
         unsafe {
             self.render_generators(gl, p);
@@ -2238,12 +3402,12 @@ impl Renderer {
             let mut prev_box = [0i32; 4];
             gl.get_parameter_i32_slice(glow::SCISSOR_BOX, &mut prev_box);
 
-            if self.capture_target.as_ref().is_some_and(|t| t.size != size) {
-                let t = self.capture_target.take().unwrap();
+            if target.as_ref().is_some_and(|t| t.size != size) {
+                let t = target.take().unwrap();
                 gl.delete_framebuffer(t.fbo);
                 gl.delete_texture(t.texture);
             }
-            if self.capture_target.is_none() {
+            if target.is_none() {
                 let texture = Self::create_texture(gl).ok()?;
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
@@ -2260,9 +3424,9 @@ impl Renderer {
                 let fbo = gl.create_framebuffer().ok()?;
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
                 gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
-                self.capture_target = Some(GenTarget { fbo, texture, size, last: None });
+                *target = Some(GenTarget { fbo, texture, size, last: None });
             }
-            let fbo = self.capture_target.as_ref()?.fbo;
+            let fbo = target.as_ref()?.fbo;
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
             gl.viewport(0, 0, size.0 as i32, size.1 as i32);
             gl.enable(glow::SCISSOR_TEST);
@@ -2578,6 +3742,26 @@ pub fn capture_callback(
             let size = rec.size;
             if let Some(frame) = renderer.lock().unwrap().capture(painter.gl(), size, &params) {
                 rec.push(frame);
+            }
+        })),
+    }
+}
+
+/// Callback qui rend la sortie en petit pour les LEDs et range l'image dans `sink`.
+pub fn led_capture_callback(
+    rect: egui::Rect,
+    renderer: Arc<Mutex<Renderer>>,
+    params: DrawParams,
+    size: (u32, u32),
+    sink: Arc<Mutex<crate::leds::Frame>>,
+) -> egui::PaintCallback {
+    egui::PaintCallback {
+        rect,
+        callback: Arc::new(egui_glow::CallbackFn::new(move |_info, painter| {
+            if let Some(pixels) = renderer.lock().unwrap().capture_leds(painter.gl(), size, &params) {
+                let mut f = sink.lock().unwrap();
+                let serial = f.serial + 1;
+                *f = crate::leds::Frame { pixels, size, serial };
             }
         })),
     }

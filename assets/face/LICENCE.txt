@@ -1,0 +1,8 @@
+Tête 3D du visuel « Visage qui parle »
+
+Le maillage, les cibles de déformation (âge, genre, corpulence, expressions), les yeux, les dents,
+les sourcils, les cils et les textures de peau viennent de MakeHuman (http://www.makehumancommunity.org),
+dont les ressources sont publiées sous licence CC0 1.0 (domaine public).
+Copyright des auteurs d'origine : Data Collection AB, Joel Palmius, Jonas Hauquier et l'équipe MakeHuman.
+
+Ces fichiers sont produits par scripts/bake-face.py à partir des fichiers d'origine.

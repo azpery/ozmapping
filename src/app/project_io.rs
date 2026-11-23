@@ -5,6 +5,7 @@ use super::*;
 impl OzApp {
     pub(super) fn set_project(&mut self, ctx: &egui::Context, project: Project, path: Option<PathBuf>) {
         self.layers = project.layers.iter().map(|_| LayerRuntime::default()).collect();
+        self.history.clear();
         self.project = project;
         self.saved = self.project.clone();
         self.project_path = path;

@@ -129,7 +129,7 @@ impl OzApp {
                 ui.checkbox(&mut cfg.mask.enabled, "Activer");
                 ui.checkbox(&mut cfg.mask.invert, "Inverser");
             });
-            ui.add(egui::Slider::new(&mut cfg.mask.feather, 0.0..=200.0).text("Adoucissement").suffix(" px"));
+            fit_slider(ui, "Adoucissement", egui::Slider::new(&mut cfg.mask.feather, 0.0..=200.0).suffix(" px"));
             ui.label("Formes :");
             ui.horizontal_wrapped(|ui| {
                 for shape in MaskShape::ALL {
@@ -218,7 +218,7 @@ impl OzApp {
             // Photo ou image : détourage automatique, à vérifier et retoucher avant d'appliquer.
             match Cutout::open(path) {
                 Ok(cut) => {
-                    self.cutout = Some(CutoutEditor { cut, name: file_name(path), tex: None, dirty: true, drag_from: None, drag_corner: None, white: false, layer: self.sel() });
+                    self.cutout = Some(CutoutEditor { cut, path: path.to_path_buf(), name: file_name(path), tex: None, dirty: true, drag_from: None, drag_corner: None, white: false, layer: self.sel() });
                     self.status = None;
                 }
                 Err(e) => self.status = Some(format!("{} : {e:#}", file_name(path))),
