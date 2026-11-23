@@ -12,7 +12,7 @@ impl OzApp {
     }
 
     pub(super) fn shape_ui(&mut self, ui: &mut egui::Ui) {
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let aspect = ({ let o = self.out_size(self.project.layers[self.sel()].output); o.x / o.y.max(1.0) }).clamp(0.2, 5.0);
         let sec = self.section();
         let i = self.sel();
         sec.show(ui, 0, |ui| {
@@ -92,24 +92,36 @@ impl OzApp {
         });
         ui.add_space(4.0);
         sec.show(ui, 1, |ui| {
-            let (mut cols, mut rows) = (cfg.warp.cols, cfg.warp.rows);
+            // Forme de la surface : grille, Bézier, triangle, ellipse.
             ui.horizontal(|ui| {
-                ui.label("Grille");
-                ui.add(egui::DragValue::new(&mut cols).range(1..=MAX_GRID).suffix(" col."));
-                ui.label("×");
-                ui.add(egui::DragValue::new(&mut rows).range(1..=MAX_GRID).suffix(" lig."));
+                ui.label("Surface");
+                for sh in surface::WarpShape::ALL {
+                    if ui.selectable_label(cfg.warp.shape == sh, sh.label()).clicked() {
+                        cfg.warp.set_shape(sh);
+                        self.edit_target = EditTarget::Warp;
+                    }
+                }
             });
-            if (cols, rows) != (cfg.warp.cols, cfg.warp.rows) {
-                cfg.warp.resize(cols, rows);
-                self.edit_target = EditTarget::Warp;
+            if cfg.warp.shape == surface::WarpShape::Grid {
+                let (mut cols, mut rows) = (cfg.warp.cols, cfg.warp.rows);
+                ui.horizontal(|ui| {
+                    ui.label("Grille");
+                    ui.add(egui::DragValue::new(&mut cols).range(1..=MAX_GRID).suffix(" col."));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(&mut rows).range(1..=MAX_GRID).suffix(" lig."));
+                });
+                if (cols, rows) != (cfg.warp.cols, cfg.warp.rows) {
+                    cfg.warp.resize(cols, rows);
+                    self.edit_target = EditTarget::Warp;
+                }
             }
-            ui.label(
-                egui::RichText::new(
-                    "1×1 : mapping 4 coins en perspective. Plus de points : surfaces courbes (colonne, sphère, angle…).",
-                )
-                .small()
-                .weak(),
-            );
+            let hint = match cfg.warp.shape {
+                surface::WarpShape::Grid => "1×1 : mapping 4 coins en perspective. Plus de points : surfaces courbes (colonne, sphère, angle…).",
+                surface::WarpShape::Bezier => "4 coins et 2 poignées par bord : tirez une poignée pour courber le bord, comme dans un logiciel de dessin. « Aplatir » redresse les bords.",
+                surface::WarpShape::Triangle => "3 coins : l'image se resserre vers le sommet.",
+                surface::WarpShape::Ellipse => "Un centre et deux rayons (horizontal, vertical) : l'image entière dans un cercle ou une ellipse ; les rayons se tournent aussi.",
+            };
+            ui.label(egui::RichText::new(hint).small().weak());
             ui.horizontal(|ui| {
                 if ui
                     .button(with_icon(ic::SQUARES_FOUR, "Aplatir"))
@@ -180,6 +192,61 @@ impl OzApp {
                     cfg.mask.enabled = true;
                 }
             });
+            // Taille et proportions : tous les points ensemble, autour du centre de la forme.
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(with_icon(ic::CORNERS_OUT, "Taille et proportions")).strong().color(TEXT))
+                .on_hover_text("Aussi à la souris : le cadre pointillé autour du masque (coins, côtés, poignée de rotation)");
+            if let Some((lo, hi)) = cfg.mask.bounds() {
+                let center = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+                let mut stretch = |sx: f32, sy: f32| {
+                    cfg.mask.scale_xy(center, sx, sy);
+                    cfg.mask.enabled = true;
+                };
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Largeur");
+                    if ui.button("−").on_hover_text("Plus étroit").clicked() {
+                        stretch(1.0 / 1.05, 1.0);
+                    }
+                    if ui.button("+").on_hover_text("Plus large").clicked() {
+                        stretch(1.05, 1.0);
+                    }
+                    let mut w = 100.0f32;
+                    if ui.add(egui::DragValue::new(&mut w).speed(0.3).suffix(" %")).on_hover_text("Glisser pour élargir ou rétrécir").changed() {
+                        stretch((w / 100.0).max(0.05), 1.0);
+                    }
+                    ui.label("Hauteur");
+                    if ui.button("−").on_hover_text("Moins haut").clicked() {
+                        stretch(1.0, 1.0 / 1.05);
+                    }
+                    if ui.button("+").on_hover_text("Plus haut").clicked() {
+                        stretch(1.0, 1.05);
+                    }
+                    let mut h = 100.0f32;
+                    if ui.add(egui::DragValue::new(&mut h).speed(0.3).suffix(" %")).on_hover_text("Glisser pour allonger ou tasser").changed() {
+                        stretch(1.0, (h / 100.0).max(0.05));
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Taille");
+                    if ui.button("Réduire").clicked() {
+                        stretch(1.0 / 1.05, 1.0 / 1.05);
+                    }
+                    if ui.button("Agrandir").clicked() {
+                        stretch(1.05, 1.05);
+                    }
+                    let mut k = 100.0f32;
+                    if ui.add(egui::DragValue::new(&mut k).speed(0.3).suffix(" %")).on_hover_text("Glisser pour agrandir ou réduire en gardant les proportions").changed() {
+                        let f = (k / 100.0).max(0.05);
+                        stretch(f, f);
+                    }
+                    if ui.button("Miroir horizontal").on_hover_text("Retourner gauche / droite").clicked() {
+                        stretch(-1.0, 1.0);
+                    }
+                    if ui.button("Miroir vertical").on_hover_text("Retourner haut / bas").clicked() {
+                        stretch(1.0, -1.0);
+                    }
+                });
+            }
             ui.label(
                 egui::RichText::new("Pour une forme qui tourne toute seule : Visuels › Sur le masque › Rotation auto.")
                     .small()
@@ -213,7 +280,7 @@ impl OzApp {
 
     /// Importe un SVG, ou la forme détourée d'une image, comme masque du calque sélectionné.
     pub(super) fn import_mask(&mut self, path: &Path) {
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let aspect = ({ let o = self.out_size(self.project.layers[self.sel()].output); o.x / o.y.max(1.0) }).clamp(0.2, 5.0);
         if !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg")) {
             // Photo ou image : détourage automatique, à vérifier et retoucher avant d'appliquer.
             match Cutout::open(path) {

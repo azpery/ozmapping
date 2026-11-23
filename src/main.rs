@@ -5,14 +5,17 @@ mod app;
 mod automix;
 mod cpu;
 mod cutout;
+mod dmx;
 mod effects;
 mod face;
 mod face_mesh;
 mod generator;
 mod icons;
+mod laser;
 mod leds;
 mod mask;
 mod midi;
+mod net;
 mod paint;
 mod project;
 mod recorder;
@@ -37,6 +40,8 @@ fn main() -> eframe::Result {
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([960.0, 600.0]),
         renderer: eframe::Renderer::Glow,
+        // OZ_SESSION=chemin : session enregistrée ailleurs (essais sans toucher à la vraie).
+        persistence_path: std::env::var_os("OZ_SESSION").map(std::path::PathBuf::from),
         ..Default::default()
     };
     eframe::run_native(

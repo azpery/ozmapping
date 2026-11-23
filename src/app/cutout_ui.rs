@@ -18,7 +18,7 @@ impl OzApp {
                 None => ed.tex = Some(ctx.load_texture("cutout", image, egui::TextureOptions::LINEAR)),
             }
         }
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let aspect = ({ let o = self.out_size(self.project.layers[self.sel()].output); o.x / o.y.max(1.0) }).clamp(0.2, 5.0);
         let mut close = false;
         let mut apply = None;
         let layer_names: Vec<String> = self.project.layers.iter().map(|l| l.name.clone()).collect();

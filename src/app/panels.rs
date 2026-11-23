@@ -67,6 +67,7 @@ impl OzApp {
                         self.set_fullscreen(&ctx, fs);
                     }
                     self.record_widget(ui);
+                    self.net_widget(ui);
                     ui.separator();
                     let bo = ui
                         .toggle_value(&mut self.blackout, with_icon(ic::MOON, "Blackout"))
@@ -467,6 +468,7 @@ impl OzApp {
             // Onglets latéraux : les grandes familles de réglages.
             ui.vertical(|ui| {
                 ui.set_width(STRIP_W);
+                let tab_h = ((ui.available_height() - 4.0) / RightTab::COUNT as f32 - ui.spacing().item_spacing.y).clamp(34.0, 50.0);
                 for (tab, icon, name) in [
                     (RightTab::Effects, ic::SPARKLE, "Effets"),
                     (RightTab::Visuals, ic::SUN, "Visuels"),
@@ -475,9 +477,11 @@ impl OzApp {
                     (RightTab::Mix, ic::FILM_REEL, "Mix"),
                     (RightTab::Rhythm, ic::WAVES, "Rythme"),
                     (RightTab::Leds, ic::LIGHTBULB, "LEDs"),
+                    (RightTab::Dmx, ic::LIGHTNING, "DMX"),
+                    (RightTab::Laser, ic::CROSSHAIR, "Laser"),
                     (RightTab::Midi, ic::SQUARES_FOUR, "MIDI"),
                 ] {
-                    if side_tab(ui, icon, name, self.right_tab == tab).clicked() {
+                    if side_tab(ui, icon, name, self.right_tab == tab, tab_h).clicked() {
                         self.right_tab = tab;
                     }
                 }
@@ -488,7 +492,7 @@ impl OzApp {
     /// Contenu de l'onglet latéral choisi, avec ses onglets horizontaux.
     pub(super) fn settings_pane(&mut self, ui: &mut egui::Ui) {
         // Les LEDs ne dépendent pas du calque sélectionné.
-        if !matches!(self.right_tab, RightTab::Leds | RightTab::Midi) {
+        if !matches!(self.right_tab, RightTab::Leds | RightTab::Dmx | RightTab::Laser | RightTab::Midi) {
             self.layer_badge(ui);
         }
         self.settings_body(ui);
@@ -544,6 +548,8 @@ impl OzApp {
                 RightTab::Mix => self.mix_ui(ui),
                 RightTab::Rhythm => self.rhythm_ui(ui),
                 RightTab::Leds => self.leds_ui(ui),
+                RightTab::Dmx => self.dmx_ui(ui),
+                RightTab::Laser => self.laser_ui(ui),
                 RightTab::Midi => self.midi_ui(ui),
             });
         // Un effet vient d'être choisi sur un calque qui ne se voit pas : on le signale.

@@ -210,7 +210,10 @@ impl OzApp {
         if dt > 0.0 {
             self.fps = self.fps * 0.95 + (1.0 / dt) * 0.05;
         }
-        if self.project.chain.enabled {
+        // Plusieurs machines en réseau : les automatismes ne tournent que sur la machine de référence
+        // (les autres reçoivent leurs effets et leur lecture).
+        let lead = !self.net_follower();
+        if self.project.chain.enabled && lead {
             self.chain_timer += dt;
             if self.chain_col.is_none() || self.chain_timer >= self.project.chain.secs.max(0.5) {
                 self.chain_next(ctx);
@@ -269,7 +272,7 @@ impl OzApp {
 
         for i in 0..self.layers.len() {
             let g = self.project.layers[i].generator;
-            if g.auto && g.is_active() && self.layers[i].gen_timer >= g.interval.max(1.0) {
+            if lead && g.auto && g.is_active() && self.layers[i].gen_timer >= g.interval.max(1.0) {
                 self.generator_next(i);
             }
         }
@@ -338,7 +341,7 @@ impl OzApp {
             }
             rt.beat.step(&react, pulse.beat, dt);
             if pulse.beat && counts_beats {
-                if auto_on && react.auto_beats > 0 {
+                if lead && auto_on && react.auto_beats > 0 {
                     rt.auto_beats += 1;
                     if rt.auto_beats >= react.auto_beats {
                         rt.auto_beats = 0;
@@ -346,7 +349,7 @@ impl OzApp {
                     }
                 }
                 let rt = &mut self.layers[i];
-                if mix_on && react.mix_beats > 0 {
+                if lead && mix_on && react.mix_beats > 0 {
                     rt.mix_beats += 1;
                     if rt.mix_beats >= react.mix_beats {
                         rt.mix_beats = 0;
@@ -359,7 +362,7 @@ impl OzApp {
         // Mode Auto : changement d'effet à intervalle régulier (ou sur les temps, plus haut).
         for i in 0..self.layers.len() {
             let auto = self.project.layers[i].auto;
-            if auto.enabled && !self.on_beats(i, |r| r.auto_beats) {
+            if lead && auto.enabled && !self.on_beats(i, |r| r.auto_beats) {
                 self.layers[i].auto_timer += dt;
                 if self.layers[i].auto_timer >= auto.interval.max(0.5) {
                     self.auto_next(i);
@@ -370,7 +373,7 @@ impl OzApp {
         // Mix auto : séquence suivante quand la durée prévue est écoulée.
         for i in 0..self.layers.len() {
             let mix = &self.project.layers[i].mix;
-            if !mix.enabled || mix.clips.is_empty() {
+            if !lead || !mix.enabled || mix.clips.is_empty() {
                 continue;
             }
             let rt = &mut self.layers[i];
@@ -426,18 +429,26 @@ impl OzApp {
         react.enabled && n(react) > 0 && self.rhythm.active() && self.rhythm.source != rhythm::Source::Manual
     }
 
+    /// Image de la sortie 1 (enregistrement, LEDs par défaut).
     pub(super) fn draw_params(&mut self) -> DrawParams {
+        self.draw_params_for(0)
+    }
+
+    /// Image d'une sortie : les calques qui lui sont attribués.
+    pub(super) fn draw_params_for(&mut self, out: usize) -> DrawParams {
         let mut layers = Vec::new();
+        let n_out = self.project.outputs.len().max(1);
+        let out_size = self.out_size(out);
         // Le masque est rastérisé à 1024 px de large, aux proportions de la sortie.
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let aspect = (out_size.x / out_size.y.max(1.0)).clamp(0.2, 5.0);
         let mask_size = (1024u32, ((1024.0 / aspect).round() as u32).clamp(64, 4096));
-        let to_mask_px = mask_size.0 as f32 / self.output_size.x.max(1.0);
+        let to_mask_px = mask_size.0 as f32 / out_size.x.max(1.0);
         let rhythm_on = self.rhythm.active();
         let pulse = self.rhythm.pulse;
         // Champ de forme : moitié de la définition du masque (il varie en douceur).
         let shape_size = (mask_size.0 / 2, mask_size.1 / 2);
         for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
-            if !cfg.visible || cfg.opacity <= 0.0 {
+            if !cfg.visible || cfg.opacity <= 0.0 || cfg.output.min(n_out - 1) != out {
                 continue;
             }
             let effects = if self.bypass_fx {
@@ -447,7 +458,7 @@ impl OzApp {
             } else {
                 cfg.effects
             };
-            let feather = cfg.mask.feather / self.output_size.y.max(1.0) / 2.0;
+            let feather = cfg.mask.feather / out_size.y.max(1.0) / 2.0;
             layers.push(LayerDraw {
                 a: rt.current.as_ref().map(source),
                 b: rt.next.as_ref().map(source),
@@ -487,7 +498,7 @@ impl OzApp {
                 blend: cfg.blend,
                 fit: cfg.fit,
                 media_rotate: cfg.media_rotate,
-                surface_aspect: cfg.warp.aspect((self.output_size.x, self.output_size.y)),
+                surface_aspect: cfg.warp.aspect((out_size.x, out_size.y)),
                 grid: self.grid,
                 phases: if self.bypass_fx { Phases::default() } else { rt.phases },
             });

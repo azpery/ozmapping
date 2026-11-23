@@ -8,8 +8,11 @@ impl OzApp {
             return;
         }
         let n = self.project.layers.len() + 1;
+        // Même sortie que le calque sélectionné.
+        let output = self.project.layers[self.sel()].output;
         let cfg = LayerConfig {
             name: format!("Calque {n}"),
+            output,
             ..LayerConfig::default()
         };
         // Nouveau calque juste au-dessus du calque sélectionné.
@@ -158,6 +161,7 @@ impl OzApp {
 
         let n = self.project.layers.len();
         let sel = self.sel();
+        let out_names: Vec<String> = self.project.outputs.iter().map(|o| o.name.clone()).collect();
         let mut action: Option<(usize, &str)> = None;
         let columns = self.project.columns;
         let cell_size = Vec2::new(78.0, 30.0);
@@ -222,6 +226,20 @@ impl OzApp {
                                 .clicked()
                             {
                                 cfg.visible = !cfg.visible;
+                            }
+                            // Plusieurs sorties : celle où ce calque s'affiche.
+                            if out_names.len() > 1 {
+                                let short = format!("S{}", cfg.output + 1);
+                                egui::ComboBox::from_id_salt(("layer_out", i))
+                                    .selected_text(short)
+                                    .width(38.0)
+                                    .show_ui(ui, |ui| {
+                                        for (k, name) in out_names.iter().enumerate() {
+                                            ui.selectable_value(&mut cfg.output, k, name);
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(format!("Sortie de ce calque : {}", out_names.get(cfg.output).map_or("", |s| s.as_str())));
                             }
                             if selected {
                                 ui.add(egui::TextEdit::singleline(&mut cfg.name).desired_width(100.0));

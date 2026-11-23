@@ -44,6 +44,8 @@ pub struct LayerConfig {
     pub mask: Mask,
     /// Vidéo chargée sur ce calque (relancée à l'ouverture du projet).
     pub clip: Option<PathBuf>,
+    /// Sortie (index dans `Project::outputs`) où ce calque est affiché.
+    pub output: usize,
     /// Ligne du tableau : cases enregistrées pour ce calque (index = colonne).
     pub cells: Vec<Option<Cell>>,
 }
@@ -133,6 +135,7 @@ impl Default for LayerConfig {
             warp: Warp::default(),
             mask: Mask::default(),
             clip: None,
+            output: 0,
             cells: Vec::new(),
         }
     }
@@ -157,6 +160,23 @@ pub struct Project {
     pub chain: Chain,
     /// LEDs pilotées par des contrôleurs WLED (installation modélisée en 3D).
     pub leds: crate::leds::LedSetup,
+    /// Sorties (chacune sa fenêtre, son écran, ses calques). Au moins une.
+    pub outputs: Vec<OutputDef>,
+}
+
+/// Une sortie : sa fenêtre affiche les calques qui lui sont attribués.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutputDef {
+    pub name: String,
+    /// Écran choisi (sorties 2 et suivantes ; la sortie 1 garde le sien dans la session).
+    pub screen: Option<String>,
+}
+
+impl Default for OutputDef {
+    fn default() -> Self {
+        Self { name: "Sortie 1".into(), screen: None }
+    }
 }
 
 impl Default for Project {
@@ -174,6 +194,7 @@ impl Default for Project {
             columns: 8,
             chain: Chain::default(),
             leds: crate::leds::LedSetup::default(),
+            outputs: vec![OutputDef::default()],
         }
     }
 }
@@ -224,6 +245,16 @@ impl Project {
         }
         self.columns = self.columns.clamp(1, MAX_COLUMNS);
         self.leds.sanitize();
+        if self.outputs.is_empty() {
+            self.outputs.push(OutputDef::default());
+        }
+        let n = self.outputs.len();
+        for l in &mut self.layers {
+            l.output = l.output.min(n - 1);
+        }
+        for s in &mut self.leds.surfaces {
+            s.output = s.output.min(n - 1);
+        }
         for l in &mut self.layers {
             l.warp.sanitize();
             l.mask.sanitize();

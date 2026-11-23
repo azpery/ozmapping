@@ -104,8 +104,12 @@ impl OzApp {
     /// Commande d'un pad (`on` : appui, sinon relâchement).
     fn midi_trigger(&mut self, ctx: &egui::Context, a: &Action, on: bool) {
         if !on {
-            if *a == Action::BlackoutHold {
-                self.blackout = false;
+            match a {
+                Action::BlackoutHold => self.blackout = false,
+                Action::DmxHold { fixture } => {
+                    self.led.bursts.insert(*fixture, self.clock() + 0.15);
+                }
+                _ => {}
             }
             return;
         }
@@ -164,6 +168,23 @@ impl OzApp {
                 self.project.leds.source = crate::leds::Source::Scenario;
                 self.project.leds.scenario.kind = *kind;
                 self.project.leds.scenario.chain = false;
+            }
+            Action::DmxToggle { fixture } => {
+                if let Some(d) = self.project.leds.dmx.iter_mut().find(|d| d.id == *fixture) {
+                    d.on = !d.on;
+                }
+            }
+            Action::DmxHold { fixture } => {
+                self.led.bursts.insert(*fixture, f64::INFINITY);
+            }
+            Action::LaserArm => self.laser.armed = !self.laser.armed,
+            Action::LaserStop => self.laser_stop(),
+            Action::LaserCue { index } => {
+                if let Some(c) = self.project.leds.laser_cues.get(*index).cloned() {
+                    for l in &mut self.project.leds.lasers {
+                        l.cue = c.clone();
+                    }
+                }
             }
             // Commandes de potentiomètre sur un pad : la valeur maximale.
             other => self.midi_value(other, 1.0),
@@ -412,6 +433,8 @@ impl OzApp {
         let presets: Vec<String> =
             self.builtin_presets.iter().chain(&self.project.presets).map(|p| p.name.clone()).collect();
         let media: Vec<String> = self.project.media.iter().map(|p| file_name(p)).collect();
+        let dmx: Vec<(u32, String)> = self.project.leds.dmx.iter().map(|d| (d.id, d.name.clone())).collect();
+        let cues: Vec<String> = self.project.leds.laser_cues.iter().map(|c| c.name.clone()).collect();
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -492,6 +515,22 @@ impl OzApp {
                     egui::ComboBox::from_id_salt("midi_media").selected_text(shown).width(220.0).show_ui(ui, |ui| {
                         for (k, m) in media.iter().enumerate() {
                             ui.selectable_value(index, k, format!("{}. {m}", k + 1));
+                        }
+                    });
+                }
+                Action::DmxToggle { fixture } | Action::DmxHold { fixture } => {
+                    let shown = dmx.iter().find(|d| d.0 == *fixture).map_or("Choisir un appareil…".to_owned(), |d| d.1.clone());
+                    egui::ComboBox::from_id_salt("midi_dmx").selected_text(shown).width(220.0).show_ui(ui, |ui| {
+                        for (id, name) in &dmx {
+                            ui.selectable_value(fixture, *id, name);
+                        }
+                    });
+                }
+                Action::LaserCue { index } => {
+                    let shown = cues.get(*index).cloned().unwrap_or_else(|| format!("Réglage {}", *index + 1));
+                    egui::ComboBox::from_id_salt("midi_laser_cue").selected_text(shown).width(220.0).show_ui(ui, |ui| {
+                        for (k, name) in cues.iter().enumerate() {
+                            ui.selectable_value(index, k, name);
                         }
                     });
                 }

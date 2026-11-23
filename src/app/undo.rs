@@ -90,7 +90,7 @@ impl OzApp {
     }
 
     /// Remet l'état de lecture en accord avec le projet rétabli.
-    fn after_history(&mut self, ctx: &egui::Context) {
+    pub(super) fn after_history(&mut self, ctx: &egui::Context) {
         self.history.pending = None;
         self.history.last_text = None;
         // Une transition d'effets en cours réécrirait les effets rétablis.

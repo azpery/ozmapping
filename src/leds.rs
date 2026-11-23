@@ -53,6 +53,18 @@ pub struct LedSetup {
     pub fixtures: Vec<Fixture>,
     /// Décor de la scène : écrans et surfaces mappées, volumes.
     pub surfaces: Vec<Surface>,
+    /// Appareils DMX de la scène (laser, derby, bulles, fumée…) et leur sortie.
+    pub dmx: Vec<crate::dmx::Fixture>,
+    pub dmx_out: crate::dmx::Output,
+    /// Lasers ILDA (Ether Dream) et réglages de laser mémorisés.
+    pub lasers: Vec<crate::laser::Laser>,
+    pub laser_cues: Vec<crate::laser::Cue>,
+    /// Son qui anime les lasers.
+    pub laser_audio: crate::laser::AudioSettings,
+    /// Photo de référence sous la planche à dessin 2D, sa largeur réelle (m) et son opacité.
+    pub plan_photo: Option<std::path::PathBuf>,
+    pub plan_photo_w: f32,
+    pub plan_bg: f32,
     /// Écran (id) sur lequel l'image des LEDs est calée : les LEDs prolongent son image.
     /// Aucun : l'image couvre l'installation des LEDs, vue selon `projection`.
     pub image_on: Option<u32>,
@@ -62,6 +74,10 @@ pub struct LedSetup {
     pub groups: Vec<LedGroup>,
     /// Scénario joué quand `source` vaut `Source::Scenario`.
     pub scenario: ScenarioSettings,
+    /// Réaction au son, quel que soit l'effet.
+    pub sound: SoundReact,
+    /// Sortie dont l'image est suivie par les LEDs (index dans les sorties du projet).
+    pub video_output: usize,
     /// Ce qu'affichent les LEDs.
     pub source: Source,
     pub test_color: [u8; 3],
@@ -82,10 +98,20 @@ impl Default for LedSetup {
             controllers: vec![Controller::new(1, "ESP32 principal", 0)],
             fixtures: Vec::new(),
             surfaces: Vec::new(),
+            dmx: Vec::new(),
+            dmx_out: crate::dmx::Output::default(),
+            lasers: Vec::new(),
+            laser_cues: Vec::new(),
+            laser_audio: crate::laser::AudioSettings::default(),
+            plan_photo: None,
+            plan_photo_w: 4.0,
+            plan_bg: 0.5,
             image_on: None,
             sets: Vec::new(),
             groups: Vec::new(),
             scenario: ScenarioSettings::default(),
+            sound: SoundReact::default(),
+            video_output: 0,
             source: Source::Video,
             test_color: [255, 120, 0],
             brightness: 1.0,
@@ -324,6 +350,11 @@ impl Fixture {
         path_length(&self.path())
     }
 
+    /// Tracé plat (tous ses points dans le plan local XY) : il se modifie sur la planche 2D.
+    pub fn is_flat(&self) -> bool {
+        self.kind == FixtureKind::Path && self.points.len() >= 2 && self.points.iter().all(|p| p[2].abs() < 1e-4)
+    }
+
     /// Tracé libre à partir de points de la salle : la position devient le premier point.
     pub fn set_path(&mut self, world: &[[f32; 3]], closed: bool) {
         let origin = world.first().copied().unwrap_or_default();
@@ -378,7 +409,7 @@ const CLOTHES: [[u8; 3]; 8] = [
 const SKINS: [[u8; 3]; 4] = [[236, 196, 164], [198, 150, 118], [150, 104, 74], [96, 64, 44]];
 
 /// Nombre pseudo-aléatoire stable (0-1) : la foule garde la même allure d'une image à l'autre.
-fn hash01(a: u32, b: u32, c: u32) -> f32 {
+pub fn hash01(a: u32, b: u32, c: u32) -> f32 {
     let mut h = a.wrapping_mul(0x9E37_79B9) ^ b.wrapping_mul(0x85EB_CA6B) ^ c.wrapping_mul(0xC2B2_AE35);
     h ^= h >> 16;
     h = h.wrapping_mul(0x7FEB_352D);
@@ -481,6 +512,12 @@ pub fn move_block<T>(v: &mut Vec<T>, items: &[usize], at: usize) -> usize {
     target
 }
 
+/// Point local `p` d'un objet posé en `pos`, orienté selon `rot` (degrés), dans la salle.
+pub fn place(pos: [f32; 3], rot: [f32; 3], p: [f32; 3]) -> [f32; 3] {
+    let q = mat_mul(&rotation(rot), p);
+    [q[0] + pos[0], q[1] + pos[1], q[2] + pos[2]]
+}
+
 /// Matrice de rotation (degrés) : Y, puis X, puis Z.
 fn rotation(deg: [f32; 3]) -> [[f32; 3]; 3] {
     let [y, x, z] = deg.map(f32::to_radians);
@@ -520,16 +557,31 @@ pub enum SurfaceKind {
     Crowd,
     /// Panneaux ondulés superposés (comme « les chips ») : largeur totale × hauteur maximale.
     Panels,
+    /// Caisson de basses (kick / bass) : la membrane bat sur les temps.
+    Sub,
+    /// Enceinte d'aigus (tops), sur pied (hauteur du pied : `stand`).
+    Top,
+    /// Pont (structure en treillis) : deux tours et une poutre ; largeur = portée.
+    Truss,
+    /// Soleil à rayons (disque plat), diamètre = largeur.
+    Sun,
+    /// Vidéoprojecteur : projette l'image d'une sortie sur ce qu'il y a devant lui.
+    Projector,
 }
 
 impl SurfaceKind {
-    pub const ALL: [SurfaceKind; 6] = [
+    pub const ALL: [SurfaceKind; 11] = [
         SurfaceKind::Screen,
         SurfaceKind::Box,
         SurfaceKind::Stage,
         SurfaceKind::Booth,
         SurfaceKind::Crowd,
         SurfaceKind::Panels,
+        SurfaceKind::Sub,
+        SurfaceKind::Top,
+        SurfaceKind::Truss,
+        SurfaceKind::Sun,
+        SurfaceKind::Projector,
     ];
 
     pub fn name(self) -> &'static str {
@@ -540,6 +592,11 @@ impl SurfaceKind {
             SurfaceKind::Booth => "Cabine DJ",
             SurfaceKind::Crowd => "Public",
             SurfaceKind::Panels => "Panneaux superposés",
+            SurfaceKind::Sub => "Caisson de basses",
+            SurfaceKind::Top => "Enceinte d'aigus",
+            SurfaceKind::Truss => "Pont",
+            SurfaceKind::Sun => "Soleil",
+            SurfaceKind::Projector => "Vidéoprojecteur",
         }
     }
 }
@@ -588,7 +645,7 @@ impl Default for Panels {
             wave: 0.035,
             inner: [244, 186, 40],
             outer: [214, 36, 48],
-            sun: 1.3,
+            sun: 0.0,
             sun_color: [242, 200, 30],
         }
     }
@@ -632,6 +689,12 @@ pub struct Surface {
     pub panels: Panels,
     /// Groupe d'objets de la scène (id, 0 : aucun).
     pub set: u32,
+    /// Hauteur du pied d'une enceinte d'aigus (m).
+    pub stand: f32,
+    /// Sortie affichée (index dans les sorties du projet) quand `show_output` est coché.
+    pub output: usize,
+    /// Vidéoprojecteur : rapport de projection (distance / largeur de l'image).
+    pub throw: f32,
 }
 
 impl Default for Surface {
@@ -651,6 +714,9 @@ impl Default for Surface {
             dance: 0.7,
             panels: Panels::default(),
             set: 0,
+            stand: 1.2,
+            output: 0,
+            throw: 1.5,
         }
     }
 }
@@ -664,7 +730,7 @@ impl Surface {
     }
 
     fn front_z(&self) -> f32 {
-        if self.kind == SurfaceKind::Screen { 0.0 } else { -self.size[2] / 2.0 }
+        if matches!(self.kind, SurfaceKind::Screen | SurfaceKind::Sun) { 0.0 } else { -self.size[2] / 2.0 }
     }
 
     /// Hauteur du dessus (pour poser un objet sur une scène).
@@ -691,6 +757,9 @@ impl Surface {
         }
         if self.kind == SurfaceKind::Panels {
             return self.panel_faces();
+        }
+        if self.kind == SurfaceKind::Sun {
+            return self.sun_faces();
         }
         let mut faces = Vec::new();
         for (lo, hi, color, output) in self.blocks(beat) {
@@ -810,6 +879,36 @@ impl Surface {
         faces
     }
 
+    /// Soleil à rayons, à plat face à l'avant : le bas du disque à la position de l'objet.
+    fn sun_faces(&self) -> Vec<Face3> {
+        let d = self.size[0].max(0.05);
+        let r = d / 2.0;
+        let (cx, cy) = (0.0, r);
+        let [u0, v0, u1, v1] = self.crop;
+        let uv = |x: f32, y: f32| {
+            let (s, t) = ((x / d + 0.5).clamp(0.0, 1.0), (1.0 - y / d).clamp(0.0, 1.0));
+            [u0 + s * (u1 - u0), v0 + t * (v1 - v0)]
+        };
+        let n = 32;
+        let pt = |k: usize| {
+            let a = k as f32 / n as f32 * std::f32::consts::TAU;
+            let rr = if k % 2 == 0 { r } else { r * 0.8 };
+            [cx + a.sin() * rr, cy + a.cos() * rr, 0.0]
+        };
+        (0..n)
+            .map(|k| {
+                let local = [pt(k), pt(k + 1), [cx, cy, 0.0], [cx, cy, 0.0]];
+                Face3 {
+                    quad: local.map(|q| self.world(q)),
+                    color: self.color,
+                    output: self.show_output,
+                    uv: local.map(|q| uv(q[0], q[1])),
+                    edges: 0b0001,
+                }
+            })
+            .collect()
+    }
+
     /// Tracés des bandes LED entre les panneaux : derrière le bord extérieur de chaque panneau
     /// (deux bords pour celui du centre), au milieu de l'écart avec la couche suivante.
     /// Chaque tracé vient avec son côté (-1 : gauche, 1 : droite) ; de gauche à droite.
@@ -845,7 +944,7 @@ impl Surface {
         let [w, h, d] = self.size;
         let (hw, hd) = (w / 2.0, d / 2.0);
         match self.kind {
-            SurfaceKind::Screen | SurfaceKind::Panels => Vec::new(),
+            SurfaceKind::Screen | SurfaceKind::Panels | SurfaceKind::Sun => Vec::new(),
             SurfaceKind::Box | SurfaceKind::Stage => vec![([-hw, 0.0, -hd], [hw, h, hd], self.color, self.show_output)],
             SurfaceKind::Booth => {
                 let t = 0.04;
@@ -866,6 +965,83 @@ impl Surface {
                 if self.dj {
                     b.extend(dj_blocks(hd + 0.35, beat));
                 }
+                b
+            }
+            SurfaceKind::Projector => {
+                // Boîtier et objectif (sur la face avant).
+                let lens = (h.min(w) * 0.3).max(0.03);
+                vec![
+                    ([-hw, 0.0, -hd], [hw, h, hd], self.color, false),
+                    ([-lens, h * 0.5 - lens, -hd - 0.04], [lens, h * 0.5 + lens, -hd], [20, 20, 24], false),
+                ]
+            }
+            SurfaceKind::Sub => {
+                // Caisson, façade, deux haut-parleurs qui avancent sur les temps (le kick).
+                let kick = 0.035 * (-(beat.fract()) * 7.0).exp();
+                let dark = [18, 18, 20];
+                let mut b = vec![([-hw, 0.0, -hd], [hw, h, hd], self.color, false)];
+                for k in 0..2 {
+                    let y0 = h * (0.08 + 0.48 * k as f32);
+                    let s = (w.min(h * 0.46) * 0.42).min(hw * 0.8);
+                    b.push(([-s, y0, -hd - 0.01 - kick], [s, y0 + 2.0 * s.min(h * 0.21), -hd], dark, false));
+                }
+                b
+            }
+            SurfaceKind::Top => {
+                // Pied, enceinte, pavillon d'aigus et haut-parleur de grave.
+                let y0 = self.stand.max(0.0);
+                let pole = 0.025;
+                let dark = [18, 18, 20];
+                vec![
+                    ([-pole, 0.0, -pole], [pole, y0, pole], [90, 90, 96], false),
+                    ([-hw * 0.9, 0.0, -hd * 0.9], [hw * 0.9, 0.03, hd * 0.9], [90, 90, 96], false),
+                    ([-hw, y0, -hd], [hw, y0 + h, hd], self.color, false),
+                    ([-hw * 0.6, y0 + h * 0.62, -hd - 0.01], [hw * 0.6, y0 + h * 0.9, -hd], dark, false),
+                    ([-hw * 0.7, y0 + h * 0.08, -hd - 0.01], [hw * 0.7, y0 + h * 0.55, -hd], dark, false),
+                ]
+            }
+            SurfaceKind::Truss => {
+                // Treillis : 4 membrures par tour et pour la poutre, des barreaux tous les 50 cm.
+                let sec = d.clamp(0.15, 0.6);
+                let (c, t) = (sec / 2.0, 0.025);
+                let col = self.color;
+                let mut b = Vec::new();
+                let segment = |a: [f32; 3], len: f32, axis: usize, b: &mut Vec<Block>| {
+                    // Quatre membrures parallèles à `axis`, autour de l'axe passant par `a`.
+                    let others: Vec<usize> = (0..3).filter(|&k| k != axis).collect();
+                    for (s0, s1) in [(-1.0, -1.0), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+                        let mut lo = a;
+                        let mut hi = a;
+                        hi[axis] += len;
+                        for (k, sg) in others.iter().zip([s0, s1]) {
+                            lo[*k] += sg * c - t;
+                            hi[*k] += sg * c + t;
+                        }
+                        b.push((lo, hi, col, false));
+                    }
+                    // Barreaux.
+                    let n = (len / 0.5).floor() as usize;
+                    for i in 0..=n {
+                        let p = (i as f32 * 0.5).min(len);
+                        for (k_bar, k_off) in [(others[0], others[1]), (others[1], others[0])] {
+                            for sg in [-1.0f32, 1.0] {
+                                let mut lo = a;
+                                let mut hi = a;
+                                lo[axis] += p - t;
+                                hi[axis] += p + t;
+                                lo[k_bar] -= c;
+                                hi[k_bar] += c;
+                                lo[k_off] += sg * c - t;
+                                hi[k_off] += sg * c + t;
+                                b.push((lo, hi, col, false));
+                            }
+                        }
+                    }
+                };
+                // Deux tours (verticales, axe Y) et la poutre (axe X) posée dessus.
+                segment([-hw + c, 0.0, 0.0], h - sec, 1, &mut b);
+                segment([hw - c, 0.0, 0.0], h - sec, 1, &mut b);
+                segment([-hw, h - c, 0.0], w, 0, &mut b);
                 b
             }
             SurfaceKind::Crowd => {
@@ -901,6 +1077,28 @@ impl Surface {
         [q[0] + self.pos[0], q[1] + self.pos[1], q[2] + self.pos[2]]
     }
 
+    /// Objectif d'un vidéoprojecteur (dans la salle).
+    pub fn lens(&self) -> [f32; 3] {
+        self.world([0.0, self.size[1] * 0.5, -self.size[2] * 0.5 - 0.04])
+    }
+
+    /// Vidéoprojecteur : point de son image (0-1, y vers le bas) qui éclaire le point `p` de la
+    /// salle ; aucun s'il est derrière l'objectif. `aspect` : largeur / hauteur de l'image.
+    pub fn projected_uv(&self, p: [f32; 3], aspect: f32) -> Option<[f32; 2]> {
+        let m = rotation(self.rot);
+        let o = self.lens();
+        let d = [p[0] - o[0], p[1] - o[1], p[2] - o[2]];
+        // Rotation inverse (transposée) : repère du projecteur, qui regarde vers -Z.
+        let l = [0, 1, 2].map(|i| m[0][i] * d[0] + m[1][i] * d[1] + m[2][i] * d[2]);
+        if l[2] > -0.02 {
+            return None;
+        }
+        let throw = self.throw.clamp(0.2, 10.0);
+        let u = 0.5 + l[0] / -l[2] * throw;
+        let v = 0.5 - l[1] / -l[2] * throw * aspect.max(0.1);
+        Some([u, v])
+    }
+
     /// Point de l'image de sortie (0-1) qui tombe, de face, sur un point de la salle.
     pub fn image_uv(&self, p: [f32; 3]) -> [f32; 2] {
         let m = rotation(self.rot);
@@ -919,6 +1117,8 @@ pub enum Source {
     /// L'image de la sortie, plaquée sur les LEDs.
     #[default]
     Video,
+    /// Couleur dominante de la vidéo, lissée, sur tout le bandeau (éclairage d'ambiance).
+    VideoAverage,
     /// Scénario qui fait jouer les groupes de bandeaux les uns avec les autres.
     Scenario,
     Solid,
@@ -935,8 +1135,9 @@ pub enum Source {
 }
 
 impl Source {
-    pub const ALL: [Source; 10] = [
+    pub const ALL: [Source; 11] = [
         Source::Video,
+        Source::VideoAverage,
         Source::Scenario,
         Source::Solid,
         Source::Rainbow,
@@ -950,7 +1151,8 @@ impl Source {
 
     pub fn name(self) -> &'static str {
         match self {
-            Source::Video => "Image de la sortie",
+            Source::Video => "Image de la sortie (chaque LED à sa place)",
+            Source::VideoAverage => "Couleur de la vidéo (ambiance)",
             Source::Scenario => "Scénario (les bandeaux jouent ensemble)",
             Source::Solid => "Couleur unie",
             Source::Rainbow => "Arc-en-ciel",
@@ -971,11 +1173,64 @@ impl Source {
 pub struct LedGroup {
     pub id: u32,
     pub name: String,
+    /// Effet propre au groupe de bandeaux (aucun : l'effet général de l'onglet Sortie).
+    pub effect: Option<GroupEffect>,
 }
 
 impl Default for LedGroup {
     fn default() -> Self {
-        Self { id: 1, name: "Groupe 1".into() }
+        Self { id: 1, name: "Groupe 1".into(), effect: None }
+    }
+}
+
+/// Réaction des LEDs au son (onglet Rythme : micro, carte son, ou tempo tapé).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundReact {
+    /// La luminosité suit le volume (0 : pas du tout, 1 : entièrement).
+    pub follow: f32,
+    /// Flash sur les temps : allumées sur le temps, puis elles retombent (0 à 1).
+    pub flash: f32,
+    /// Les basses (le kick) plutôt que tout le son.
+    pub bass: bool,
+}
+
+impl Default for SoundReact {
+    fn default() -> Self {
+        Self { follow: 0.0, flash: 0.0, bass: true }
+    }
+}
+
+impl SoundReact {
+    /// Facteur de luminosité pour ce niveau et cette enveloppe de temps.
+    pub fn factor(&self, m: &Music) -> f32 {
+        let lv = if self.bass { m.bass } else { m.level }.clamp(0.0, 1.0);
+        let follow = 1.0 - self.follow.clamp(0.0, 1.0) * (1.0 - lv);
+        let flash = 1.0 - self.flash.clamp(0.0, 1.0) * (1.0 - m.env.clamp(0.0, 1.0));
+        follow * flash
+    }
+}
+
+/// Effet d'un groupe de bandeaux, à la place de l'effet général.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GroupEffect {
+    pub source: Source,
+    /// Scénario (si `source` est un scénario).
+    pub scenario: ScenarioKind,
+    /// Couleur (si `source` est une couleur unie).
+    pub color: [u8; 3],
+    /// Luminosité du groupe (0-1).
+    pub brightness: f32,
+    /// Réagit au son (réglages généraux de l'onglet Sortie).
+    pub sound: bool,
+    /// Sortie suivie (image, couleur de la vidéo) ; aucune : celle de l'effet général.
+    pub output: Option<usize>,
+}
+
+impl Default for GroupEffect {
+    fn default() -> Self {
+        Self { source: Source::Video, scenario: ScenarioKind::Wave, color: [255, 120, 0], brightness: 1.0, sound: true, output: None }
     }
 }
 
@@ -1047,6 +1302,75 @@ impl Default for ScenarioSettings {
     }
 }
 
+/// Ordre des groupes automatiques.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupOrder {
+    /// Paires symétriques gauche/droite, du centre vers les bords.
+    CenterOut,
+    LeftRight,
+    /// De l'avant de la salle vers le fond (un tunnel).
+    FrontBack,
+}
+
+/// Tunnel d'arches LED : des arches identiques, l'une derrière l'autre, et des bandes au sol.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tunnel {
+    pub arches: u32,
+    /// Profondeur de la première arche, écart entre deux arches (m).
+    pub start: f32,
+    pub spacing: f32,
+    /// Largeur, hauteur des murs (départ de la voûte), hauteur totale (m).
+    pub width: f32,
+    pub wall: f32,
+    pub height: f32,
+    /// Voûte arrondie (sinon à pans, comme une cave).
+    pub round: bool,
+    /// Bandes au sol le long du tunnel, de chaque côté.
+    pub floor: bool,
+    /// LEDs par mètre.
+    pub density: f32,
+}
+
+impl Default for Tunnel {
+    fn default() -> Self {
+        Self { arches: 5, start: 1.5, spacing: 1.2, width: 3.6, wall: 1.6, height: 2.6, round: false, floor: true, density: 60.0 }
+    }
+}
+
+impl Tunnel {
+    /// Tracés (nom, points) : chaque arche part du sol à gauche et finit au sol à droite.
+    pub fn paths(&self) -> Vec<(String, Vec<[f32; 3]>)> {
+        let n = self.arches.clamp(1, 50);
+        let (hw, wall, top) = (self.width / 2.0, self.wall.min(self.height), self.height.max(self.wall));
+        let mut out = Vec::new();
+        for k in 0..n {
+            let z = self.start + k as f32 * self.spacing;
+            let profile: Vec<[f32; 2]> = if self.round {
+                // Mur, puis demi-ellipse jusqu'au sommet.
+                let mut p = vec![[-hw, 0.0]];
+                for i in 0..=16 {
+                    let a = std::f32::consts::PI * (1.0 - i as f32 / 16.0);
+                    p.push([hw * a.cos(), wall + (top - wall) * a.sin()]);
+                }
+                p.push([hw, 0.0]);
+                p
+            } else {
+                // Voûte à pans : murs droits, deux pans, plafond plat.
+                vec![[-hw, 0.0], [-hw, wall], [-hw * 0.45, top], [hw * 0.45, top], [hw, wall], [hw, 0.0]]
+            };
+            out.push((format!("Arche {}", k + 1), profile.into_iter().map(|[x, y]| [x, y, z]).collect()));
+        }
+        if self.floor {
+            let z1 = self.start + (n - 1) as f32 * self.spacing;
+            for (side, name) in [(-1.0, "Sol gauche"), (1.0, "Sol droite")] {
+                let x = side * hw * 0.92;
+                out.push((name.to_owned(), vec![[x, 0.02, self.start - 0.5], [x, 0.02, z1]]));
+            }
+        }
+        out
+    }
+}
+
 /// Couleurs des groupes, du centre vers l'extérieur (celles d'organic_tears_drops).
 const GROUP_COLORS: [[u8; 3]; 26] = [
     [255, 255, 175],
@@ -1077,11 +1401,33 @@ const GROUP_COLORS: [[u8; 3]; 26] = [
     [0, 255, 51],
 ];
 
+/// Images des sorties lues pour les LEDs : image (par sortie) et couleur dominante lissée.
+#[derive(Default)]
+pub struct VideoIn<'a> {
+    pub frames: HashMap<usize, &'a Frame>,
+    pub avg: HashMap<usize, [f32; 3]>,
+    /// Sortie suivie par défaut.
+    pub main: usize,
+}
+
+impl VideoIn<'_> {
+    fn sample(&self, out: usize, uv: [f32; 2]) -> [f32; 3] {
+        self.frames.get(&out).map_or([0.0; 3], |f| f.sample(uv))
+    }
+
+    fn average(&self, out: usize) -> [f32; 3] {
+        self.avg.get(&out).copied().unwrap_or([0.0; 3])
+    }
+}
+
 /// Musique au moment de l'image : numéro du temps (fractionnaire) et niveau du son (0-1).
 #[derive(Clone, Copy, Default)]
 pub struct Music {
     pub beat: f32,
     pub level: f32,
+    /// Enveloppe du dernier temps (1 au temps, retombe vers 0) et niveau des basses (0-1).
+    pub env: f32,
+    pub bass: f32,
 }
 
 /// Couleur d'une LED dans un scénario : groupe `g` sur `n`, position `u` (0-1) le long de son
@@ -1270,7 +1616,13 @@ impl LedSetup {
     /// Pivot d'un groupe : milieu en largeur et profondeur, au niveau de son point le plus bas.
     pub fn set_pivot(&self, id: u32) -> [f32; 3] {
         let (fs, ss) = self.set_members(id);
-        let pts: Vec<[f32; 3]> = fs.iter().map(|&i| self.fixtures[i].pos).chain(ss.iter().map(|&i| self.surfaces[i].pos)).collect();
+        let pts: Vec<[f32; 3]> = fs
+            .iter()
+            .map(|&i| self.fixtures[i].pos)
+            .chain(ss.iter().map(|&i| self.surfaces[i].pos))
+            .chain(self.dmx.iter().filter(|d| id != 0 && d.set == id).map(|d| d.pos))
+            .chain(self.lasers.iter().filter(|l| id != 0 && l.set == id).map(|l| l.pos))
+            .collect();
         if pts.is_empty() {
             return [0.0; 3];
         }
@@ -1295,6 +1647,12 @@ impl LedSetup {
             let p = &mut self.surfaces[i].pos;
             *p = [p[0] + d[0], p[1] + d[1], p[2] + d[2]];
         }
+        for x in self.dmx.iter_mut().filter(|x| id != 0 && x.set == id) {
+            x.pos = [x.pos[0] + d[0], x.pos[1] + d[1], x.pos[2] + d[2]];
+        }
+        for x in self.lasers.iter_mut().filter(|x| id != 0 && x.set == id) {
+            x.pos = [x.pos[0] + d[0], x.pos[1] + d[1], x.pos[2] + d[2]];
+        }
     }
 
     /// Tourne tout le groupe autour de la verticale passant par son pivot.
@@ -1318,6 +1676,14 @@ impl LedSetup {
             let s = &mut self.surfaces[i];
             turn(&mut s.pos);
             s.rot[0] = (s.rot[0] + deg).rem_euclid(360.0);
+        }
+        for x in self.dmx.iter_mut().filter(|x| id != 0 && x.set == id) {
+            turn(&mut x.pos);
+            x.rot[0] = (x.rot[0] + deg).rem_euclid(360.0);
+        }
+        for x in self.lasers.iter_mut().filter(|x| id != 0 && x.set == id) {
+            turn(&mut x.pos);
+            x.rot[0] = (x.rot[0] + deg).rem_euclid(360.0);
         }
     }
 
@@ -1348,6 +1714,12 @@ impl LedSetup {
             s.panels.wave *= k;
             s.panels.sun *= k;
         }
+        for x in self.dmx.iter_mut().filter(|x| id != 0 && x.set == id) {
+            sc(&mut x.pos);
+        }
+        for x in self.lasers.iter_mut().filter(|x| id != 0 && x.set == id) {
+            sc(&mut x.pos);
+        }
     }
 
     /// Retire les groupes d'objets vides ou réduits à un seul membre.
@@ -1358,7 +1730,7 @@ impl LedSetup {
             .map(|g| g.id)
             .filter(|&id| {
                 let (f, s) = self.set_members(id);
-                f.len() + s.len() > 1
+                f.len() + s.len() + self.dmx.iter().filter(|d| d.set == id).count() + self.lasers.iter().filter(|l| l.set == id).count() > 1
             })
             .collect();
         self.sets.retain(|g| keep.contains(&g.id));
@@ -1372,44 +1744,70 @@ impl LedSetup {
                 s.set = 0;
             }
         }
+        for d in &mut self.dmx {
+            if !keep.contains(&d.set) {
+                d.set = 0;
+            }
+        }
+        for l in &mut self.lasers {
+            if !keep.contains(&l.set) {
+                l.set = 0;
+            }
+        }
     }
 
     pub fn next_group_id(&self) -> u32 {
         self.groups.iter().map(|g| g.id).max().unwrap_or(0) + 1
     }
 
-    /// Groupes automatiques : `center_out` = paires symétriques du centre vers les bords
-    /// (comme les chips gauche et droite), sinon de gauche à droite, un élément par groupe.
-    pub fn auto_groups(&mut self, center_out: bool) {
-        let centers: Vec<f32> = self
-            .fixtures
-            .iter()
-            .map(|f| {
-                let p = f.positions();
-                p.iter().map(|q| q[0]).sum::<f32>() / p.len().max(1) as f32
+    /// Groupes automatiques : un groupe par élément (ou par paire symétrique, ou par rangée),
+    /// dans l'ordre demandé ; des éléments à moins de 10 cm l'un de l'autre (selon cet ordre)
+    /// forment un même groupe, sauf de gauche à droite.
+    pub fn auto_groups(&mut self, order: GroupOrder) {
+        let all = self.leds();
+        let centers: Vec<[f32; 3]> = (0..self.fixtures.len())
+            .map(|fi| {
+                let p: Vec<[f32; 3]> = all.iter().filter(|l| l.fixture == fi).map(|l| l.pos).collect();
+                let n = p.len().max(1) as f32;
+                [0, 1, 2].map(|k| p.iter().map(|q| q[k]).sum::<f32>() / n)
             })
             .collect();
         let mid = if centers.is_empty() {
             0.0
         } else {
-            let (lo, hi) = centers.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+            let (lo, hi) = centers.iter().fold((f32::MAX, f32::MIN), |(a, b), c| (a.min(c[0]), b.max(c[0])));
             (lo + hi) / 2.0
         };
-        // Clé de tri de chaque élément ; des clés proches (10 cm) forment un même groupe.
-        let key = |x: f32| if center_out { (x - mid).abs() } else { x };
-        let mut order: Vec<usize> = (0..self.fixtures.len()).collect();
-        order.sort_by(|&a, &b| key(centers[a]).total_cmp(&key(centers[b])));
+        // Clé de tri de chaque élément.
+        let key = |c: [f32; 3]| match order {
+            GroupOrder::CenterOut => (c[0] - mid).abs(),
+            GroupOrder::LeftRight => c[0],
+            GroupOrder::FrontBack => c[2],
+        };
+        let merge = order != GroupOrder::LeftRight;
+        let mut idx: Vec<usize> = (0..self.fixtures.len()).collect();
+        idx.sort_by(|&a, &b| key(centers[a]).total_cmp(&key(centers[b])));
         self.groups.clear();
         let mut last: Option<f32> = None;
-        for i in order {
+        for i in idx {
             let k = key(centers[i]);
-            if !center_out || last.is_none_or(|l| (k - l).abs() > 0.1) {
+            if !merge || last.is_none_or(|l| (k - l).abs() > 0.1) {
                 let id = self.next_group_id();
-                self.groups.push(LedGroup { id, name: format!("Groupe {id}") });
+                self.groups.push(LedGroup { id, name: format!("Groupe {id}"), effect: None });
             }
             last = Some(k);
             self.fixtures[i].group = self.groups.last().unwrap().id;
         }
+    }
+
+    pub fn next_dmx_id(&self) -> u32 {
+        self.dmx.iter().map(|d| d.id).max().unwrap_or(0) + 1
+    }
+
+    /// Première adresse libre de l'univers 0 pour `n` canaux.
+    pub fn next_dmx_address(&self, n: usize) -> u16 {
+        let end = self.dmx.iter().filter(|d| d.universe == 0).map(|d| d.last_address()).max().unwrap_or(0);
+        if end as usize + n <= 512 { end + 1 } else { 1 }
     }
 
     pub fn next_surface_id(&self) -> u32 {
@@ -1545,6 +1943,28 @@ pub struct Frame {
 }
 
 impl Frame {
+    /// Couleur moyenne de toute l'image (un pixel sur 4 dans chaque sens), plus vive : les zones
+    /// sombres comptent moins, pour garder la teinte dominante plutôt qu'un gris.
+    pub fn average(&self) -> [f32; 3] {
+        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+        if w == 0 || h == 0 || self.pixels.len() < w * h * 4 {
+            return [0.0; 3];
+        }
+        let (mut acc, mut wsum) = ([0.0f32; 3], 0.0f32);
+        for y in (0..h).step_by(4) {
+            for x in (0..w).step_by(4) {
+                let i = (y * w + x) * 4;
+                let p = [0, 1, 2].map(|k| f32::from(self.pixels[i + k]));
+                let weight = 0.05 + p.iter().copied().fold(0.0, f32::max) / 255.0;
+                for k in 0..3 {
+                    acc[k] += p[k] * weight;
+                }
+                wsum += weight;
+            }
+        }
+        acc.map(|v| v / wsum.max(1e-6))
+    }
+
     /// Couleur moyenne autour d'un point (u, v : 0-1, v vers le bas).
     fn sample(&self, uv: [f32; 2]) -> [f32; 3] {
         let (w, h) = (self.size.0 as i32, self.size.1 as i32);
@@ -1589,7 +2009,7 @@ pub fn hue(h: f32) -> [f32; 3] {
 pub fn colors(
     setup: &LedSetup,
     leds: &[Led],
-    frame: &Frame,
+    video: &VideoIn,
     time: f32,
     level: f32,
     flash: Option<(usize, f32)>,
@@ -1631,20 +2051,32 @@ pub fn colors(
         [a * 255.0, a * 255.0, a * 255.0]
     };
     let n_fix = setup.fixtures.len().max(1);
+    let sound = setup.sound.factor(&music);
+    // Effet propre à chaque groupe de bandeaux (s'il en a un).
+    let effect_of: Vec<Option<&GroupEffect>> = setup
+        .fixtures
+        .iter()
+        .map(|f| setup.groups.iter().find(|g| g.id == f.group).and_then(|g| g.effect.as_ref()))
+        .collect();
     leds.iter()
         .map(|l| {
-            let c = match setup.source {
-                Source::Video => frame.sample(l.uv),
+            let fx = effect_of.get(l.fixture).copied().flatten();
+            let source = fx.map_or(setup.source, |e| e.source);
+            let c = match source {
+                Source::Video => video.sample(fx.and_then(|e| e.output).unwrap_or(video.main), l.uv),
+                Source::VideoAverage => video.average(fx.and_then(|e| e.output).unwrap_or(video.main)),
                 Source::Scenario => match group_of.get(l.fixture).copied().flatten() {
                     Some(g) => {
                         let len = setup.fixtures.get(l.fixture).map_or(1, Fixture::led_count);
                         let u = if len > 1 { l.index as f32 / (len - 1) as f32 } else { 0.5 };
                         let id = (l.fixture as u32) << 16 | l.index as u32;
-                        scenario_color(sc, kind, g, n_groups, u, id, t_sc, time, music.level).map(|v| v * fade)
+                        // Un groupe qui a son scénario ne suit pas l'enchaînement général.
+                        let (k, f) = fx.map_or((kind, fade), |e| (e.scenario, 1.0));
+                        scenario_color(sc, k, g, n_groups, u, id, t_sc, time, music.level).map(|v| v * f)
                     }
                     None => [0.0; 3],
                 },
-                Source::Solid => setup.test_color.map(f32::from),
+                Source::Solid => fx.map_or(setup.test_color, |e| e.color).map(f32::from),
                 Source::Rainbow => hue(l.uv[0] * 0.8 + l.uv[1] * 0.3 - time * 0.25),
                 Source::Chase => {
                     let n = setup.fixtures.get(l.fixture).map_or(1, Fixture::led_count) as f32;
@@ -1676,7 +2108,11 @@ pub fn colors(
                         [0.0; 3]
                     }
                 }
-                None => c.map(|v| v * setup.brightness * level),
+                None => {
+                    // Son : un groupe qui a son effet peut ne pas y réagir.
+                    let react = if fx.is_none_or(|e| e.sound) { sound } else { 1.0 };
+                    c.map(|v| v * setup.brightness * level * react * fx.map_or(1.0, |e| e.brightness))
+                }
             };
             c.map(|v| v.round().clamp(0.0, 255.0) as u8)
         })
@@ -2076,14 +2512,14 @@ mod tests {
     fn center_out_groups_pair_left_and_right() {
         let mut s = LedSetup::default();
         s.columns_example();
-        s.auto_groups(true);
+        s.auto_groups(GroupOrder::CenterOut);
         // 8 colonnes face à face (x = ±2,22 m) : toutes à la même distance du centre, mais
         // en profondeur différente → un seul groupe en largeur.
         assert_eq!(s.groups.len(), 1);
-        s.auto_groups(false);
+        s.auto_groups(GroupOrder::LeftRight);
         assert_eq!(s.groups.len(), 8);
         let leds = s.leds();
-        let c = colors(&s, &leds, &Frame::default(), 0.0, 1.0, None, Music::default());
+        let c = colors(&s, &leds, &VideoIn::default(), 0.0, 1.0, None, Music::default());
         assert_eq!(c.len(), leds.len());
     }
 
@@ -2091,7 +2527,7 @@ mod tests {
     fn sets_move_turn_and_scale_together() {
         let mut s = LedSetup::default();
         s.columns_example();
-        s.sets.push(LedGroup { id: 1, name: "A".into() });
+        s.sets.push(LedGroup { id: 1, name: "A".into(), effect: None });
         s.fixtures[0].set = 1;
         s.fixtures[4].set = 1;
         let (a, b) = (s.fixtures[0].pos, s.fixtures[4].pos);
@@ -2121,6 +2557,73 @@ mod tests {
         let mut v: Vec<u8> = (0..4).collect();
         move_block(&mut v, &[2, 3], 0);
         assert_eq!(v, [2, 3, 0, 1]);
+    }
+
+    #[test]
+    fn tunnel_groups_run_front_to_back() {
+        let t = Tunnel::default();
+        let paths = t.paths();
+        assert_eq!(paths.len(), 7);
+        let mut s = LedSetup::default();
+        for (k, (name, pts)) in paths.into_iter().enumerate() {
+            let mut f = Fixture::new(FixtureKind::Path, k as u32 + 1, name);
+            f.set_path(&pts, false);
+            s.fixtures.push(f);
+        }
+        s.auto_groups(GroupOrder::FrontBack);
+        // Arche 1 dans le premier groupe, arche 5 après l'arche 4.
+        let rank = |i: usize| s.groups.iter().position(|g| g.id == s.fixtures[i].group).unwrap();
+        assert_eq!(rank(0), 0);
+        assert!(rank(4) > rank(3));
+    }
+
+    #[test]
+    fn groups_can_have_their_own_effect() {
+        let mut s = LedSetup::default();
+        s.columns_example();
+        s.source = Source::Off;
+        s.groups.push(LedGroup {
+            id: 1,
+            name: "A".into(),
+            effect: Some(GroupEffect { source: Source::Solid, color: [10, 20, 30], ..GroupEffect::default() }),
+        });
+        s.groups.push(LedGroup { id: 2, name: "B".into(), effect: None });
+        s.fixtures[0].group = 1;
+        s.fixtures[1].group = 2;
+        let leds = s.leds();
+        let c = colors(&s, &leds, &VideoIn::default(), 0.0, 1.0, None, Music::default());
+        assert_eq!(c[0], [10, 20, 30]); // groupe A : sa couleur
+        assert_eq!(c[30], [0, 0, 0]); // groupe B : l'effet général (noir)
+        // Le groupe B suit la couleur de la sortie 2.
+        let v = VideoIn { avg: [(1, [200.0, 100.0, 0.0])].into_iter().collect(), ..VideoIn::default() };
+        s.groups[1].effect = Some(GroupEffect { source: Source::VideoAverage, output: Some(1), ..GroupEffect::default() });
+        let c = colors(&s, &leds, &v, 0.0, 1.0, None, Music::default());
+        assert_eq!(c[30], [200, 100, 0]);
+    }
+
+    #[test]
+    fn leds_follow_the_sound() {
+        let r = SoundReact { follow: 1.0, flash: 0.0, bass: true };
+        let quiet = Music { bass: 0.1, ..Music::default() };
+        let loud = Music { bass: 0.9, ..Music::default() };
+        assert!(r.factor(&quiet) < 0.2 && r.factor(&loud) > 0.8);
+        let f = SoundReact { follow: 0.0, flash: 1.0, bass: true };
+        assert!(f.factor(&Music { env: 1.0, ..Music::default() }) > 0.99);
+        assert!(f.factor(&Music { env: 0.0, ..Music::default() }) < 0.01);
+        assert!((SoundReact::default().factor(&quiet) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn projector_hits_the_centre_straight_ahead() {
+        let p = Surface { kind: SurfaceKind::Projector, pos: [0.0, 1.0, 0.0], size: [0.4, 0.2, 0.3], throw: 1.0, ..Surface::default() };
+        let o = p.lens();
+        // 2 m devant l'objectif (vers -Z) : le centre de l'image.
+        let uv = p.projected_uv([o[0], o[1], o[2] - 2.0], 16.0 / 9.0).unwrap();
+        assert!((uv[0] - 0.5).abs() < 1e-4 && (uv[1] - 0.5).abs() < 1e-4);
+        // Rapport 1 : à 2 m, l'image fait 2 m de large ; 1 m à droite = bord droit.
+        let uv = p.projected_uv([o[0] + 1.0, o[1], o[2] - 2.0], 16.0 / 9.0).unwrap();
+        assert!((uv[0] - 1.0).abs() < 1e-4);
+        assert!(p.projected_uv([o[0], o[1], o[2] + 1.0], 1.0).is_none());
     }
 
     #[test]

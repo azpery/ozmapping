@@ -209,6 +209,14 @@ pub enum Action {
     LedLive,
     /// Scénario LED.
     LedScenario { kind: ScenarioKind },
+    /// Appareil DMX (id) : allumer / éteindre.
+    DmxToggle { fixture: u32 },
+    /// Appareil DMX (id) à fond tant qu'on appuie (fumée, bulles, flash).
+    DmxHold { fixture: u32 },
+    /// Lasers ILDA : armer / désarmer, tout arrêter, réglage mémorisé (rang) sur tous les lasers.
+    LaserArm,
+    LaserStop,
+    LaserCue { index: usize },
     // --- Potentiomètres : valeurs continues.
     Master,
     /// Opacité d'un calque (aucun : le calque sélectionné).
@@ -248,6 +256,11 @@ impl Action {
             Action::Shatter,
             Action::LedLive,
             Action::LedScenario { kind: ScenarioKind::HeartBeat },
+            Action::DmxToggle { fixture: 0 },
+            Action::DmxHold { fixture: 0 },
+            Action::LaserArm,
+            Action::LaserStop,
+            Action::LaserCue { index: 0 },
         ]
     }
 
@@ -294,6 +307,11 @@ impl Action {
             Action::Shatter => "Casser ! (destruction)",
             Action::LedLive => "Envoi aux WLED",
             Action::LedScenario { .. } => "Scénario LED",
+            Action::DmxToggle { .. } => "Appareil DMX : allumer / éteindre",
+            Action::DmxHold { .. } => "Appareil DMX : tant qu'on appuie",
+            Action::LaserArm => "Lasers : armer / désarmer",
+            Action::LaserStop => "Lasers : STOP",
+            Action::LaserCue { .. } => "Laser : réglage mémorisé",
             Action::Master => "Luminosité générale",
             Action::Opacity { .. } => "Opacité d'un calque",
             Action::Speed => "Vitesse de lecture",
@@ -315,6 +333,9 @@ impl Action {
             Action::LedScenario { kind } => kind.name().split(" (").next().unwrap_or("").to_owned(),
             Action::Opacity { layer: Some(l) } => format!("Opacité C{}", l + 1),
             Action::Opacity { layer: None } => "Opacité".into(),
+            Action::DmxToggle { .. } => "DMX on/off".into(),
+            Action::DmxHold { .. } => "DMX à fond".into(),
+            Action::LaserCue { index } => format!("Laser {}", index + 1),
             Action::Effect { param } => FX_PARAMS.get(*param).map_or("Effet", |p| p.0).to_owned(),
             other => other.title().to_owned(),
         }

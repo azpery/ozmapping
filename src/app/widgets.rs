@@ -3,8 +3,9 @@
 use super::*;
 
 /// Onglet latéral : icône au-dessus du nom, barre d'accent quand il est choisi.
-pub(super) fn side_tab(ui: &mut egui::Ui, icon: &str, name: &str, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 50.0), Sense::click());
+/// `h` : hauteur de l'onglet (réduite quand la fenêtre est basse, pour que tous restent visibles).
+pub(super) fn side_tab(ui: &mut egui::Ui, icon: &str, name: &str, selected: bool, h: f32) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click());
     let p = ui.painter();
     if selected {
         p.rect_filled(rect, 6.0, theme::ACCENT_DIM.gamma_multiply(0.55));
@@ -15,9 +16,10 @@ pub(super) fn side_tab(ui: &mut egui::Ui, icon: &str, name: &str, selected: bool
         p.rect_filled(rect, 6.0, theme::WIDGET);
     }
     let color = if selected { ACCENT } else if resp.hovered() { TEXT } else { TEXT_WEAK };
-    p.text(rect.center() - Vec2::new(0.0, 8.0), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(20.0), color);
+    let k = (h / 50.0).clamp(0.7, 1.0);
+    p.text(rect.center() - Vec2::new(0.0, 8.0 * k), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(20.0 * k), color);
     p.text(
-        rect.center() + Vec2::new(0.0, 13.0),
+        rect.center() + Vec2::new(0.0, 13.0 * k),
         egui::Align2::CENTER_CENTER,
         name,
         egui::FontId::proportional(11.0),

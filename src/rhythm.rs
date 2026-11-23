@@ -190,7 +190,13 @@ pub struct AudioInput {
     error: Arc<Mutex<Option<String>>>,
     band: Arc<AtomicU8>,
     pub device: String,
+    /// Derniers échantillons (mono), pour dessiner le son (laser : oscilloscope, spectre).
+    wave: Arc<Mutex<Vec<f32>>>,
+    pub sample_rate: f32,
 }
+
+/// Échantillons gardés pour dessiner le son.
+pub const WAVE_LEN: usize = 1024;
 
 /// Noms des entrées audio disponibles (micros, cartes son, entrées virtuelles…).
 pub fn input_devices() -> Vec<String> {
@@ -222,12 +228,21 @@ impl AudioInput {
 
         let shared = levels.clone();
         let band_in = band.clone();
+        let wave = Arc::new(Mutex::new(vec![0.0f32; WAVE_LEN]));
+        let wave_in = wave.clone();
+        let mut ring: std::collections::VecDeque<f32> = std::collections::VecDeque::from(vec![0.0; WAVE_LEN]);
         let mut feed = move |mono: &mut dyn Iterator<Item = f32>| {
             analyzer.band = Band::from_u8(band_in.load(Ordering::Relaxed));
             for x in mono {
                 analyzer.push(x);
+                ring.pop_front();
+                ring.push_back(x);
             }
             *shared.lock().unwrap() = analyzer.out;
+            if let Ok(mut w) = wave_in.try_lock() {
+                w.clear();
+                w.extend(ring.iter().copied());
+            }
         };
         let err = error.clone();
         let on_error = move |e: cpal::Error| *err.lock().unwrap() = Some(e.to_string());
@@ -266,7 +281,8 @@ impl AudioInput {
         }
         .context("ouverture de l'entrée audio")?;
         stream.play().context("démarrage de l'entrée audio")?;
-        Ok(Self { _stream: stream, levels, error, band, device: device_name })
+        let sample_rate = config.sample_rate() as f32;
+        Ok(Self { _stream: stream, levels, error, band, device: device_name, wave, sample_rate })
     }
 
     pub fn set_band(&self, band: Band) {
@@ -275,6 +291,11 @@ impl AudioInput {
 
     pub fn levels(&self) -> Levels {
         *self.levels.lock().unwrap()
+    }
+
+    /// Derniers échantillons et leur fréquence.
+    pub fn wave(&self) -> (Vec<f32>, f32) {
+        (self.wave.lock().unwrap().clone(), self.sample_rate)
     }
 
     pub fn error(&self) -> Option<String> {

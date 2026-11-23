@@ -76,8 +76,20 @@ impl OzApp {
     }
 
     pub(super) fn preview(&mut self, ui: &mut egui::Ui) {
-        let avail = ui.available_rect_before_wrap().shrink(14.0);
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        // Choisir un calque montre sa sortie.
+        let sel = self.sel();
+        if sel != self.last_sel {
+            self.last_sel = sel;
+            self.preview_out = self.project.layers[sel].output.min(self.project.outputs.len().max(1) - 1);
+        }
+        self.preview_out = self.preview_out.min(self.project.outputs.len().max(1) - 1);
+        let full = ui.available_rect_before_wrap();
+        let tabs = Rect::from_min_size(full.min + Vec2::new(14.0, 2.0), Vec2::new(full.width() - 28.0, 24.0));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(tabs), |ui| self.output_tabs(ui));
+        let avail = Rect::from_min_max(egui::pos2(full.min.x, tabs.max.y + 6.0), full.max).shrink(14.0);
+        let out = self.preview_out;
+        let out_size = self.out_size(out);
+        let aspect = (out_size.x / out_size.y.max(1.0)).clamp(0.2, 5.0);
         let size = if avail.width() / avail.height() > aspect {
             Vec2::new(avail.height() * aspect, avail.height())
         } else {
@@ -88,10 +100,11 @@ impl OzApp {
 
         let painter = ui.painter_at(avail.expand(14.0));
         if let Some(r) = self.renderer.clone() {
-            let params = self.draw_params();
-            // Enregistrement : la sortie est aussi rendue hors écran, à la définition choisie.
+            let params = self.draw_params_for(out);
+            // Enregistrement : la sortie 1 est aussi rendue hors écran, à la définition choisie.
             if let Some(rec) = self.recorder.clone() {
-                painter.add(renderer::capture_callback(rect, r.clone(), params.clone(), rec));
+                let main = if out == 0 { params.clone() } else { self.draw_params_for(0) };
+                painter.add(renderer::capture_callback(rect, r.clone(), main, rec));
             }
             painter.add(renderer::paint_callback(rect, r, params));
         }
@@ -99,7 +112,7 @@ impl OzApp {
         painter.text(
             rect.left_top() + Vec2::new(2.0, -6.0),
             egui::Align2::LEFT_BOTTOM,
-            format!("{}  Sortie  ·  {:.0}×{:.0}", ic::MONITOR, self.output_size.x, self.output_size.y),
+            format!("{}  {}  ·  {:.0}×{:.0}", ic::MONITOR, self.project.outputs.get(out).map_or("Sortie", |o| o.name.as_str()), out_size.x, out_size.y),
             egui::FontId::proportional(12.0),
             TEXT_WEAK,
         );
@@ -127,7 +140,196 @@ impl OzApp {
             );
         }
         self.leds_overlay(&painter, rect);
-        self.shape_editor(ui, rect, "preview");
+        // Formes du calque choisi : seulement sur sa sortie.
+        if self.project.layers[sel].output.min(self.project.outputs.len().max(1) - 1) == out {
+            self.shape_editor(ui, rect, "preview");
+        }
+    }
+
+    /// Taille (pixels) de la fenêtre d'une sortie.
+    pub(super) fn out_size(&self, k: usize) -> Vec2 {
+        if k == 0 { self.output_size } else { self.outs.get(k).map_or(Vec2::new(1920.0, 1080.0), |o| o.size) }
+    }
+
+    /// Une entrée d'état par sortie du projet.
+    pub(super) fn sync_outputs(&mut self) {
+        let n = self.project.outputs.len().max(1);
+        while self.outs.len() < n {
+            // Une sortie qui a un écran (projet rouvert) y retourne.
+            let k = self.outs.len();
+            let screen = self.project.outputs[k].screen.as_ref().and_then(|key| self.screens.iter().find(|s| &s.key == key)).cloned();
+            self.outs.push(ExtraOut { mv: screen.map(|screen| OutputMove { screen, stage: 0, at: 0.0 }), ..ExtraOut::default() });
+        }
+        self.outs.truncate(n);
+    }
+
+    /// Onglets des sorties au-dessus de l'aperçu ; réglages de la sortie montrée.
+    fn output_tabs(&mut self, ui: &mut egui::Ui) {
+        self.sync_outputs();
+        let n = self.project.outputs.len();
+        let mut pick = None;
+        let mut remove = None;
+        ui.horizontal(|ui| {
+            for k in 0..n {
+                let name = self.project.outputs[k].name.clone();
+                let layers = self.project.layers.iter().filter(|l| l.output == k).count();
+                let r = ui
+                    .selectable_label(self.preview_out == k, with_icon(ic::MONITOR, &name))
+                    .on_hover_text(format!("{layers} calque(s) · clic droit : renommer, supprimer"));
+                if r.clicked() {
+                    pick = Some(k);
+                }
+                r.context_menu(|ui| {
+                    ui.text_edit_singleline(&mut self.project.outputs[k].name);
+                    if k > 0 && ui.button(with_icon(ic::TRASH, "Supprimer cette sortie")).clicked() {
+                        remove = Some(k);
+                        ui.close();
+                    }
+                });
+            }
+            if ui.small_button(ic::PLUS).on_hover_text("Nouvelle sortie : une autre fenêtre, sur un autre écran, avec ses propres calques").clicked() {
+                let k = self.project.outputs.len();
+                self.project.outputs.push(project::OutputDef { name: format!("Sortie {}", k + 1), screen: None });
+                self.sync_outputs();
+                self.outs[k].open = true;
+                // Un premier calque pour cette sortie.
+                if self.project.layers.len() < MAX_LAYERS {
+                    self.add_layer();
+                    let i = self.sel();
+                    self.project.layers[i].output = k;
+                }
+                pick = Some(k);
+            }
+            // Sortie 2 et suivantes : fenêtre, écran, plein écran.
+            let k = self.preview_out;
+            if k > 0 && k < self.outs.len() {
+                ui.separator();
+                ui.toggle_value(&mut self.outs[k].open, "Fenêtre").on_hover_text("Ouvrir / fermer la fenêtre de cette sortie");
+                let current = self.project.outputs[k].screen.clone();
+                let text = self.screens.iter().find(|s| Some(&s.key) == current.as_ref()).map_or("Écran…".to_owned(), |s| s.label.split("  ·").next().unwrap_or_default().to_owned());
+                let mut chosen = None;
+                egui::ComboBox::from_id_salt(("extra_screen", k)).selected_text(text).width(120.0).show_ui(ui, |ui| {
+                    for screen in &self.screens {
+                        if ui.selectable_label(Some(&screen.key) == current.as_ref(), &screen.label).clicked() {
+                            chosen = Some(screen.clone());
+                        }
+                    }
+                });
+                if let Some(screen) = chosen {
+                    self.project.outputs[k].screen = Some(screen.key.clone());
+                    self.outs[k].open = true;
+                    self.outs[k].mv = Some(OutputMove { screen, stage: 0, at: 0.0 });
+                }
+                let mut fs = self.outs[k].fullscreen;
+                if ui.toggle_value(&mut fs, "Plein écran").changed() {
+                    self.outs[k].open = true;
+                    self.outs[k].fullscreen = fs;
+                    ui.ctx().send_viewport_cmd_to(extra_viewport_id(k), ViewportCommand::Fullscreen(fs));
+                }
+            }
+        });
+        if let Some(k) = remove {
+            // Ses calques et ses écrans de la scène reviennent à la sortie 1.
+            self.project.outputs.remove(k);
+            for l in &mut self.project.layers {
+                if l.output == k {
+                    l.output = 0;
+                } else if l.output > k {
+                    l.output -= 1;
+                }
+            }
+            for s in &mut self.project.leds.surfaces {
+                if s.output == k {
+                    s.output = 0;
+                } else if s.output > k {
+                    s.output -= 1;
+                }
+            }
+            self.sync_outputs();
+            self.preview_out = 0;
+        }
+        if let Some(k) = pick {
+            self.preview_out = k;
+            // On travaille sur un calque de cette sortie.
+            if self.project.layers[self.sel()].output != k {
+                if let Some(i) = self.project.layers.iter().rposition(|l| l.output == k) {
+                    self.selected = i;
+                }
+            }
+            self.last_sel = self.sel();
+        }
+    }
+
+    /// Fenêtre d'une sortie 2 et suivantes.
+    pub(super) fn extra_output_window(&mut self, ui: &mut egui::Ui, k: usize) {
+        let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.outs[k].open = false;
+            self.outs[k].fullscreen = false;
+            return;
+        }
+        if let Some(fs) = ctx.input(|i| i.viewport().fullscreen) {
+            self.outs[k].fullscreen = fs;
+        }
+        // Déplacement vers l'écran choisi : sortir du plein écran, déplacer, y revenir.
+        let now = ctx.input(|i| i.time);
+        let fullscreen = self.outs[k].fullscreen;
+        if let Some(mv) = &mut self.outs[k].mv {
+            ctx.request_repaint();
+            match mv.stage {
+                0 => {
+                    if fullscreen {
+                        ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+                        mv.at = now + if cfg!(target_os = "macos") { 1.0 } else { 0.2 };
+                    } else {
+                        mv.at = now;
+                    }
+                    mv.stage = 1;
+                }
+                1 if now >= mv.at => {
+                    let pos = screens::window_position(&mv.screen, ctx.pixels_per_point());
+                    ctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos));
+                    mv.at = now + 0.4;
+                    mv.stage = 2;
+                }
+                2 if now >= mv.at => {
+                    ctx.send_viewport_cmd(ViewportCommand::Fullscreen(true));
+                    self.outs[k].fullscreen = true;
+                    self.outs[k].mv = None;
+                }
+                _ => {}
+            }
+        }
+        // F : plein écran de cette fenêtre ; les autres raccourcis restent ceux de l'app.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F)) {
+            let fs = !self.outs[k].fullscreen;
+            self.outs[k].fullscreen = fs;
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(fs));
+        }
+        if self.outs[k].fullscreen && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.outs[k].fullscreen = false;
+            ctx.send_viewport_cmd(ViewportCommand::Fullscreen(false));
+        }
+        self.handle_shortcuts(&ctx);
+        egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(ui, |ui| {
+            let rect = ui.max_rect();
+            self.outs[k].size = rect.size() * ctx.pixels_per_point();
+            if let Some(r) = self.renderer.clone() {
+                let params = self.draw_params_for(k);
+                ui.painter().add(renderer::paint_callback(rect, r, params));
+            }
+            let bg = ui.interact(rect, ui.scope_id().with(("extra_bg", k)), Sense::click());
+            if bg.double_clicked() && !self.edit_mapping {
+                let fs = !self.outs[k].fullscreen;
+                self.outs[k].fullscreen = fs;
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(fs));
+            }
+            if self.edit_mapping && self.project.layers[self.sel()].output == k {
+                self.shape_editor(ui, rect, &format!("output{k}"));
+            } else if self.outs[k].fullscreen {
+                ctx.set_cursor_icon(egui::CursorIcon::None);
+            }
+        });
     }
 
     pub(super) fn output_window(&mut self, ui: &mut egui::Ui) {
@@ -156,7 +358,7 @@ impl OzApp {
                     let fs = !self.output_fullscreen;
                     self.set_fullscreen(&ctx, fs);
                 }
-                if self.edit_mapping {
+                if self.edit_mapping && self.project.layers[self.sel()].output == 0 {
                     self.shape_editor(ui, rect, "output");
                 } else if self.output_fullscreen {
                     ctx.set_cursor_icon(egui::CursorIcon::None);
@@ -167,6 +369,24 @@ impl OzApp {
 
 pub(super) fn output_viewport_id() -> ViewportId {
     ViewportId::from_hash_of("oz_output")
+}
+
+pub(super) fn extra_viewport_id(k: usize) -> ViewportId {
+    ViewportId::from_hash_of(("oz_output", k))
+}
+
+/// État d'une sortie 2 et suivantes : fenêtre ouverte, plein écran, taille, déplacement en cours.
+pub(super) struct ExtraOut {
+    pub(super) open: bool,
+    pub(super) fullscreen: bool,
+    pub(super) size: Vec2,
+    pub(super) mv: Option<OutputMove>,
+}
+
+impl Default for ExtraOut {
+    fn default() -> Self {
+        Self { open: true, fullscreen: false, size: Vec2::new(1920.0, 1080.0), mv: None }
+    }
 }
 
 /// Déplacement de la fenêtre de sortie vers un autre écran, en plusieurs temps

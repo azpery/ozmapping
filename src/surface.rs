@@ -103,12 +103,63 @@ pub struct Warp {
     pub cols: usize,
     pub rows: usize,
     pub points: Vec<Point>,
+    /// Forme de la surface (grille, Bézier, triangle, ellipse) et ses points de contrôle
+    /// (autres que la grille) : voir `WarpShape`.
+    pub shape: WarpShape,
+    pub ctrl: Vec<Point>,
 }
 
 impl Default for Warp {
     fn default() -> Self {
         Self::regular(1, 1, &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
     }
+}
+
+/// Forme d'une surface de mapping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WarpShape {
+    /// Grille de points (courbes lisses entre eux).
+    #[default]
+    Grid,
+    /// 4 coins et 2 poignées par bord (bords en courbes de Bézier) : `ctrl` = coins haut-gauche,
+    /// haut-droit, bas-droit, bas-gauche, puis poignées haut (2), droite (2), bas (2), gauche (2).
+    Bezier,
+    /// 3 coins : sommet, bas-droit, bas-gauche.
+    Triangle,
+    /// Centre, point du rayon horizontal, point du rayon vertical (l'image entière dans l'ellipse).
+    Ellipse,
+}
+
+impl WarpShape {
+    pub const ALL: [WarpShape; 4] = [WarpShape::Grid, WarpShape::Bezier, WarpShape::Triangle, WarpShape::Ellipse];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WarpShape::Grid => "Grille",
+            WarpShape::Bezier => "Bézier",
+            WarpShape::Triangle => "Triangle",
+            WarpShape::Ellipse => "Ellipse",
+        }
+    }
+
+    fn ctrl_len(self) -> usize {
+        match self {
+            WarpShape::Grid => 0,
+            WarpShape::Bezier => 12,
+            WarpShape::Triangle => 3,
+            WarpShape::Ellipse => 3,
+        }
+    }
+}
+
+fn lerp2(a: Point, b: Point, t: f32) -> Point {
+    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+}
+
+fn cubic(p0: Point, p1: Point, p2: Point, p3: Point, t: f32) -> Point {
+    let u = 1.0 - t;
+    let (a, b, c, d) = (u * u * u, 3.0 * u * u * t, 3.0 * u * t * t, t * t * t);
+    [a * p0[0] + b * p1[0] + c * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + c * p2[1] + d * p3[1]]
 }
 
 /// Cadrage de l'image dans la surface, quand leurs proportions diffèrent.
@@ -146,6 +197,16 @@ impl Fit {
 impl Warp {
     /// Proportions (largeur / hauteur) de la surface sur une sortie de `out` pixels.
     pub fn aspect(&self, out: (f32, f32)) -> f32 {
+        if matches!(self.shape, WarpShape::Triangle | WarpShape::Ellipse) {
+            // Rectangle englobant.
+            let o = self.outline();
+            let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for p in &o {
+                lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+                hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+            }
+            return (((hi[0] - lo[0]) * out.0) / ((hi[1] - lo[1]) * out.1).max(1e-3)).clamp(0.05, 20.0);
+        }
         let [tl, tr, br, bl] = self.corners();
         let dist = |a: Point, b: Point| ((a[0] - b[0]) * out.0).hypot((a[1] - b[1]) * out.1);
         let w = (dist(tl, tr) + dist(bl, br)) / 2.0;
@@ -163,13 +224,60 @@ impl Warp {
                 points.push([p[0] as f32, p[1] as f32]);
             }
         }
-        Self { cols, rows, points }
+        Self { cols, rows, points, shape: WarpShape::Grid, ctrl: Vec::new() }
     }
 
     fn is_valid(&self) -> bool {
         (1..=MAX_GRID).contains(&self.cols)
             && (1..=MAX_GRID).contains(&self.rows)
             && self.points.len() == (self.cols + 1) * (self.rows + 1)
+            && self.ctrl.len() == self.shape.ctrl_len()
+    }
+
+    /// Change la forme de la surface en gardant sa place et sa taille.
+    pub fn set_shape(&mut self, shape: WarpShape) {
+        if shape == self.shape {
+            return;
+        }
+        // Triangle ou ellipse : on part de leur rectangle englobant (leurs « coins » n'en sont pas).
+        let [tl, tr, br, bl] = if matches!(self.shape, WarpShape::Triangle | WarpShape::Ellipse) {
+            let o = self.outline();
+            let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+            for p in &o {
+                lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+                hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+            }
+            [lo, [hi[0], lo[1]], hi, [lo[0], hi[1]]]
+        } else {
+            self.corners()
+        };
+        if shape == WarpShape::Grid {
+            let (c, r) = (self.cols, self.rows);
+            *self = Self::regular(c, r, &[tl, tr, br, bl]);
+            return;
+        }
+        // Les points de la grille suivent : 4 coins (pour revenir à la grille plus tard).
+        let grid = Self::regular(self.cols, self.rows, &[tl, tr, br, bl]);
+        self.points = grid.points;
+        self.ctrl = match shape {
+            WarpShape::Bezier => {
+                let third = |a: Point, b: Point, t: f32| lerp2(a, b, t);
+                vec![
+                    tl, tr, br, bl,
+                    third(tl, tr, 1.0 / 3.0), third(tl, tr, 2.0 / 3.0),
+                    third(tr, br, 1.0 / 3.0), third(tr, br, 2.0 / 3.0),
+                    third(br, bl, 1.0 / 3.0), third(br, bl, 2.0 / 3.0),
+                    third(bl, tl, 1.0 / 3.0), third(bl, tl, 2.0 / 3.0),
+                ]
+            }
+            WarpShape::Triangle => vec![lerp2(tl, tr, 0.5), br, bl],
+            WarpShape::Ellipse => {
+                let c = [(tl[0] + tr[0] + br[0] + bl[0]) / 4.0, (tl[1] + tr[1] + br[1] + bl[1]) / 4.0];
+                vec![c, lerp2(tr, br, 0.5), lerp2(bl, br, 0.5)]
+            }
+            WarpShape::Grid => Vec::new(),
+        };
+        self.shape = shape;
     }
 
     /// Répare une grille chargée d'un fichier incohérent.
@@ -185,6 +293,14 @@ impl Warp {
 
     /// Coins extérieurs : haut-gauche, haut-droit, bas-droit, bas-gauche.
     pub fn corners(&self) -> [Point; 4] {
+        match self.shape {
+            WarpShape::Bezier if self.ctrl.len() == 12 => return [self.ctrl[0], self.ctrl[1], self.ctrl[2], self.ctrl[3]],
+            WarpShape::Triangle | WarpShape::Ellipse if self.ctrl.len() == 3 => {
+                let e = self.evaluator();
+                return [e(0.0, 0.0), e(1.0, 0.0), e(1.0, 1.0), e(0.0, 1.0)];
+            }
+            _ => {}
+        }
         [
             self.points[self.idx(0, 0)],
             self.points[self.idx(0, self.cols)],
@@ -208,8 +324,49 @@ impl Warp {
 
     /// Évalue la surface : (u, v) dans 0..1 → position sur la sortie.
     /// Renvoie aussi un évaluateur réutilisable pour éviter de recalculer l'homographie.
-    pub fn evaluator(&self) -> impl Fn(f32, f32) -> Point + use<> {
-        let h = square_to_quad(&self.corners());
+    pub fn evaluator(&self) -> Box<dyn Fn(f32, f32) -> Point> {
+        let c = self.ctrl.clone();
+        match self.shape {
+            WarpShape::Bezier if c.len() == 12 => {
+                // Coons : les 4 bords en courbes de Bézier, l'intérieur se remplit entre eux.
+                return Box::new(move |u, v| {
+                    let top = cubic(c[0], c[4], c[5], c[1], u);
+                    let bottom = cubic(c[3], c[9], c[8], c[2], u);
+                    let left = cubic(c[0], c[11], c[10], c[3], v);
+                    let right = cubic(c[1], c[6], c[7], c[2], v);
+                    let bil = |k: usize| {
+                        (1.0 - u) * (1.0 - v) * c[0][k] + u * (1.0 - v) * c[1][k] + (1.0 - u) * v * c[3][k] + u * v * c[2][k]
+                    };
+                    [0, 1].map(|k| (1.0 - v) * top[k] + v * bottom[k] + (1.0 - u) * left[k] + u * right[k] - bil(k))
+                });
+            }
+            WarpShape::Triangle if c.len() == 3 => {
+                // Le bord du haut de l'image se resserre jusqu'au sommet.
+                return Box::new(move |u, v| lerp2(c[0], lerp2(c[2], c[1], u), v));
+            }
+            WarpShape::Ellipse if c.len() == 3 => {
+                // Carré → disque (sans pli), puis l'ellipse donnée par ses deux rayons.
+                return Box::new(move |u, v| {
+                    let (x, y) = (2.0 * u - 1.0, 2.0 * v - 1.0);
+                    let (dx, dy) = (x * (1.0 - y * y / 2.0).sqrt(), y * (1.0 - x * x / 2.0).sqrt());
+                    let a = [c[1][0] - c[0][0], c[1][1] - c[0][1]];
+                    let b = [c[2][0] - c[0][0], c[2][1] - c[0][1]];
+                    [c[0][0] + a[0] * dx + b[0] * dy, c[0][1] + a[1] * dx + b[1] * dy]
+                });
+            }
+            _ => {}
+        }
+        Box::new(self.grid_evaluator())
+    }
+
+    fn grid_evaluator(&self) -> impl Fn(f32, f32) -> Point + use<> {
+        let corners = [
+            self.points[self.idx(0, 0)],
+            self.points[self.idx(0, self.cols)],
+            self.points[self.idx(self.rows, self.cols)],
+            self.points[self.idx(self.rows, 0)],
+        ];
+        let h = square_to_quad(&corners);
         let h_inv = invert3(h).unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
         // Points de contrôle dans l'espace redressé.
         let q: Vec<[f64; 2]> = self.points.iter().map(|p| apply(&h_inv, p.map(f64::from))).collect();
@@ -245,7 +402,7 @@ impl Warp {
     /// Change la résolution de la grille en conservant la forme actuelle.
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let (cols, rows) = (cols.clamp(1, MAX_GRID), rows.clamp(1, MAX_GRID));
-        if cols == self.cols && rows == self.rows {
+        if cols == self.cols && rows == self.rows || self.shape != WarpShape::Grid {
             return;
         }
         let eval = self.evaluator();
@@ -255,12 +412,19 @@ impl Warp {
                 points.push(eval(c as f32 / cols as f32, r as f32 / rows as f32));
             }
         }
-        *self = Self { cols, rows, points };
+        *self = Self { cols, rows, points, shape: WarpShape::Grid, ctrl: Vec::new() };
     }
 
-    /// Remet la grille en perspective régulière entre ses 4 coins actuels.
+    /// Remet la grille en perspective régulière entre ses 4 coins actuels (Bézier : bords droits).
     pub fn flatten(&mut self) {
-        *self = Self::regular(self.cols, self.rows, &self.corners());
+        match self.shape {
+            WarpShape::Grid => *self = Self::regular(self.cols, self.rows, &self.corners()),
+            WarpShape::Bezier => {
+                self.shape = WarpShape::Grid;
+                self.set_shape(WarpShape::Bezier);
+            }
+            _ => {}
+        }
     }
 
     /// Maillage en triangles : [x, y, u, v] par sommet.
@@ -300,11 +464,11 @@ impl Warp {
 
     /// Agrandit (`factor` > 1) ou réduit la surface autour du point `center`.
     pub fn scale(&mut self, center: Point, factor: f32) {
-        scale_points(self.points.iter_mut(), center, factor);
+        scale_points(self.points.iter_mut().chain(self.ctrl.iter_mut()), center, factor);
     }
 
     pub fn translate(&mut self, d: Point) {
-        for p in &mut self.points {
+        for p in self.points.iter_mut().chain(self.ctrl.iter_mut()) {
             p[0] += d[0];
             p[1] += d[1];
         }
@@ -472,6 +636,33 @@ impl Mask {
         scale_points(self.points.iter_mut().chain(self.rings.iter_mut().flatten()), center, factor);
     }
 
+    /// Étire tous les contours autour de `pivot` : `sx` en largeur, `sy` en hauteur.
+    pub fn scale_xy(&mut self, pivot: Point, sx: f32, sy: f32) {
+        for p in self.points.iter_mut().chain(self.rings.iter_mut().flatten()) {
+            *p = [pivot[0] + (p[0] - pivot[0]) * sx, pivot[1] + (p[1] - pivot[1]) * sy];
+        }
+    }
+
+    /// Tourne tous les contours autour de `pivot` (`aspect` : largeur / hauteur de la sortie).
+    pub fn rotate_around(&mut self, pivot: Point, degrees: f32, aspect: f32) {
+        let (s, c) = degrees.to_radians().sin_cos();
+        let [cx, cy] = pivot;
+        for p in self.points.iter_mut().chain(self.rings.iter_mut().flatten()) {
+            let (x, y) = ((p[0] - cx) * aspect, p[1] - cy);
+            *p = [cx + (x * c - y * s) / aspect, cy + x * s + y * c];
+        }
+    }
+
+    /// Coins du rectangle qui englobe tous les contours (sortie, 0-1).
+    pub fn bounds(&self) -> Option<(Point, Point)> {
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for p in self.all_rings().flatten() {
+            lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+            hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+        }
+        (lo[0] <= hi[0]).then_some((lo, hi))
+    }
+
     pub fn centroid(&self) -> Point {
         let n = self.total_points().max(1) as f32;
         self.all_rings().flatten().fold([0.0, 0.0], |acc, p| [acc[0] + p[0] / n, acc[1] + p[1] / n])
@@ -563,6 +754,10 @@ pub fn draw_warp_outline(ui: &egui::Ui, rect: Rect, warp: &Warp, color: Color32)
 /// Poignées de la grille de déformation.
 pub fn edit_warp(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, salt: &str) {
     let base_id = ui.scope_id().with(("warp", salt));
+    if warp.shape != WarpShape::Grid {
+        edit_shape(ui, rect, warp, base_id);
+        return;
+    }
 
     // Lignes de la grille, échantillonnées pour montrer les courbes.
     {
@@ -606,6 +801,81 @@ pub fn edit_warp(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, salt: &str) {
     }
 }
 
+/// Surfaces Bézier, triangle, ellipse : contour, poignées (coins, tangentes, rayons), croix
+/// centrale pour tout déplacer.
+fn edit_shape(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, base_id: egui::Id) {
+    let outline: Vec<Pos2> = warp.outline().into_iter().map(|p| to_screen(rect, p)).collect();
+    ui.painter().add(Shape::closed_line(outline, Stroke::new(1.5, ACCENT)));
+    // Quelques lignes intérieures, pour voir la déformation de l'image.
+    {
+        let eval = warp.evaluator();
+        let stroke = Stroke::new(1.0, ACCENT.gamma_multiply(0.35));
+        for k in 1..4 {
+            let t = k as f32 / 4.0;
+            let h: Vec<Pos2> = (0..=24).map(|i| to_screen(rect, eval(i as f32 / 24.0, t))).collect();
+            let v: Vec<Pos2> = (0..=24).map(|i| to_screen(rect, eval(t, i as f32 / 24.0))).collect();
+            ui.painter().add(Shape::line(h, stroke));
+            ui.painter().add(Shape::line(v, stroke));
+        }
+    }
+    let center = to_screen(rect, warp.evaluator()(0.5, 0.5));
+    let d = center_handle(ui, rect, base_id.with("center"), center, ACCENT);
+    if d != [0.0, 0.0] {
+        warp.translate(d);
+        return;
+    }
+    // Bézier : traits des tangentes (coin → poignée).
+    if warp.shape == WarpShape::Bezier && warp.ctrl.len() == 12 {
+        let c = &warp.ctrl;
+        let pairs = [(0, 4), (1, 5), (1, 6), (2, 7), (2, 8), (3, 9), (3, 10), (0, 11)];
+        for (a, b) in pairs {
+            ui.painter().line_segment([to_screen(rect, c[a]), to_screen(rect, c[b])], Stroke::new(1.0, Color32::from_rgb(120, 200, 255)));
+        }
+    }
+    let n = warp.ctrl.len();
+    for i in 0..n {
+        let pos = to_screen(rect, warp.ctrl[i]);
+        // Coins (Bézier : les 4 premiers ; triangle : tous ; ellipse : le centre) en gros.
+        let big = match warp.shape {
+            WarpShape::Bezier => i < 4,
+            WarpShape::Triangle => true,
+            WarpShape::Ellipse => i == 0,
+            WarpShape::Grid => false,
+        };
+        let (resp, d) = handle(ui, rect, base_id.with(("ctrl", i)), pos, if big { 24.0 } else { 16.0 });
+        let hint = match (warp.shape, big) {
+            (WarpShape::Bezier, true) => "Coin : glisser (ses poignées suivent)",
+            (WarpShape::Bezier, false) => "Poignée : courbe le bord",
+            (WarpShape::Ellipse, true) => "Centre : déplacer l'ellipse",
+            (WarpShape::Ellipse, false) => "Rayon : agrandir, aplatir, tourner",
+            _ => "Coin du triangle",
+        };
+        let resp = resp.on_hover_text(hint);
+        if d != [0.0, 0.0] {
+            let mv = |p: &mut Point| {
+                p[0] = (p[0] + d[0]).clamp(-1.0, 2.0);
+                p[1] = (p[1] + d[1]).clamp(-1.0, 2.0);
+            };
+            mv(&mut warp.ctrl[i]);
+            // Un coin de Bézier emmène ses deux poignées ; le centre de l'ellipse, ses rayons.
+            let followers: &[usize] = match (warp.shape, i) {
+                (WarpShape::Bezier, 0) => &[4, 11],
+                (WarpShape::Bezier, 1) => &[5, 6],
+                (WarpShape::Bezier, 2) => &[7, 8],
+                (WarpShape::Bezier, 3) => &[9, 10],
+                (WarpShape::Ellipse, 0) => &[1, 2],
+                _ => &[],
+            };
+            for &f in followers {
+                mv(&mut warp.ctrl[f]);
+            }
+        }
+        let active = resp.hovered() || resp.dragged();
+        let color = if big { ACCENT } else { Color32::from_rgb(120, 200, 255) };
+        draw_point(ui, pos, color, active, big, None);
+    }
+}
+
 /// Édition de l'ensemble média + masque : un cadre autour des deux.
 /// Glisser un coin = redimensionner (autour du coin opposé ; Alt : autour du centre),
 /// glisser la croix = déplacer. Le masque reste à la même place sur le média.
@@ -620,11 +890,14 @@ pub fn edit_both(ui: &mut egui::Ui, rect: Rect, warp: &mut Warp, mask: &mut Mask
         }
     }
 
-    // Cadre englobant (coordonnées de sortie, 0..1).
+    // Cadre englobant (coordonnées de sortie, 0..1) : au plus près de la découpe quand un masque
+    // la détoure (photo détourée : le cadre suit l'objet, pas toute la photo) ; sinon tout le média.
     let outline = warp.outline();
     let mask_pts: Vec<Point> = if mask.enabled { mask.all_rings().flatten().copied().collect() } else { Vec::new() };
+    let tight = mask.enabled && !mask.invert && !mask_pts.is_empty();
+    let framed: Vec<Point> = if tight { mask_pts.clone() } else { outline.iter().chain(mask_pts.iter()).copied().collect() };
     let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
-    for p in outline.iter().chain(mask_pts.iter()) {
+    for p in framed.iter() {
         lo = [lo[0].min(p[0]), lo[1].min(p[1])];
         hi = [hi[0].max(p[0]), hi[1].max(p[1])];
     }
@@ -732,6 +1005,7 @@ pub fn edit_mask(ui: &mut egui::Ui, rect: Rect, mask: &mut Mask, salt: &str) {
         }
     }
 
+    // Points d'abord (chacun se déplace seul), puis le cadre de transformation par-dessus.
     let mut remove = None;
     for k in 0..mask.ring_count() {
         let ring_len = mask.ring(k).len();
@@ -756,6 +1030,115 @@ pub fn edit_mask(ui: &mut egui::Ui, rect: Rect, mask: &mut Mask, salt: &str) {
     if let Some((k, i)) = remove {
         mask.ring_mut(k).remove(i);
     }
+    transform_frame(ui, rect, mask, base_id.with("frame"));
+}
+
+/// Cadre de transformation de tout le masque : coins = agrandir ou réduire (proportions gardées ;
+/// Maj : librement), milieux des côtés = plus large / plus étroit, plus haut / plus bas, poignée
+/// ronde au-dessus = tourner (Maj : par 15°). Alt : depuis le centre.
+fn transform_frame(ui: &mut egui::Ui, rect: Rect, mask: &mut Mask, id: egui::Id) {
+    let Some((lo, hi)) = mask.bounds() else { return };
+    let (a, b) = (to_screen(rect, lo), to_screen(rect, hi));
+    // Cadre un peu plus grand que la forme : ses poignées ne recouvrent pas les points.
+    const M: f32 = 14.0;
+    let frame = Rect::from_min_max(a - Vec2::splat(M), b + Vec2::splat(M));
+    let color = Color32::from_rgb(255, 210, 120);
+    let painter = ui.painter();
+    painter.add(Shape::dashed_line(
+        &[frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom(), frame.left_top()],
+        Stroke::new(1.0, color.gamma_multiply(0.8)),
+        5.0,
+        4.0,
+    ));
+    let (alt, shift) = ui.input(|i| (i.modifiers.alt, i.modifiers.shift));
+    let raw = Rect::from_min_max(a, b);
+    let to_norm = |p: Pos2| -> Point { [(p.x - rect.min.x) / rect.width().max(1.0), (p.y - rect.min.y) / rect.height().max(1.0)] };
+    // Poignées : (position dans le cadre, axes qu'elle étire, coin correspondant de la forme).
+    let handles: [(Pos2, (bool, bool), Pos2); 8] = [
+        (frame.left_top(), (true, true), raw.left_top()),
+        (frame.right_top(), (true, true), raw.right_top()),
+        (frame.right_bottom(), (true, true), raw.right_bottom()),
+        (frame.left_bottom(), (true, true), raw.left_bottom()),
+        (frame.center_top(), (false, true), raw.center_top()),
+        (frame.right_center(), (true, false), raw.right_center()),
+        (frame.center_bottom(), (false, true), raw.center_bottom()),
+        (frame.left_center(), (true, false), raw.left_center()),
+    ];
+    for (k, &(pos, (ax, ay), corner)) in handles.iter().enumerate() {
+        let (resp, d) = handle(ui, rect, id.with(k), pos, 16.0);
+        let cursor = match (ax, ay) {
+            (true, false) => egui::CursorIcon::ResizeHorizontal,
+            (false, true) => egui::CursorIcon::ResizeVertical,
+            _ if k % 2 == 0 => egui::CursorIcon::ResizeNwSe,
+            _ => egui::CursorIcon::ResizeNeSw,
+        };
+        let hint = match (ax, ay) {
+            (true, false) => "Glisser : plus large / plus étroit · Alt : depuis le centre",
+            (false, true) => "Glisser : plus haut / moins haut · Alt : depuis le centre",
+            _ => "Glisser : agrandir / réduire tout le masque · Maj : librement · Alt : depuis le centre",
+        };
+        let resp = resp.on_hover_cursor(cursor).on_hover_text(hint);
+        let active = resp.hovered() || resp.dragged();
+        ui.painter().rect(
+            Rect::from_center_size(pos, Vec2::splat(if active { 10.0 } else { 8.0 })),
+            1.0,
+            if active { color } else { Color32::from_black_alpha(170) },
+            Stroke::new(1.5, color),
+            egui::StrokeKind::Middle,
+        );
+        if d == [0.0, 0.0] {
+            continue;
+        }
+        // Point fixe : le côté ou le coin opposé (Alt : le centre).
+        let pivot = if alt { raw.center() } else { raw.center() + (raw.center() - corner) };
+        let from = corner - pivot;
+        let delta = Vec2::new(d[0] * rect.width(), d[1] * rect.height());
+        let ratio = |num: f32, den: f32| if den.abs() < 4.0 { 1.0 } else { ((den + num) / den).max(0.02) };
+        let (mut sx, mut sy) = (if ax { ratio(delta.x, from.x) } else { 1.0 }, if ay { ratio(delta.y, from.y) } else { 1.0 });
+        if ax && ay && !shift {
+            // Coin : proportions gardées (projection sur la diagonale).
+            let f = ((from + delta).dot(from) / from.length_sq().max(1.0)).max(0.02);
+            sx = f;
+            sy = f;
+        }
+        // Pas plus petit qu'une dizaine de pixels.
+        if raw.width() * sx < 10.0 {
+            sx = 1.0;
+        }
+        if raw.height() * sy < 10.0 {
+            sy = 1.0;
+        }
+        mask.scale_xy(to_norm(pivot), sx, sy);
+        return;
+    }
+    // Rotation : poignée ronde au-dessus du cadre.
+    let knob = frame.center_top() - Vec2::new(0.0, 26.0);
+    ui.painter().line_segment([frame.center_top(), knob], Stroke::new(1.0, color.gamma_multiply(0.8)));
+    let (resp, _) = handle(ui, rect, id.with("rotate"), knob, 18.0);
+    let resp = resp.on_hover_cursor(egui::CursorIcon::Alias).on_hover_text("Glisser : tourner tout le masque · Maj : par pas de 15°");
+    let active = resp.hovered() || resp.dragged();
+    ui.painter().circle(knob, if active { 7.0 } else { 5.5 }, if active { color } else { Color32::from_black_alpha(170) }, Stroke::new(1.5, color));
+    if resp.dragged() {
+        if let Some(p) = resp.interact_pointer_pos() {
+            let c = raw.center();
+            let prev = p - resp.drag_delta();
+            let a0 = (prev - c).angle();
+            let a1 = (p - c).angle();
+            let mut deg = (a1 - a0).to_degrees();
+            if shift {
+                // Par pas de 15° : on accumule le glissement jusqu'au pas suivant.
+                let acc_id = id.with("acc");
+                let acc: f32 = ui.data(|d| d.get_temp(acc_id)).unwrap_or(0.0) + deg;
+                let steps = (acc / 15.0).trunc();
+                deg = steps * 15.0;
+                ui.data_mut(|d| d.insert_temp(acc_id, acc - deg));
+            }
+            if deg != 0.0 {
+                let aspect = rect.width() / rect.height().max(1.0);
+                mask.rotate_around(to_norm(c), deg, aspect);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -764,6 +1147,36 @@ mod tests {
 
     fn close(a: Point, b: Point) -> bool {
         (a[0] - b[0]).abs() < 1e-4 && (a[1] - b[1]).abs() < 1e-4
+    }
+
+    #[test]
+    fn shapes_keep_their_place() {
+        let mut w = Warp::regular(1, 1, &[[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8]]);
+        w.set_shape(WarpShape::Bezier);
+        // Bézier aux poignées droites : la même surface qu'avant.
+        let e = w.evaluator();
+        assert!(close(e(0.0, 0.0), [0.2, 0.2]) && close(e(1.0, 1.0), [0.8, 0.8]) && close(e(0.5, 0.5), [0.5, 0.5]));
+        w.set_shape(WarpShape::Triangle);
+        let e = w.evaluator();
+        assert!(close(e(0.3, 0.0), [0.5, 0.2]) && close(e(1.0, 1.0), [0.8, 0.8]));
+        w.set_shape(WarpShape::Ellipse);
+        let e = w.evaluator();
+        assert!(close(e(0.5, 0.5), [0.5, 0.5]) && close(e(1.0, 0.5), [0.8, 0.5]));
+        w.set_shape(WarpShape::Grid);
+        assert!(w.points.len() == 4 && w.ctrl.is_empty());
+        assert!(!w.mesh().is_empty());
+    }
+
+    #[test]
+    fn mask_stretches_and_turns_around_a_pivot() {
+        let mut m = Mask::default();
+        m.set_shape(vec![[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]]);
+        m.scale_xy([0.4, 0.5], 2.0, 1.0);
+        let (lo, hi) = m.bounds().unwrap();
+        assert!(close(lo, [0.4, 0.4]) && close(hi, [0.8, 0.6]));
+        m.rotate_around([0.6, 0.5], 180.0, 1.0);
+        let (lo, hi) = m.bounds().unwrap();
+        assert!(close(lo, [0.4, 0.4]) && close(hi, [0.8, 0.6]));
     }
 
     #[test]

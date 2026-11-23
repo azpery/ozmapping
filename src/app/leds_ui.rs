@@ -26,6 +26,34 @@ pub(super) enum LedView {
     Both,
     Sim,
     Output,
+    /// Éditeur des tracés 2D, sur l'image de la sortie ou une photo.
+    Plan,
+}
+
+/// Planche à dessin 2D : la forme d'un bandeau, en mètres (y vers le haut), avant de l'ajouter
+/// à la scène (ou celle d'un tracé plat de la scène, modifié en direct).
+pub(super) struct Sketch {
+    points: Vec<[f32; 2]>,
+    closed: bool,
+    /// Élément de la scène modifié (id) ; aucun : nouvelle forme, pas encore ajoutée.
+    editing: Option<u32>,
+    /// On pose des points (sinon on modifie la forme).
+    drawing: bool,
+    /// LEDs par mètre.
+    density: f32,
+}
+
+impl Default for Sketch {
+    fn default() -> Self {
+        Self { points: Vec::new(), closed: false, editing: None, drawing: true, density: 60.0 }
+    }
+}
+
+/// Ce qu'on fait glisser sur la planche : un point, ou toute la forme.
+#[derive(Clone, Copy)]
+enum SketchGrab {
+    Point(usize),
+    All,
 }
 
 /// État des LEDs propre à la session (non enregistré).
@@ -34,7 +62,7 @@ pub(super) struct LedRuntime {
     pub(super) live: bool,
     pub(super) sender: leds::Sender,
     /// Image de la sortie lue sur le GPU (remplie par le rendu).
-    pub(super) frame: Arc<Mutex<leds::Frame>>,
+    pub(super) frames: HashMap<usize, Arc<Mutex<leds::Frame>>>,
     /// LEDs calculées pour l'installation `cache_of`.
     cache_of: Option<LedSetup>,
     leds: Vec<Led>,
@@ -51,16 +79,49 @@ pub(super) struct LedRuntime {
     pending_click: Option<(Target, bool)>,
     /// Bandeaux choisis ensemble (id) : Cmd+clic, Maj+clic ; et dernier rang cliqué (plages).
     multi: Vec<u32>,
+    /// Objets du décor et appareils DMX choisis ensemble (id), par le rectangle de sélection.
+    multi_surf: Vec<u32>,
+    multi_dmx: Vec<u32>,
+    /// Rectangle de sélection en cours (coin de départ).
+    marquee: Option<egui::Pos2>,
     anchor: Option<usize>,
     /// Glisser-déposer en cours dans une liste (0 : bandeaux, 1 : groupes), rangs glissés.
     list_drag: Option<(u8, Vec<usize>)>,
     /// Contrôleurs (id) des bandes des chips : côté gauche, côté droit.
     chips_ctrl: [u32; 2],
+    /// Planche 2D : forme en cours, demande venue du panneau (Some(None) : nouvelle forme,
+    /// Some(Some(i)) : modifier l'élément i), glissement, vue (centre en m, pixels par m),
+    /// photo de fond chargée (chemin, texture).
+    sketch: Sketch,
+    sketch_req: Option<Option<usize>>,
+    sketch_grab: Option<SketchGrab>,
+    sketch_view: ([f32; 2], f32),
+    plan_tex: Option<(std::path::PathBuf, egui::TextureHandle)>,
+    /// Réglages du générateur de tunnel d'arches.
+    tunnel: leds::Tunnel,
+    /// Appareil DMX choisi ; envoi DMX en direct ; rafales en cours (id → fin, infini : tant
+    /// qu'on appuie) ; dernier envoi.
+    pub(super) selected_dmx: Option<usize>,
+    pub(super) dmx_live: bool,
+    dmx_sender: crate::dmx::Sender,
+    pub(super) bursts: HashMap<u32, f64>,
+    dmx_last: f64,
+    serial_ports: Vec<String>,
+    /// Couleur dominante de la vidéo de chaque sortie, lissée.
+    video_avg: HashMap<usize, [f32; 3]>,
     camera: Option<Orbit>,
+    /// Vue vers laquelle la caméra glisse en douceur (boutons de vue, double-clic, tout voir).
+    cam_goal: Option<Orbit>,
+    /// Point d'ajout : les éléments ajoutés apparaissent ici (clic droit dans la scène).
+    pub(super) cursor3d: Option<[f32; 3]>,
+    /// Souris sur la vue 3D à l'image précédente (le clavier pilote alors le drone) ;
+    /// mode drone : glisser regarde autour de soi au lieu de tourner autour d'un point.
+    hover_3d: bool,
+    drone: bool,
     drag: Option<Drag>,
     /// Image de la sortie sur les écrans de la scène, et numéro de l'image affichée.
-    screen_tex: Option<egui::TextureHandle>,
-    tex_serial: u64,
+    /// Image de chaque sortie sur les écrans de la scène, et numéro de l'image affichée.
+    screen_tex: HashMap<usize, (egui::TextureHandle, u64)>,
     /// Tracé libre en cours de dessin dans la vue 3D.
     drawing: Option<Drawing>,
     /// Montre l'ordre des LEDs dans la vue 3D (début, sens, fil d'un bandeau au suivant).
@@ -68,7 +129,8 @@ pub(super) struct LedRuntime {
     /// Câblage à la souris en cours, et sortie proposée (contrôleur, sortie).
     wiring: Option<WireMode>,
     wire_target: (u32, usize),
-    pub(super) view: LedView,
+    /// Vue de la zone centrale choisie (aucune : automatique, voir `shown_view`).
+    pub(super) view: Option<LedView>,
     /// Messages des opérations sur les contrôleurs (lecture, configuration), par id.
     jobs: Arc<Mutex<HashMap<u32, String>>>,
     /// Lectures terminées, à reporter dans les réglages.
@@ -82,7 +144,7 @@ impl Default for LedRuntime {
         Self {
             live: false,
             sender: leds::Sender::new(),
-            frame: Arc::new(Mutex::new(leds::Frame::default())),
+            frames: HashMap::new(),
             cache_of: None,
             leds: Vec::new(),
             colors: Vec::new(),
@@ -93,18 +155,37 @@ impl Default for LedRuntime {
             selected_set: None,
             pending_click: None,
             multi: Vec::new(),
+            multi_surf: Vec::new(),
+            multi_dmx: Vec::new(),
+            marquee: None,
             anchor: None,
             list_drag: None,
             chips_ctrl: [0, 0],
+            sketch: Sketch::default(),
+            sketch_req: None,
+            sketch_grab: None,
+            sketch_view: ([0.0, 1.0], 120.0),
+            plan_tex: None,
+            tunnel: leds::Tunnel::default(),
+            selected_dmx: None,
+            dmx_live: false,
+            dmx_sender: crate::dmx::Sender::default(),
+            bursts: HashMap::new(),
+            dmx_last: 0.0,
+            serial_ports: Vec::new(),
+            video_avg: HashMap::new(),
             camera: None,
+            cam_goal: None,
+            cursor3d: None,
+            hover_3d: false,
+            drone: false,
             drag: None,
-            screen_tex: None,
-            tex_serial: 0,
+            screen_tex: HashMap::new(),
             drawing: None,
             show_wiring: false,
             wiring: None,
             wire_target: (0, 0),
-            view: LedView::Both,
+            view: None,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             reads: Arc::new(Mutex::new(Vec::new())),
             infos: HashMap::new(),
@@ -118,6 +199,10 @@ impl Default for LedRuntime {
 enum Target {
     Fixture(usize),
     Surface(usize),
+    /// Appareil DMX (index dans `dmx`).
+    Dmx(usize),
+    /// Laser ILDA (index dans `lasers`).
+    Laser(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -161,6 +246,10 @@ enum Item {
     Tile { pts: [egui::Pos2; 4], z: [f32; 4], mesh: egui::Mesh, surface: usize, quad: [[f32; 3]; 4] },
     /// Trait (arête, mât) ; `z` : sa vraie distance, `hidden` : caché par une face.
     Wire { a: egui::Pos2, b: egui::Pos2, stroke: Stroke, z: f32, hidden: bool },
+    /// Faisceau lumineux (laser, derby, projecteur), en lumière additive.
+    Beam { a: egui::Pos2, b: egui::Pos2, c: [u8; 3], w: f32 },
+    /// Bouffée de fumée (disque) ou bulle (cercle).
+    Puff { p: egui::Pos2, r: f32, c: Color32, ring: bool },
     /// `hidden` : cachée par une face (seul son halo se voit, comme la lumière qui déborde).
     Led { p: egui::Pos2, r: f32, c: [u8; 3], i: usize, hidden: bool },
 }
@@ -170,16 +259,69 @@ const FLASH_SECS: f64 = 2.5;
 
 impl OzApp {
     /// LEDs utiles en ce moment (l'image de la sortie doit alors être lue pour elles).
-    fn leds_need_frame(&self) -> bool {
+    /// Sorties dont il faut lire l'image, et à quelle largeur : celle que suivent les LEDs, et
+    /// celles affichées sur les écrans de la scène 3D (plus fines).
+    fn frames_needed(&self) -> Vec<(usize, u32)> {
         let setup = &self.project.leds;
         let tab = self.right_tab == RightTab::Leds;
-        (!setup.fixtures.is_empty() && setup.source == Source::Video && (self.led.live || tab))
-            || (tab && self.led.view != LedView::Output && self.screens_show_output())
+        let n = self.project.outputs.len().max(1);
+        let video = |s: Source| matches!(s, Source::Video | Source::VideoAverage);
+        let uses_video = video(setup.source) || setup.groups.iter().any(|g| g.effect.as_ref().is_some_and(|e| video(e.source)));
+        let mut need: Vec<(usize, u32)> = Vec::new();
+        let mut add = |k: usize, w: u32| match need.iter_mut().find(|e| e.0 == k) {
+            Some(e) => e.1 = e.1.max(w),
+            None => need.push((k, w)),
+        };
+        if !setup.fixtures.is_empty() && uses_video && (self.led.live || tab || self.shown_view() != LedView::Output) {
+            for k in self.video_outputs() {
+                add(k, 192);
+            }
+        }
+        if self.shown_view() != LedView::Output {
+            for s in setup.surfaces.iter().filter(|s| s.show_output) {
+                add(s.output.min(n - 1), 448);
+            }
+        }
+        // Lasers qui tracent les contours d'une sortie.
+        for l in setup.lasers.iter().filter(|l| l.cue.shape == crate::laser::Shape::Video) {
+            add(l.cue.video_output.min(n - 1), 192);
+        }
+        need
     }
 
-    fn screens_show_output(&self) -> bool {
-        self.project.leds.surfaces.iter().any(|s| s.show_output)
+    /// Sorties suivies par les LEDs : celle de l'effet général, et celles choisies par des groupes.
+    fn video_outputs(&self) -> Vec<usize> {
+        let n = self.project.outputs.len().max(1);
+        let l = &self.project.leds;
+        let mut v = vec![l.video_output.min(n - 1)];
+        for e in l.groups.iter().filter_map(|g| g.effect.as_ref()) {
+            if let Some(k) = e.output {
+                if !v.contains(&k.min(n - 1)) {
+                    v.push(k.min(n - 1));
+                }
+            }
+        }
+        v
     }
+
+    /// Image lue d'une sortie (créée à la demande).
+    pub(super) fn frame_of(&mut self, k: usize) -> Arc<Mutex<leds::Frame>> {
+        self.led.frames.entry(k).or_insert_with(|| Arc::new(Mutex::new(leds::Frame::default()))).clone()
+    }
+
+    /// Vue de la zone centrale : celle choisie, sinon la sortie seule tant que la scène est vide,
+    /// et sortie + 3D dès qu'elle contient quelque chose. Le plan 2D n'existe que dans l'onglet LEDs.
+    pub(super) fn shown_view(&self) -> LedView {
+        let l = &self.project.leds;
+        let empty = l.fixtures.is_empty() && l.surfaces.is_empty() && l.dmx.is_empty() && l.lasers.is_empty();
+        match self.led.view {
+            Some(LedView::Plan) if self.right_tab != RightTab::Leds => LedView::Both,
+            Some(v) => v,
+            None if empty => LedView::Output,
+            None => LedView::Both,
+        }
+    }
+
 
     /// Calcule les couleurs des LEDs et les envoie aux contrôleurs (à chaque image).
     pub(super) fn leds_tick(&mut self, ctx: &egui::Context) {
@@ -211,6 +353,9 @@ impl OzApp {
             if self.led.selected_surface.is_some_and(|s| s >= self.project.leds.surfaces.len()) {
                 self.led.selected_surface = None;
             }
+            if self.led.selected_dmx.is_some_and(|s| s >= self.project.leds.dmx.len()) {
+                self.led.selected_dmx = None;
+            }
         }
         let now = self.clock();
         if self.led.flash.is_some_and(|(_, t)| now - t > FLASH_SECS) {
@@ -219,11 +364,45 @@ impl OzApp {
         let flash = self.led.flash.map(|(f, t)| (f, (now - t) as f32));
         let level = 1.0 - self.blackout_level;
         self.led.colors = {
-            let frame = self.led.frame.lock().unwrap();
-            let music = leds::Music { beat: self.rhythm.tempo.beat_at(now) as f32, level: self.rhythm.pulse.level };
-            leds::colors(&self.project.leds, &self.led.leds, &frame, now as f32, level, flash, music)
+            // Sorties suivies : celle de l'effet général et celles des groupes.
+            let main = self.project.leds.video_output.min(self.project.outputs.len().max(1) - 1);
+            let outs = self.video_outputs();
+            let srcs: Vec<(usize, Arc<Mutex<leds::Frame>>)> = outs.iter().map(|&k| (k, self.frame_of(k))).collect();
+            let guards: Vec<(usize, std::sync::MutexGuard<leds::Frame>)> = srcs.iter().map(|(k, a)| (*k, a.lock().unwrap())).collect();
+            let mut video = leds::VideoIn { main, ..leds::VideoIn::default() };
+            for (k, g) in &guards {
+                // Couleur dominante de la vidéo, lissée (pas de scintillement d'une image à l'autre).
+                let avg = g.average();
+                let sm = self.led.video_avg.entry(*k).or_insert(avg);
+                for c in 0..3 {
+                    sm[c] += (avg[c] - sm[c]) * 0.15;
+                }
+                video.avg.insert(*k, *sm);
+                video.frames.insert(*k, &**g);
+            }
+            let music = leds::Music {
+                beat: self.rhythm.tempo.beat_at(now) as f32,
+                level: self.rhythm.pulse.level,
+                env: self.rhythm.pulse.env,
+                bass: self.rhythm.pulse.bass,
+            };
+            leds::colors(&self.project.leds, &self.led.leds, &video, now as f32, level, flash, music)
         };
 
+        // DMX : envoi à sa cadence, rafales terminées retirées.
+        self.led.bursts.retain(|_, until| *until > now);
+        if self.led.dmx_live && !self.project.leds.dmx.is_empty() {
+            ctx.request_repaint();
+            let fps = f64::from(self.project.leds.dmx_out.fps.max(1));
+            if now - self.led.dmx_last >= 1.0 / fps {
+                self.led.dmx_last = now;
+                let universes = crate::dmx::universes(&self.project.leds.dmx, &|d| self.dmx_live_state(d));
+                self.led.dmx_sender.send(&self.project.leds.dmx_out, universes);
+            }
+        }
+        if !self.led.bursts.is_empty() {
+            ctx.request_repaint();
+        }
         let sending = self.led.live || flash.is_some();
         if !sending || self.project.leds.fixtures.is_empty() {
             return;
@@ -255,16 +434,15 @@ impl OzApp {
 
     /// Fait lire l'image de la sortie pour les LEDs (petite définition), si besoin.
     pub(super) fn leds_capture(&mut self, ui: &egui::Ui) {
-        if !self.leds_need_frame() {
-            return;
-        }
         let Some(r) = self.renderer.clone() else { return };
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
-        // Plus fine quand elle s'affiche sur les écrans du simulateur.
-        let w = if self.right_tab == RightTab::Leds && self.screens_show_output() { 448.0 } else { 192.0 };
-        let size = (w as u32, ((w / aspect) as u32).clamp(8, 1024));
-        let rect = ui.max_rect();
-        ui.painter().add(renderer::led_capture_callback(rect, r, self.draw_params(), size, self.led.frame.clone()));
+        for (k, w) in self.frames_needed() {
+            let o = self.out_size(k);
+            let aspect = (o.x / o.y.max(1.0)).clamp(0.2, 5.0);
+            let size = (w, ((w as f32 / aspect) as u32).clamp(8, 1024));
+            let sink = self.frame_of(k);
+            let params = self.draw_params_for(k);
+            ui.painter().add(renderer::led_capture_callback(ui.max_rect(), r.clone(), params, k, size, sink));
+        }
     }
 
     /// Points de l'image où les LEDs prennent leur couleur, dessinés sur l'aperçu de la sortie.
@@ -284,13 +462,22 @@ impl OzApp {
     pub(super) fn leds_central(&mut self, ui: &mut egui::Ui) {
         let full = ui.available_rect_before_wrap();
         let bar = Rect::from_min_size(full.min + Vec2::new(14.0, 6.0), Vec2::new(full.width() - 28.0, 24.0));
+        let shown = self.shown_view();
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
             ui.horizontal(|ui| {
-                for (v, name) in [(LedView::Both, "Sortie + LEDs"), (LedView::Sim, "LEDs 3D"), (LedView::Output, "Sortie")] {
-                    ui.selectable_value(&mut self.led.view, v, name);
+                for (v, name) in [(LedView::Both, "Sortie + 3D"), (LedView::Sim, "Scène 3D"), (LedView::Plan, "Plan 2D"), (LedView::Output, "Sortie")] {
+                    if v == LedView::Plan && self.right_tab != RightTab::Leds {
+                        continue;
+                    }
+                    if ui.selectable_label(shown == v, name).clicked() {
+                        self.led.view = Some(v);
+                    }
+                }
+                let n = self.led.leds.len();
+                if n == 0 {
+                    return;
                 }
                 ui.separator();
-                let n = self.led.leds.len();
                 let state = if self.led.live {
                     egui::RichText::new(with_icon(ic::WIFI_HIGH, &format!("{n} LEDs · envoi aux WLED"))).color(ACCENT)
                 } else {
@@ -300,11 +487,12 @@ impl OzApp {
             });
         });
         let body = Rect::from_min_max(egui::pos2(full.min.x, bar.max.y + 14.0), full.max);
-        match self.led.view {
+        match shown {
             LedView::Output => {
                 ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| self.preview(ui));
             }
             LedView::Sim => self.led_sim(ui, body.shrink(14.0)),
+            LedView::Plan => self.led_plan(ui, body.shrink(14.0)),
             LedView::Both => {
                 let split = body.min.y + body.height() * 0.4;
                 let top = Rect::from_min_max(body.min, egui::pos2(body.max.x, split));
@@ -319,8 +507,27 @@ impl OzApp {
     /// Simulateur 3D : la salle, le décor (écrans, volumes) et les LEDs allumées.
     fn led_sim(&mut self, ui: &mut egui::Ui, rect: Rect) {
         let room = self.project.leds.room;
+        // Glissement en douceur vers la vue demandée.
+        if let Some(goal) = self.led.cam_goal {
+            let cam = self.led.camera.get_or_insert_with(|| Orbit::home(room));
+            let k = (ui.input(|i| i.stable_dt) * 8.0).clamp(0.05, 1.0);
+            let dyaw = (goal.yaw - cam.yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+            cam.yaw += dyaw * k;
+            cam.pitch += (goal.pitch - cam.pitch) * k;
+            cam.dist += (goal.dist - cam.dist) * k;
+            for i in 0..3 {
+                cam.target[i] += (goal.target[i] - cam.target[i]) * k;
+            }
+            let close = dyaw.abs() < 0.002 && (goal.pitch - cam.pitch).abs() < 0.002 && (goal.dist - cam.dist).abs() < 0.01;
+            if close {
+                *cam = goal;
+                self.led.cam_goal = None;
+            }
+            ui.ctx().request_repaint();
+        }
         let cam = *self.led.camera.get_or_insert_with(|| Orbit::home(room));
         let resp = ui.interact(rect, ui.scope_id().with("led_sim"), Sense::click_and_drag());
+        self.led.hover_3d = resp.hovered() || resp.dragged();
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 6.0, Color32::from_rgb(8, 9, 12));
         self.update_screen_texture(ui.ctx());
@@ -355,15 +562,70 @@ impl OzApp {
         // Tout ce qui se dessine, trié du plus loin au plus proche.
         let mut items: Vec<(f32, Item)> = Vec::new();
         let light = norm([0.35, 0.8, -0.5]);
-        let tex = self.led.screen_tex.as_ref().map(|t| t.id());
+        let n_out = self.project.outputs.len().max(1);
+        let tex_of = |k: usize| self.led.screen_tex.get(&k.min(n_out - 1)).map(|t| t.0.id());
         // Les personnages dansent sur le tempo de l'onglet Rythme.
         let beat = self.rhythm.tempo.beat_at(self.clock()) as f32;
-        if self.project.leds.surfaces.iter().any(|s| s.kind == leds::SurfaceKind::Crowd || (s.kind == leds::SurfaceKind::Booth && s.dj)) {
+        if self.project.leds.surfaces.iter().any(|s| matches!(s.kind, leds::SurfaceKind::Crowd | leds::SurfaceKind::Sub) || (s.kind == leds::SurfaceKind::Booth && s.dj)) {
             ui.ctx().request_repaint();
         }
         let set = self.led.selected_set.unwrap_or(u32::MAX);
-        for (si, s) in self.project.leds.surfaces.iter().enumerate() {
-            let sel = self.led.selected_surface == Some(si) || s.set == set;
+        // Boîtiers des appareils DMX, dessinés comme des volumes (index après les objets du décor).
+        let n_surf = self.project.leds.surfaces.len();
+        let bodies: Vec<leds::Surface> = self
+            .project
+            .leds
+            .dmx
+            .iter()
+            .map(|d| {
+                let (color, size) = d.kind.body();
+                leds::Surface {
+                    kind: leds::SurfaceKind::Box,
+                    pos: d.pos,
+                    rot: d.rot,
+                    size,
+                    color,
+                    show_output: false,
+                    ..leds::Surface::default()
+                }
+            })
+            .chain(self.project.leds.lasers.iter().map(|l| leds::Surface {
+                kind: leds::SurfaceKind::Box,
+                pos: l.pos,
+                rot: l.rot,
+                size: [0.3, 0.14, 0.34],
+                color: [40, 30, 50],
+                show_output: false,
+                ..leds::Surface::default()
+            }))
+            .collect();
+        let n_dmx = self.project.leds.dmx.len();
+        // Vidéoprojecteurs allumés dont l'image est prête.
+        let n_out = self.project.outputs.len().max(1);
+        let beamers: Vec<Beamer> = self
+            .project
+            .leds
+            .surfaces
+            .iter()
+            .filter(|s| s.kind == leds::SurfaceKind::Projector && s.show_output)
+            .filter_map(|s| {
+                let k = s.output.min(n_out - 1);
+                let tex = self.led.screen_tex.get(&k).map(|t| t.0.id())?;
+                let o = self.out_size(k);
+                Some(Beamer { surface: s, tex, aspect: (o.x / o.y.max(1.0)).clamp(0.2, 5.0) })
+            })
+            .collect();
+        let all_bodies = self.project.leds.surfaces.iter().enumerate().map(|(i, s)| (i, s)).chain(bodies.iter().enumerate().map(|(k, s)| (n_surf + k, s)));
+        for (si, s) in all_bodies {
+            let sel = if si < n_surf {
+                self.led.selected_surface == Some(si) || s.set == set || self.led.multi_surf.contains(&s.id)
+            } else if si < n_surf + n_dmx {
+                let d = &self.project.leds.dmx[si - n_surf];
+                self.led.selected_dmx == Some(si - n_surf) || d.set == set || self.led.multi_dmx.contains(&d.id)
+            } else {
+                let k = si - n_surf - n_dmx;
+                (self.right_tab == RightTab::Laser && self.laser.selected == Some(k)) || self.project.leds.lasers[k].set == set
+            };
             let edge = Stroke::new(if sel { 2.0 } else { 1.0 }, if sel { ACCENT } else { Color32::from_black_alpha(200) });
             for f3 in s.faces(beat) {
                 let face = f3.quad;
@@ -371,7 +633,7 @@ impl OzApp {
                 let center = [0, 1, 2].map(|i| face.iter().map(|p| p[i]).sum::<f32>() / 4.0);
                 let facing = dot(n, sub(view.eye, center)) > 0.0;
                 // Un volume ne montre que ses faces tournées vers nous ; un écran montre aussi son dos.
-                if !facing && !matches!(s.kind, leds::SurfaceKind::Screen | leds::SurfaceKind::Panels) {
+                if !facing && !matches!(s.kind, leds::SurfaceKind::Screen | leds::SurfaceKind::Panels | leds::SurfaceKind::Sun) {
                     continue;
                 }
                 let shade = 0.55 + 0.45 * dot(if facing { n } else { n.map(|v| -v) }, light).max(0.0);
@@ -381,10 +643,19 @@ impl OzApp {
                     (f32::from(base[1]) * shade) as u8,
                     (f32::from(base[2]) * shade) as u8,
                 );
-                let textured = (f3.output && facing).then_some(tex).flatten();
-                face_tiles(&view, face, fill, textured.map(|t| (t, f3.uv)), edge, f3.edges, si, &mut items);
+                let textured = (f3.output && facing && s.kind != leds::SurfaceKind::Projector).then(|| tex_of(s.output)).flatten();
+                // Un projecteur n'éclaire pas son propre boîtier.
+                let lights: Vec<Beamer> = beamers
+                    .iter()
+                    .filter(|b| !std::ptr::eq(b.surface, s))
+                    .map(|b| Beamer { surface: b.surface, tex: b.tex, aspect: b.aspect })
+                    .collect();
+                face_tiles(&view, face, fill, textured.map(|t| (t, f3.uv)), edge, f3.edges, si, &mut items, &lights);
             }
         }
+        self.dmx_effects(&view, &mut items, beat);
+        let targets = self.laser_targets(beat);
+        self.ilda_beams(&view, &mut items, &targets);
         for (i, l) in self.led.leds.iter().enumerate() {
             if let Some((p, z)) = view.project(l.pos) {
                 let c = self.led.colors.get(i).copied().unwrap_or_default();
@@ -428,6 +699,17 @@ impl OzApp {
                         hovered_quad = Some(*quad);
                     }
                 }
+                Item::Beam { a, b, c, w } => {
+                    painter.line_segment([*a, *b], Stroke::new(*w * 4.0, glow(*c, 0.10)));
+                    painter.line_segment([*a, *b], Stroke::new(*w, glow(*c, 0.75)));
+                }
+                Item::Puff { p, r, c, ring } => {
+                    if *ring {
+                        painter.circle_stroke(*p, *r, Stroke::new(1.0, *c));
+                    } else {
+                        painter.circle_filled(*p, *r, *c);
+                    }
+                }
                 Item::Wire { hidden: true, .. } => {}
                 Item::Wire { a, b, stroke, .. } => {
                     painter.line_segment([*a, *b], *stroke);
@@ -463,7 +745,15 @@ impl OzApp {
         } else {
             match hovered_led {
             Some((i, _)) => Some(Target::Fixture(self.led.leds[i].fixture)),
-                None => hovered_surface.map(Target::Surface),
+                None => hovered_surface.map(|s| {
+                    if s < n_surf {
+                        Target::Surface(s)
+                    } else if s < n_surf + self.project.leds.dmx.len() {
+                        Target::Dmx(s - n_surf)
+                    } else {
+                        Target::Laser(s - n_surf - self.project.leds.dmx.len())
+                    }
+                }),
             }
         };
 
@@ -483,7 +773,11 @@ impl OzApp {
 
         // Souris : glisser un objet le déplace au sol (Maj : en hauteur, Alt : le tourne),
         // glisser ailleurs tourne autour de la salle.
-        if resp.drag_started_by(egui::PointerButton::Primary) {
+        let shift_held = ui.input(|i| i.modifiers.shift);
+        if resp.drag_started_by(egui::PointerButton::Primary) && hovered.is_none() && shift_held && !drawing && self.led.wiring.is_none() {
+            // Maj + glisser dans le vide : rectangle de sélection.
+            self.led.marquee = resp.interact_pointer_pos();
+        } else if resp.drag_started_by(egui::PointerButton::Primary) {
             self.led.drag = hovered.and_then(|t| {
                 let pos = self.target_pos(t)?;
                 let mods = ui.input(|i| i.modifiers);
@@ -498,7 +792,10 @@ impl OzApp {
                 Some(Drag { target: t, mode, offset: [pos[0] - hit[0], pos[2] - hit[2]] })
             });
             if let Some(d) = self.led.drag {
-                self.select(d.target);
+                // Un objet de la sélection multiple garde la sélection (ils bougeront ensemble).
+                if !(self.multi_count() > 1 && self.in_multi(d.target)) {
+                    self.select(d.target);
+                }
             }
         }
         if resp.dragged_by(egui::PointerButton::Primary) {
@@ -532,12 +829,38 @@ impl OzApp {
                 if let Some(b) = before {
                     self.spread_to_set(d.target, b);
                 }
-            } else {
+            } else if self.led.marquee.is_none() {
                 let d = resp.drag_delta();
+                let drone = self.led.drone;
                 let cam = self.led.camera.as_mut().unwrap();
-                cam.yaw -= d.x * 0.008;
-                cam.pitch = (cam.pitch + d.y * 0.008).clamp(-0.2, 1.55);
+                if drone {
+                    // Drone : on tourne la tête, l'œil reste en place.
+                    let eye = view.eye;
+                    cam.yaw += d.x * 0.006;
+                    cam.pitch = (cam.pitch - d.y * 0.006).clamp(-1.55, 1.55);
+                    let (cp, sp) = (cam.pitch.cos(), cam.pitch.sin());
+                    let off = [cam.yaw.sin() * cp, sp, -cam.yaw.cos() * cp];
+                    cam.target = [0, 1, 2].map(|k| eye[k] - off[k] * cam.dist);
+                } else {
+                    // Glisser dans le vide : tourner autour de la scène, dans tous les sens.
+                    cam.yaw -= d.x * 0.008;
+                    cam.pitch = (cam.pitch + d.y * 0.008).clamp(-1.55, 1.55);
+                }
             }
+        }
+        // Rectangle de sélection : dessiné pendant le glissement, appliqué au lâcher.
+        if let (Some(a), Some(b)) = (self.led.marquee, resp.interact_pointer_pos()) {
+            let r = Rect::from_two_pos(a, b);
+            painter.rect_filled(r, 0.0, ACCENT.gamma_multiply(0.12));
+            painter.rect_stroke(r, 0.0, Stroke::new(1.0, ACCENT), egui::StrokeKind::Inside);
+            if resp.drag_stopped() {
+                let add = ui.input(|i| i.modifiers.shift);
+                self.select_in_rect(r, &view, add);
+                self.led.marquee = None;
+            }
+        }
+        if !resp.dragged() && !resp.drag_stopped() {
+            self.led.marquee = None;
         }
         if resp.drag_stopped() {
             if let Some(Drag { target, mode: DragMode::Rotate, .. }) = self.led.drag.filter(|_| self.led.selected_set.is_none()) {
@@ -549,6 +872,7 @@ impl OzApp {
             }
             self.led.drag = None;
         }
+        // Clic droit glissé, ou molette enfoncée : déplacer la vue.
         if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
             let d = resp.drag_delta();
             let cam = self.led.camera.as_mut().unwrap();
@@ -558,10 +882,40 @@ impl OzApp {
             }
         }
         if resp.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
+            // Molette ou pincement du trackpad : zoom vers le point visé (pas vers le centre).
+            let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            let factor = (-scroll * 0.002).exp() / pinch.max(0.01);
+            if (factor - 1.0).abs() > 1e-4 {
+                self.led.cam_goal = None;
+                let aim = resp.hover_pos().and_then(|h| match hovered_quad {
+                    Some(q) => view.ray_plane(h, q[0], norm(cross(sub(q[1], q[0]), sub(q[3], q[0])))),
+                    None => view.ray_floor(h, 0.0),
+                });
                 let cam = self.led.camera.as_mut().unwrap();
-                cam.dist = (cam.dist * (-scroll * 0.002).exp()).clamp(0.5, 80.0);
+                let new_dist = (cam.dist * factor).clamp(0.3, 120.0);
+                let f = new_dist / cam.dist;
+                if let Some(p) = aim.filter(|p| dot(sub(*p, view.eye), sub(*p, view.eye)).sqrt() < 200.0) {
+                    for i in 0..3 {
+                        cam.target[i] += (p[i] - cam.target[i]) * (1.0 - f);
+                    }
+                }
+                cam.dist = new_dist;
+            }
+        }
+        // Clic droit (sans glisser) : poser le point d'ajout, au sol ou sur la face visée.
+        if resp.secondary_clicked() && !drawing {
+            if let Some(h) = resp.interact_pointer_pos() {
+                let hit = match hovered_quad {
+                    Some(q) => {
+                        let n = norm(cross(sub(q[1], q[0]), sub(q[3], q[0])));
+                        view.ray_plane(h, q[0], n)
+                    }
+                    None => view.ray_floor(h, 0.0),
+                };
+                if let Some(p) = hit {
+                    let snap = |v: f32| (v * 20.0).round() / 20.0;
+                    self.led.cursor3d = Some([snap(p[0]), snap(p[1]).max(0.0), snap(p[2])]);
+                }
             }
         }
         if resp.clicked() && !drawing && self.led.wiring.is_some() {
@@ -574,15 +928,36 @@ impl OzApp {
             match hovered {
                 Some(Target::Fixture(i)) if cmd => self.toggle_multi(i),
                 Some(t) if shift => self.add_to_group(t),
-                Some(t) => self.select(t),
+                Some(t) => {
+                    self.select(t);
+                    if !matches!(t, Target::Dmx(_) | Target::Laser(_)) {
+                        self.right_tab = RightTab::Leds;
+                    }
+                }
                 None => {
                     self.led.selected = None;
                     self.led.selected_surface = None;
+                    self.led.selected_dmx = None;
+                    self.clear_multi();
                 }
             }
         }
-        if resp.double_clicked() && hovered.is_none() && !drawing {
-            self.led.camera = Some(Orbit::home(room));
+        if resp.double_clicked() && !drawing {
+            match hovered {
+                // Double-clic sur un objet : la vue se centre sur lui.
+                Some(t) => {
+                    if let Some(p) = self.target_pos(t) {
+                        let cam = self.led.camera.unwrap();
+                        let h = match t {
+                            Target::Surface(i) => self.project.leds.surfaces.get(i).map_or(0.0, |s| s.size[1] * 0.5),
+                            _ => 0.3,
+                        };
+                        self.led.cam_goal = Some(Orbit { target: [p[0], p[1] + h, p[2]], dist: cam.dist.min(5.0), ..cam });
+                    }
+                }
+                // Dans le vide : tout voir.
+                None => self.frame_all(None),
+            }
         }
         if resp.dragged() || resp.hovered() {
             ui.ctx().request_repaint();
@@ -599,6 +974,45 @@ impl OzApp {
         if drawing {
             self.draw_path(ui, &resp, &painter, &view, rect, hovered_quad);
             return;
+        }
+
+        // Cône des vidéoprojecteurs allumés (pointillés), jusqu'à 6 m.
+        for s in self.project.leds.surfaces.iter().filter(|s| s.kind == leds::SurfaceKind::Projector && s.show_output) {
+            let o = self.out_size(s.output.min(self.project.outputs.len().max(1) - 1));
+            let aspect = (o.x / o.y.max(1.0)).clamp(0.2, 5.0);
+            let l = 6.0;
+            let (hx, hy) = (l / (2.0 * s.throw.max(0.2)), l / (2.0 * s.throw.max(0.2) * aspect));
+            let lens = s.lens();
+            let z = -s.size[2] * 0.5 - 0.04 - l;
+            let corners: Vec<[f32; 3]> = [[-hx, hy], [hx, hy], [hx, -hy], [-hx, -hy]]
+                .iter()
+                .map(|c| leds::place(s.pos, s.rot, [c[0], s.size[1] * 0.5 + c[1], z]))
+                .collect();
+            let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 200, 255, 90));
+            let px: Vec<Option<egui::Pos2>> = corners.iter().map(|c| view.project(*c).map(|p| p.0)).collect();
+            if let Some((a, _)) = view.project(lens) {
+                for p in px.iter().flatten() {
+                    painter.extend(egui::Shape::dashed_line(&[a, *p], stroke, 5.0, 4.0));
+                }
+            }
+            for k in 0..4 {
+                if let (Some(a), Some(b)) = (px[k], px[(k + 1) % 4]) {
+                    painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 5.0, 4.0));
+                }
+            }
+        }
+
+        // Point d'ajout.
+        if let Some(c) = self.led.cursor3d {
+            if let Some((p, _)) = view.project(c) {
+                painter.circle_stroke(p, 9.0, Stroke::new(2.0, WARN));
+                painter.line_segment([p - Vec2::new(14.0, 0.0), p + Vec2::new(14.0, 0.0)], Stroke::new(1.5, WARN));
+                painter.line_segment([p - Vec2::new(0.0, 14.0), p + Vec2::new(0.0, 14.0)], Stroke::new(1.5, WARN));
+                // Repère vertical jusqu'au sol, pour lire la hauteur.
+                if c[1] > 0.01 {
+                    view.line(&painter, c, [c[0], 0.0, c[2]], Stroke::new(1.0, WARN.gamma_multiply(0.5)));
+                }
+            }
         }
 
         // Infos de la LED survolée.
@@ -619,21 +1033,34 @@ impl OzApp {
         let buttons = Rect::from_min_size(rect.min + Vec2::new(8.0, 8.0), Vec2::new(rect.width() - 16.0, 24.0));
         ui.scope_builder(egui::UiBuilder::new().max_rect(buttons), |ui| {
             ui.horizontal(|ui| {
-                let cam = self.led.camera.as_mut().unwrap();
                 for (name, yaw, pitch) in [("Face", 0.0, 0.12), ("Dessus", 0.0, 1.55), ("Côté", -1.5708, 0.12), ("3D", 0.5, 0.42)] {
                     if ui.small_button(name).clicked() {
-                        *cam = Orbit { yaw, pitch, ..Orbit::home(room) };
+                        self.frame_all(Some((yaw, pitch)));
+                    }
+                }
+                if ui.small_button(with_icon(ic::CORNERS_OUT, "Tout voir")).on_hover_text("Cadrer toute la scène (double-clic dans le vide)").clicked() {
+                    self.frame_all(None);
+                }
+                if self.led.cursor3d.is_some() {
+                    ui.separator();
+                    ui.label(egui::RichText::new(with_icon(ic::CROSSHAIR, "Point d'ajout posé")).small().color(WARN))
+                        .on_hover_text("Les éléments ajoutés apparaissent ici. Clic droit ailleurs : le déplacer.");
+                    if ui.small_button(ic::X).on_hover_text("Retirer le point d'ajout").clicked() {
+                        self.led.cursor3d = None;
                     }
                 }
             });
         });
-        painter.text(
-            rect.left_bottom() + Vec2::new(8.0, -6.0),
-            egui::Align2::LEFT_BOTTOM,
-            "Glisser : tourner · clic droit : déplacer la vue · molette : zoom · objet : glisser (Maj : hauteur, Alt : tourner) · flèches, PgHaut PgBas : déplacer · Q E : tourner · Suppr · Cmd+D : dupliquer · D : dessiner · V : vue",
+        // Aide en bas de la vue : retour à la ligne plutôt que coupée, sur un fond qui la détache de la scène.
+        let help = painter.layout(
+            "ZQSD : drone (Espace / C : monter, descendre ; Maj : vite) · flèches : déplacer la vue · glisser : tourner · clic droit glissé : déplacer · molette : zoom · double-clic : centrer (vide : tout voir) · clic droit : point d'ajout · Maj + glisser : sélection".into(),
             egui::FontId::proportional(11.0),
             TEXT_WEAK,
+            rect.width() - 16.0,
         );
+        let at = rect.left_bottom() + Vec2::new(8.0, -6.0 - help.size().y);
+        painter.rect_filled(Rect::from_min_size(at, help.size()).expand(4.0), 4.0, Color32::from_black_alpha(170));
+        painter.galley(at, help, TEXT_WEAK);
         if self.project.leds.fixtures.is_empty() && self.project.leds.surfaces.is_empty() {
             painter.text(
                 rect.center(),
@@ -645,10 +1072,59 @@ impl OzApp {
         }
     }
 
+    /// Drone : ZQSD (ou WASD) pour avancer, reculer, se décaler, Espace / C pour monter et
+    /// descendre, tant que la souris est sur la vue 3D. Ces touches ne lancent alors pas leurs
+    /// raccourcis habituels. Appelé avant les raccourcis.
+    pub(super) fn drone_keys(&mut self, ctx: &egui::Context) {
+        let hover = std::mem::take(&mut self.led.hover_3d);
+        if !hover || ctx.egui_wants_keyboard_input() || ctx.input(|i| i.modifiers.command) {
+            return;
+        }
+        // Flèches : déplacer la vue (haut, bas, gauche, droite), quand aucun objet n'est choisi
+        // (sinon elles déplacent l'objet).
+        let nothing_selected = self.current_target().is_none() && self.multi_count() < 2;
+        let (fwd, side, up, dt) = ctx.input_mut(|i| {
+            let down = |k: Key| i.key_down(k);
+            let arrows = nothing_selected;
+            let f = (down(Key::Z) || down(Key::W)) as i32 - down(Key::S) as i32;
+            let r = (down(Key::D) || arrows && down(Key::ArrowRight)) as i32 - (down(Key::Q) || down(Key::A) || arrows && down(Key::ArrowLeft)) as i32;
+            let u = (down(Key::Space) || arrows && down(Key::ArrowUp)) as i32 - (down(Key::C) || arrows && down(Key::ArrowDown)) as i32;
+            if arrows {
+                for k in [Key::ArrowUp, Key::ArrowDown, Key::ArrowLeft, Key::ArrowRight] {
+                    i.consume_key(Modifiers::NONE, k);
+                    i.consume_key(Modifiers::SHIFT, k);
+                }
+            }
+            // Les appuis ne vont pas aux raccourcis de l'app.
+            for k in [Key::Z, Key::W, Key::S, Key::D, Key::Q, Key::A, Key::Space, Key::C] {
+                i.consume_key(Modifiers::NONE, k);
+                i.consume_key(Modifiers::SHIFT, k);
+            }
+            (f as f32, r as f32, u as f32, i.stable_dt.min(0.1))
+        });
+        if fwd == 0.0 && side == 0.0 && up == 0.0 {
+            return;
+        }
+        let room = self.project.leds.room;
+        // Maj : plus vite.
+        let speed = if ctx.input(|i| i.modifiers.shift) { 6.0 } else { 2.5 };
+        self.led.cam_goal = None;
+        self.led.drone = true;
+        let cam = self.led.camera.get_or_insert_with(|| Orbit::home(room));
+        // Le regard s'approche de l'œil : on vole, on ne tourne plus autour de la scène.
+        cam.dist = cam.dist.min(2.0);
+        let (f, r) = ([-cam.yaw.sin(), 0.0, cam.yaw.cos()], [cam.yaw.cos(), 0.0, cam.yaw.sin()]);
+        for k in 0..3 {
+            cam.target[k] += (f[k] * fwd + r[k] * side + if k == 1 { up } else { 0.0 }) * speed * dt;
+        }
+        cam.target[1] = cam.target[1].max(-1.0);
+        ctx.request_repaint();
+    }
+
     /// Raccourcis de la scène 3D (onglet LEDs ouvert). Appelé avant les raccourcis généraux :
     /// les touches utilisées ici ne lancent pas aussi leur action habituelle.
     pub(super) fn scene_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.right_tab != RightTab::Leds || ctx.egui_wants_keyboard_input() || self.led.confirm_push.is_some() {
+        if !matches!(self.right_tab, RightTab::Leds | RightTab::Dmx) || ctx.egui_wants_keyboard_input() || self.led.confirm_push.is_some() {
             return;
         }
         if self.led.wiring.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
@@ -656,7 +1132,7 @@ impl OzApp {
             return;
         }
         // Pendant un tracé, Entrée, Retour arrière et Échap appartiennent au dessin.
-        if self.led.drawing.is_some() {
+        if self.led.drawing.is_some() || (self.shown_view() == LedView::Plan && self.led.sketch.drawing) {
             return;
         }
         let key = |mods: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(mods, k));
@@ -671,27 +1147,27 @@ impl OzApp {
             let cam = self.led.camera.get_or_insert_with(|| Orbit::home(room));
             let cur = views.iter().position(|v| (v.0 - cam.yaw).abs() < 0.01 && (v.1 - cam.pitch).abs() < 0.01);
             let (yaw, pitch) = views[cur.map_or(0, |c| (c + 1) % views.len())];
-            *cam = Orbit { yaw, pitch, ..Orbit::home(room) };
+            let _ = cam;
+            self.frame_all(Some((yaw, pitch)));
         }
-        let target = match (self.led.selected, self.led.selected_surface) {
-            (Some(i), _) => Target::Fixture(i),
-            (_, Some(i)) => Target::Surface(i),
-            _ => return,
+        // Plusieurs objets choisis (rectangle, Cmd+clic) : les touches agissent sur tous.
+        let multi = self.multi_count() > 1;
+        let target = match self.current_target() {
+            Some(t) => t,
+            None if multi => Target::Fixture(usize::MAX),
+            None => return,
         };
         if key(Modifiers::NONE, Key::Escape) {
             self.led.selected = None;
             self.led.selected_surface = None;
+            self.led.selected_dmx = None;
             self.led.selected_set = None;
-            self.led.multi.clear();
+            self.clear_multi();
             return;
         }
         if key(Modifiers::NONE, Key::Delete) || key(Modifiers::NONE, Key::Backspace) {
-            if self.led.multi.len() > 1 {
-                // Tous les bandeaux choisis.
-                let multi = std::mem::take(&mut self.led.multi);
-                self.project.leds.fixtures.retain(|f| !multi.contains(&f.id));
-                self.project.leds.prune_sets();
-                self.led.selected = None;
+            if multi {
+                self.delete_multi();
                 return;
             }
             if let Some(id) = self.led.selected_set.take() {
@@ -719,13 +1195,20 @@ impl OzApp {
                         setup.image_on = None;
                     }
                 }
+                Target::Dmx(i) if i < setup.dmx.len() => {
+                    setup.dmx.remove(i);
+                }
+                Target::Laser(i) if i < setup.lasers.len() => {
+                    setup.lasers.remove(i);
+                }
                 _ => {}
             }
             self.led.selected = None;
             self.led.selected_surface = None;
+            self.led.selected_dmx = None;
             return;
         }
-        if key(Modifiers::COMMAND, Key::D) {
+        if !multi && key(Modifiers::COMMAND, Key::D) {
             let setup = &mut self.project.leds;
             match target {
                 Target::Fixture(i) if i < setup.fixtures.len() => {
@@ -763,10 +1246,11 @@ impl OzApp {
         for (k, dir) in [
             (Key::ArrowRight, [right[0], 0.0, right[1]]),
             (Key::ArrowLeft, [-right[0], 0.0, -right[1]]),
-            (Key::ArrowUp, [fwd[0], 0.0, fwd[1]]),
-            (Key::ArrowDown, [-fwd[0], 0.0, -fwd[1]]),
-            (Key::PageUp, [0.0, 1.0, 0.0]),
-            (Key::PageDown, [0.0, -1.0, 0.0]),
+            // Haut / bas : en hauteur ; PgHaut / PgBas : en profondeur (s'éloigner, se rapprocher).
+            (Key::ArrowUp, [0.0, 1.0, 0.0]),
+            (Key::ArrowDown, [0.0, -1.0, 0.0]),
+            (Key::PageUp, [fwd[0], 0.0, fwd[1]]),
+            (Key::PageDown, [-fwd[0], 0.0, -fwd[1]]),
         ] {
             if key(mods, k) {
                 for i in 0..3 {
@@ -781,27 +1265,14 @@ impl OzApp {
             turn -= 15.0;
         }
         if mv != [0.0; 3] || turn != 0.0 {
-            if self.led.multi.len() > 1 {
-                // Les bandeaux choisis bougent ensemble, comme un groupe provisoire.
-                const TEMP: u32 = u32::MAX;
-                let setup = &mut self.project.leds;
-                let saved: Vec<(usize, u32)> = setup
-                    .fixtures
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, f)| self.led.multi.contains(&f.id))
-                    .map(|(i, f)| (i, f.set))
-                    .collect();
-                for &(i, _) in &saved {
-                    setup.fixtures[i].set = TEMP;
-                }
-                setup.move_set(TEMP, mv);
-                if turn != 0.0 {
-                    setup.rotate_set(TEMP, turn);
-                }
-                for (i, set) in saved {
-                    setup.fixtures[i].set = set;
-                }
+            if multi {
+                // Les objets choisis bougent ensemble, comme un groupe provisoire.
+                self.with_multi(|l, id| {
+                    l.move_set(id, mv);
+                    if turn != 0.0 {
+                        l.rotate_set(id, turn);
+                    }
+                });
             } else if let Some(id) = self.led.selected_set {
                 // Tout le groupe.
                 self.project.leds.move_set(id, mv);
@@ -815,6 +1286,82 @@ impl OzApp {
                 pos[1] = pos[1].max(0.0);
                 rot[0] = (rot[0] + turn).rem_euclid(360.0);
             }
+        }
+    }
+
+    /// Générateur de tunnel d'arches LED.
+    fn tunnel_ui(&mut self, ui: &mut egui::Ui) {
+        let mut create = false;
+        egui::CollapsingHeader::new(egui::RichText::new(with_icon(ic::SPIRAL, "Tunnel d'arches")).strong())
+            .id_salt("led_tunnel")
+            .show(ui, |ui| {
+                let t = &mut self.led.tunnel;
+                ui.horizontal(|ui| {
+                    ui.label("Arches");
+                    ui.add(egui::DragValue::new(&mut t.arches).range(1..=50));
+                    ui.label("tous les");
+                    ui.add(egui::DragValue::new(&mut t.spacing).range(0.1..=20.0).speed(0.01).suffix(" m"));
+                    ui.label("dès");
+                    ui.add(egui::DragValue::new(&mut t.start).range(0.0..=100.0).speed(0.01).suffix(" m"))
+                        .on_hover_text("Profondeur de la première arche");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Largeur");
+                    ui.add(egui::DragValue::new(&mut t.width).range(0.3..=30.0).speed(0.01).suffix(" m"));
+                    ui.label("Murs");
+                    ui.add(egui::DragValue::new(&mut t.wall).range(0.0..=20.0).speed(0.01).suffix(" m"));
+                    ui.label("Sommet");
+                    ui.add(egui::DragValue::new(&mut t.height).range(0.2..=20.0).speed(0.01).suffix(" m"));
+                });
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut t.round, false, "Voûte à pans");
+                    ui.selectable_value(&mut t.round, true, "Voûte arrondie");
+                    ui.checkbox(&mut t.floor, "Bandes au sol");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Densité");
+                    for d in [30.0, 60.0, 96.0, 144.0] {
+                        ui.selectable_value(&mut t.density, d, format!("{d:.0}/m"));
+                    }
+                });
+                create = ui
+                    .add(theme::primary_button(with_icon(ic::PLUS, "Créer le tunnel")))
+                    .on_hover_text("Remplace le tunnel déjà créé. Groupes de bandeaux de l'avant vers le fond : Sortie › Scénario « Allumage » ou « Vague » font courir la lumière dans le tunnel.")
+                    .clicked();
+            });
+        if !create {
+            return;
+        }
+        let paths = self.led.tunnel.paths();
+        let density = self.led.tunnel.density;
+        let setup = &mut self.project.leds;
+        const PREFIX: &str = "Tunnel · ";
+        setup.fixtures.retain(|f| !f.name.starts_with(PREFIX));
+        let (ctrl, outputs) = self
+            .led
+            .selected
+            .and_then(|s| setup.fixtures.get(s))
+            .and_then(|f| setup.controllers.iter().find(|c| c.id == f.controller))
+            .or(setup.controllers.first())
+            .map_or((0, 1), |c| (c.id, c.pins.len().max(1)));
+        let set = setup.next_set_id();
+        setup.sets.push(leds::LedGroup { id: set, name: "Tunnel".into(), effect: None });
+        for (k, (name, pts)) in paths.iter().enumerate() {
+            let id = setup.next_fixture_id();
+            let mut f = Fixture::new(FixtureKind::Path, id, format!("{PREFIX}{name}"));
+            f.set_path(pts, false);
+            f.count = ((f.path_length() * density).round() as u32).clamp(2, leds::MAX_COUNT);
+            f.controller = ctrl;
+            f.output = k % outputs;
+            f.set = set;
+            setup.fixtures.push(f);
+        }
+        setup.prune_sets();
+        // L'effet tunnel : les groupes vont de l'avant vers le fond.
+        setup.auto_groups(leds::GroupOrder::FrontBack);
+        self.led.selected_set = Some(set).filter(|id| setup.sets.iter().any(|g| g.id == *id));
+        if self.shown_view() == LedView::Output {
+            self.led.view = Some(LedView::Both);
         }
     }
 
@@ -978,12 +1525,911 @@ impl OzApp {
             if let Some((controller, output)) = start {
                 self.led.wiring = Some(WireMode { controller, output, chain: Vec::new() });
                 self.led.show_wiring = true;
-                if self.led.view == LedView::Output {
-                    self.led.view = LedView::Both;
+                if self.shown_view() == LedView::Output {
+                    self.led.view = Some(LedView::Both);
                 }
             }
         });
         ui.add_space(4.0);
+    }
+
+    /// Ouvre la planche 2D : nouvelle forme (`None`) ou forme d'un tracé plat de la scène.
+    fn open_sketch(&mut self, target: Option<usize>) {
+        self.led.view = Some(LedView::Plan);
+        self.led.sketch_grab = None;
+        match target.and_then(|i| self.project.leds.fixtures.get(i)).filter(|f| f.is_flat()) {
+            Some(f) => {
+                let len = f.path_length();
+                self.led.sketch = Sketch {
+                    points: f.points.iter().map(|p| [p[0], p[1]]).collect(),
+                    closed: f.closed,
+                    editing: Some(f.id),
+                    drawing: false,
+                    density: if len > 0.01 { f.count as f32 / len } else { 60.0 },
+                };
+                self.frame_sketch();
+            }
+            None => {
+                let density = self.led.sketch.density;
+                self.led.sketch = Sketch { density, ..Sketch::default() };
+                self.led.sketch_view = ([0.0, 1.0], self.led.sketch_view.1);
+            }
+        }
+    }
+
+    /// Cadre la vue sur la forme.
+    fn frame_sketch(&mut self) {
+        let pts = &self.led.sketch.points;
+        if pts.is_empty() {
+            return;
+        }
+        let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
+        for p in pts {
+            for k in 0..2 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let size = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(0.5);
+        self.led.sketch_view = ([(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0], (500.0 / size).clamp(20.0, 2000.0));
+    }
+
+    /// Planche à dessin 2D : on dessine la forme d'un bandeau en mètres, puis on l'ajoute à la
+    /// scène (où on la place et l'oriente) ; ou on modifie la forme d'un tracé plat de la scène.
+    fn led_plan(&mut self, ui: &mut egui::Ui, rect: Rect) {
+        // Tracé modifié supprimé entre-temps : la planche redevient une nouvelle forme.
+        if let Some(id) = self.led.sketch.editing {
+            if !self.project.leds.fixtures.iter().any(|f| f.id == id) {
+                self.led.sketch.editing = None;
+            }
+        }
+        let editing_name = self.led.sketch.editing.and_then(|id| self.project.leds.fixtures.iter().find(|f| f.id == id)).map(|f| f.name.clone());
+        let len = sketch_length(&self.led.sketch.points, self.led.sketch.closed);
+        let count = ((len * self.led.sketch.density).round() as u32).clamp(2, leds::MAX_COUNT);
+
+        // Outils (1re ligne) et forme (2e ligne).
+        let bar = Rect::from_min_size(rect.min, Vec2::new(rect.width(), 56.0));
+        let mut pick_photo = false;
+        let mut add = false;
+        let mut new_shape = false;
+        let mut done = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar), |ui| {
+            ui.horizontal(|ui| {
+                if ui.button(with_icon(ic::PLUS, "Nouvelle forme")).clicked() {
+                    new_shape = true;
+                }
+                let sk = &mut self.led.sketch;
+                if ui.selectable_label(!sk.drawing, with_icon(ic::CROSSHAIR, "Modifier")).clicked() {
+                    sk.drawing = false;
+                }
+                if ui.selectable_label(sk.drawing, with_icon(ic::PENCIL_SIMPLE, "Tracer")).clicked() {
+                    sk.drawing = true;
+                }
+                ui.separator();
+                let setup = &mut self.project.leds;
+                let name = setup.plan_photo.as_deref().map_or("Photo de référence…".to_owned(), |p| elide_name(&file_name(p)));
+                if ui.selectable_label(setup.plan_photo.is_some(), name).on_hover_text("Photo de l'élément réel, pour décalquer sa forme").clicked() {
+                    pick_photo = true;
+                }
+                if setup.plan_photo.is_some() {
+                    ui.add(egui::DragValue::new(&mut setup.plan_photo_w).range(0.1..=100.0).speed(0.01).prefix("largeur ").suffix(" m"))
+                        .on_hover_text("Largeur réelle de ce que montre la photo : elle se met à l'échelle de la planche");
+                    ui.add(egui::Slider::new(&mut setup.plan_bg, 0.0..=1.0).show_value(false)).on_hover_text("Opacité de la photo");
+                    if ui.small_button(ic::X).on_hover_text("Retirer la photo").clicked() {
+                        setup.plan_photo = None;
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let sk = &mut self.led.sketch;
+                ui.label(egui::RichText::new(format!("{len:.2} m · {count} LEDs")).strong());
+                for d in [30.0, 60.0, 96.0, 144.0] {
+                    ui.selectable_value(&mut sk.density, d, format!("{d:.0}/m"));
+                }
+                ui.checkbox(&mut sk.closed, "Boucle fermée");
+                ui.separator();
+                match &editing_name {
+                    Some(name) => {
+                        ui.label(egui::RichText::new(format!("Modifie « {name} » en direct")).color(ACCENT));
+                        if ui.button("Terminé").clicked() {
+                            done = true;
+                        }
+                    }
+                    None => {
+                        add = ui
+                            .add_enabled(sk.points.len() >= 2, theme::primary_button(with_icon(ic::PLUS, "Ajouter à la scène")))
+                            .on_hover_text("Le bandeau apparaît debout au milieu de la salle : placez-le et tournez-le dans la vue 3D")
+                            .clicked();
+                    }
+                }
+            });
+        });
+        if pick_photo {
+            if let Some(p) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"]).pick_file() {
+                self.project.leds.plan_photo = Some(p);
+            }
+        }
+        if new_shape {
+            self.open_sketch(None);
+        }
+
+        // Planche : quadrillage en mètres, photo à l'échelle, forme.
+        let canvas = Rect::from_min_max(egui::pos2(rect.min.x, bar.max.y + 4.0), egui::pos2(rect.max.x, rect.max.y - 18.0));
+        let resp = ui.interact(canvas, ui.scope_id().with("led_sketch"), Sense::click_and_drag());
+        let (mut center, mut scale) = self.led.sketch_view;
+        // Clic droit ou molette enfoncée : déplacer la vue ; molette : zoom sous le pointeur.
+        if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let d = resp.drag_delta();
+            center = [center[0] - d.x / scale, center[1] + d.y / scale];
+        }
+        if let (true, Some(h)) = (resp.hovered(), resp.hover_pos()) {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                let before = [center[0] + (h.x - canvas.center().x) / scale, center[1] - (h.y - canvas.center().y) / scale];
+                scale = (scale * (scroll * 0.002).exp()).clamp(10.0, 4000.0);
+                center = [before[0] - (h.x - canvas.center().x) / scale, before[1] + (h.y - canvas.center().y) / scale];
+            }
+        }
+        self.led.sketch_view = (center, scale);
+        let to_px = |p: [f32; 2]| canvas.center() + Vec2::new((p[0] - center[0]) * scale, -(p[1] - center[1]) * scale);
+        let to_m = |q: egui::Pos2| [center[0] + (q.x - canvas.center().x) / scale, center[1] - (q.y - canvas.center().y) / scale];
+        let painter = ui.painter_at(canvas);
+        painter.rect_filled(canvas, 6.0, Color32::from_rgb(14, 16, 20));
+        if let Some(path) = self.project.leds.plan_photo.clone() {
+            if self.led.plan_tex.as_ref().is_none_or(|t| t.0 != path) {
+                self.led.plan_tex = load_photo(ui.ctx(), &path).map(|t| (path.clone(), t));
+                if self.led.plan_tex.is_none() {
+                    self.status = Some(format!("Photo illisible : {}", path.display()));
+                    self.project.leds.plan_photo = None;
+                }
+            }
+            if let Some((_, tex)) = &self.led.plan_tex {
+                // Photo centrée sur l'origine, posée au sol (y = 0 en bas).
+                let w = self.project.leds.plan_photo_w;
+                let [tw, th] = tex.size().map(|v| v as f32);
+                let h = w * th / tw.max(1.0);
+                let r = Rect::from_two_pos(to_px([-w / 2.0, h]), to_px([w / 2.0, 0.0]));
+                let a = (self.project.leds.plan_bg * 255.0) as u8;
+                painter.image(tex.id(), r, Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::from_white_alpha(a));
+            }
+        }
+        // Quadrillage : 10 cm (si assez grand), 1 m, axes.
+        let (lo, hi) = (to_m(canvas.left_bottom()), to_m(canvas.right_top()));
+        for (step, alpha) in [(0.1f32, 10u8), (1.0, 28)] {
+            if step * scale < 8.0 {
+                continue;
+            }
+            let mut x = (lo[0] / step).floor() * step;
+            while x <= hi[0] {
+                painter.vline(to_px([x, 0.0]).x, canvas.y_range(), Stroke::new(1.0, Color32::from_white_alpha(alpha)));
+                x += step;
+            }
+            let mut y = (lo[1] / step).floor() * step;
+            while y <= hi[1] {
+                painter.hline(canvas.x_range(), to_px([0.0, y]).y, Stroke::new(1.0, Color32::from_white_alpha(alpha)));
+                y += step;
+            }
+        }
+        painter.hline(canvas.x_range(), to_px([0.0, 0.0]).y, Stroke::new(1.0, Color32::from_white_alpha(60)));
+        painter.vline(to_px([0.0, 0.0]).x, canvas.y_range(), Stroke::new(1.0, Color32::from_white_alpha(40)));
+        painter.text(egui::pos2(canvas.min.x + 4.0, to_px([0.0, 0.0]).y - 2.0), egui::Align2::LEFT_BOTTOM, "sol", egui::FontId::proportional(10.0), TEXT_WEAK);
+        let mut m = (lo[0]).ceil();
+        while m <= hi[0] && scale >= 25.0 {
+            painter.text(egui::pos2(to_px([m, 0.0]).x + 2.0, canvas.max.y - 2.0), egui::Align2::LEFT_BOTTOM, format!("{m:.0} m"), egui::FontId::proportional(10.0), TEXT_WEAK);
+            m += 1.0;
+        }
+
+        // La forme, ses points et l'aperçu de ses LEDs.
+        let sk = &self.led.sketch;
+        let mut pts_px: Vec<egui::Pos2> = sk.points.iter().map(|&p| to_px(p)).collect();
+        if sk.closed && pts_px.len() > 2 {
+            pts_px.push(pts_px[0]);
+        }
+        painter.add(egui::Shape::line(pts_px.clone(), Stroke::new(2.0, ACCENT)));
+        if sk.points.len() >= 2 {
+            let preview = Fixture {
+                kind: FixtureKind::Path,
+                points: sk.points.iter().map(|p| [p[0], p[1], 0.0]).collect(),
+                closed: sk.closed,
+                count,
+                pos: [0.0; 3],
+                ..Fixture::default()
+            };
+            let r = (0.012 * scale).clamp(1.2, 4.0);
+            for (k, p) in preview.positions().into_iter().enumerate() {
+                let q = to_px([p[0], p[1]]);
+                painter.circle_filled(q, r, if k == 0 { Color32::WHITE } else { Color32::from_rgb(255, 170, 60) });
+            }
+        }
+        let hover = resp.hover_pos();
+        let mut on_point = None;
+        for (k, &p) in sk.points.iter().enumerate() {
+            let q = to_px(p);
+            let rr = Rect::from_center_size(q, Vec2::splat(9.0));
+            painter.rect_filled(rr, 2.0, TEXT);
+            painter.rect_stroke(rr, 2.0, Stroke::new(1.0, BG), egui::StrokeKind::Inside);
+            if hover.is_some_and(|h| h.distance(q) < 8.0) {
+                on_point = Some(k);
+            }
+        }
+        let on_line = hover.is_some_and(|h| pts_px.windows(2).any(|w| seg_dist(h, w[0], w[1]) < 7.0));
+        // Magnétisme : tous les 5 cm (Alt : libre).
+        let alt = ui.input(|i| i.modifiers.alt);
+        let snap = |p: [f32; 2]| if alt { p } else { p.map(|v| (v / 0.05).round() * 0.05) };
+
+        let ctx = ui.ctx().clone();
+        if self.led.sketch.drawing {
+            let (enter, escape, back, shift) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::Enter),
+                    i.consume_key(Modifiers::NONE, Key::Escape),
+                    i.consume_key(Modifiers::NONE, Key::Backspace),
+                    i.modifiers.shift,
+                )
+            });
+            let sk = &mut self.led.sketch;
+            if back {
+                sk.points.pop();
+            }
+            let first = sk.points.first().map(|&p| to_px(p));
+            let mut close = false;
+            let target = hover.map(|h| {
+                if sk.points.len() > 2 && first.is_some_and(|f| f.distance(h) < 10.0) {
+                    close = true;
+                    return sk.points[0];
+                }
+                let mut p = snap(to_m(h));
+                // Maj : horizontale, verticale ou 45° depuis le point précédent.
+                if let (true, Some(&last)) = (shift, sk.points.last()) {
+                    let (dx, dy) = (p[0] - last[0], p[1] - last[1]);
+                    let a = (dy.atan2(dx) / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
+                    let l = (dx * dx + dy * dy).sqrt();
+                    p = [last[0] + a.cos() * l, last[1] + a.sin() * l];
+                }
+                p
+            });
+            if let (Some(&last), Some(t)) = (sk.points.last(), target) {
+                painter.line_segment([to_px(last), to_px(t)], Stroke::new(1.5, ACCENT.gamma_multiply(0.6)));
+                let l = ((t[0] - last[0]).powi(2) + (t[1] - last[1]).powi(2)).sqrt();
+                painter.text(to_px(t) + Vec2::new(10.0, -10.0), egui::Align2::LEFT_BOTTOM, format!("{l:.2} m"), egui::FontId::proportional(11.5), ACCENT);
+            }
+            if let Some(t) = target {
+                painter.circle_stroke(to_px(t), if close { 8.0 } else { 5.0 }, Stroke::new(1.5, if close { WARN } else { TEXT }));
+            }
+            if resp.clicked() && !resp.double_clicked() {
+                if close {
+                    sk.closed = true;
+                    sk.drawing = false;
+                } else if let Some(t) = target {
+                    sk.points.push(t);
+                }
+            }
+            if enter || resp.double_clicked() || escape {
+                sk.drawing = false;
+                // Double-clic : son second clic a posé un point en double.
+                if sk.points.len() >= 2 {
+                    let n = sk.points.len();
+                    let (a, b) = (sk.points[n - 1], sk.points[n - 2]);
+                    if (a[0] - b[0]).abs() + (a[1] - b[1]).abs() < 1e-4 {
+                        sk.points.pop();
+                    }
+                }
+            }
+            if resp.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        } else {
+            // Modifier : glisser un point ou toute la forme, double-clic pour ajouter un point,
+            // clic droit sur un point pour le retirer.
+            if resp.drag_started_by(egui::PointerButton::Primary) {
+                self.led.sketch_grab = match (on_point, on_line) {
+                    (Some(k), _) => Some(SketchGrab::Point(k)),
+                    (None, true) => Some(SketchGrab::All),
+                    _ => None,
+                };
+            }
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                let d = resp.drag_delta();
+                let sk = &mut self.led.sketch;
+                match self.led.sketch_grab {
+                    Some(SketchGrab::Point(k)) => {
+                        if let (Some(p), Some(h)) = (sk.points.get_mut(k), resp.interact_pointer_pos()) {
+                            *p = snap(to_m(h));
+                        }
+                    }
+                    Some(SketchGrab::All) => {
+                        for p in &mut sk.points {
+                            *p = [p[0] + d.x / scale, p[1] - d.y / scale];
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if resp.drag_stopped() {
+                self.led.sketch_grab = None;
+            }
+            let sk = &mut self.led.sketch;
+            if resp.double_clicked() {
+                if let Some(h) = hover {
+                    let n = sk.points.len();
+                    let segs = if sk.closed && n > 2 { n } else { n.saturating_sub(1) };
+                    let best = (0..segs).min_by(|&a, &b| {
+                        let da = seg_dist(h, to_px(sk.points[a]), to_px(sk.points[(a + 1) % n]));
+                        let db = seg_dist(h, to_px(sk.points[b]), to_px(sk.points[(b + 1) % n]));
+                        da.total_cmp(&db)
+                    });
+                    if let Some(k) = best.filter(|&k| seg_dist(h, to_px(sk.points[k]), to_px(sk.points[(k + 1) % n])) < 10.0) {
+                        sk.points.insert(k + 1, snap(to_m(h)));
+                    }
+                }
+            }
+            if resp.secondary_clicked() {
+                if let Some(k) = on_point.filter(|_| sk.points.len() > 2) {
+                    sk.points.remove(k);
+                }
+            }
+            if on_point.is_some() || on_line {
+                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+            }
+        }
+        let hint = if self.led.sketch.drawing {
+            "Clic : poser un point (tous les 5 cm, Alt : libre)  ·  Maj : horizontale, verticale ou 45°  ·  clic sur le premier point : boucle fermée  ·  Entrée ou double-clic : terminer  ·  Retour arrière : retirer"
+        } else {
+            "Glisser un point ou la forme  ·  double-clic sur la forme : ajouter un point  ·  clic droit sur un point : le retirer  ·  clic droit glissé : déplacer la vue  ·  molette : zoom"
+        };
+        ui.painter().text(egui::pos2(canvas.min.x, rect.max.y), egui::Align2::LEFT_BOTTOM, hint, egui::FontId::proportional(11.0), TEXT_WEAK);
+
+        // Tracé de la scène modifié en direct.
+        if let Some(id) = self.led.sketch.editing {
+            let sk = &self.led.sketch;
+            if let Some(f) = self.project.leds.fixtures.iter_mut().find(|f| f.id == id) {
+                let pts: Vec<[f32; 3]> = sk.points.iter().map(|p| [p[0], p[1], 0.0]).collect();
+                if f.points != pts || f.closed != sk.closed || f.count != count {
+                    f.points = pts;
+                    f.closed = sk.closed;
+                    f.count = count;
+                }
+            }
+        }
+        if done {
+            self.led.view = Some(LedView::Both);
+        }
+        if add {
+            self.add_sketch(count);
+        }
+    }
+
+    /// Ajoute la forme dessinée à la scène : debout, au milieu de la salle, face à l'avant.
+    fn add_sketch(&mut self, count: u32) {
+        let sk = &self.led.sketch;
+        let (mut minx, mut maxx, mut miny) = (f32::MAX, f32::MIN, f32::MAX);
+        for p in &sk.points {
+            minx = minx.min(p[0]);
+            maxx = maxx.max(p[0]);
+            miny = miny.min(p[1]);
+        }
+        // Origine de l'élément : milieu du bas de la forme.
+        let (cx, by) = ((minx + maxx) / 2.0, miny);
+        let local: Vec<[f32; 2]> = sk.points.iter().map(|p| [p[0] - cx, p[1] - by]).collect();
+        let setup = &mut self.project.leds;
+        let id = setup.next_fixture_id();
+        let n = setup.fixtures.iter().filter(|f| f.kind == FixtureKind::Path).count() + 1;
+        let mut f = Fixture::new(FixtureKind::Path, id, format!("Tracé {n}"));
+        f.points = local.iter().map(|p| [p[0], p[1], 0.0]).collect();
+        f.closed = sk.closed;
+        f.count = count;
+        f.pos = self.led.cursor3d.unwrap_or([0.0, by.max(0.0), setup.room[1] * 0.5]);
+        f.rot = [0.0; 3];
+        if let Some(prev) = self.led.selected.and_then(|s| setup.fixtures.get(s)).or(setup.fixtures.last()) {
+            f.controller = prev.controller;
+            f.output = prev.output;
+        } else if let Some(c) = setup.controllers.first() {
+            f.controller = c.id;
+        }
+        setup.fixtures.push(f);
+        let index = setup.fixtures.len() - 1;
+        // La planche reste liée au nouveau bandeau : la modifier le modifie dans la scène.
+        self.led.sketch.points = local;
+        self.led.sketch.editing = Some(id);
+        self.led.sketch.drawing = false;
+        self.frame_sketch();
+        self.select(Target::Fixture(index));
+        // Place au bandeau dans la scène.
+        self.led.view = Some(LedView::Both);
+    }
+
+    /// Cadre toute la scène (en gardant l'angle de vue, ou celui donné), en douceur.
+    fn frame_all(&mut self, angle: Option<(f32, f32)>) {
+        self.led.drone = false;
+        let room = self.project.leds.room;
+        let l = &self.project.leds;
+        let mut pts: Vec<[f32; 3]> = self.led.leds.iter().map(|x| x.pos).collect();
+        for s in &l.surfaces {
+            pts.push(s.pos);
+            pts.push(leds::place(s.pos, s.rot, [0.0, s.size[1], 0.0]));
+        }
+        pts.extend(l.dmx.iter().map(|d| d.pos));
+        pts.extend(l.lasers.iter().map(|x| x.pos));
+        let (target, radius) = if pts.is_empty() {
+            ([0.0, 1.0, room[1] * 0.5], room[0].max(room[1]) * 0.6)
+        } else {
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let c = [0, 1, 2].map(|k| (lo[k] + hi[k]) / 2.0);
+            let r = (0..3).map(|k| (hi[k] - lo[k]) / 2.0).map(|v| v * v).sum::<f32>().sqrt();
+            (c, r.max(0.8))
+        };
+        let cam = self.led.camera.unwrap_or_else(|| Orbit::home(room));
+        let (yaw, pitch) = angle.unwrap_or((cam.yaw, cam.pitch));
+        // Champ de 50° : la sphère englobante tient dans la vue.
+        let dist = radius / (25f32.to_radians()).sin() * 1.05;
+        self.led.cam_goal = Some(Orbit { yaw, pitch, dist, target });
+    }
+
+    /// Valeurs en direct d'un appareil DMX : rafale en cours, temps écoulés, enveloppe du temps.
+    pub(super) fn dmx_live_state(&self, d: &crate::dmx::Fixture) -> crate::dmx::Live {
+        let now = self.clock();
+        let beat = self.rhythm.tempo.beat_at(now);
+        crate::dmx::Live {
+            burst: self.led.bursts.get(&d.id).is_some_and(|&until| until > now),
+            beats: beat.max(0.0).floor() as u64,
+            env: (-(beat.fract() as f32) * 4.0).exp(),
+        }
+    }
+
+    /// Ce que font les appareils DMX dans le simulateur : faisceaux, fumée, bulles.
+    fn dmx_effects(&self, view: &View, items: &mut Vec<(f32, Item)>, beat: f32) {
+        let targets = self.laser_targets(beat);
+        use crate::dmx::{Kind, Role};
+        let t = self.clock() as f32;
+        for d in &self.project.leds.dmx {
+            let live = self.dmx_live_state(d);
+            let get = |r: Role| d.live_role(r, live).map_or(0.0, |v| f32::from(v) / 255.0);
+            let on = d.on || live.burst;
+            let (_, size) = d.kind.body();
+            let world = |p: [f32; 3]| leds::place(d.pos, d.rot, p);
+            let front = [0.0, size[1] * 0.5, -size[2] * 0.5];
+            // Stroboscope : allumé une demi-période sur deux.
+            let strobe = get(Role::Strobe);
+            if strobe > 0.03 && (t * (1.0 + strobe * 14.0)).fract() > 0.5 {
+                continue;
+            }
+            let beam = |items: &mut Vec<(f32, Item)>, from: [f32; 3], dir: [f32; 3], len: f32, c: [u8; 3], w: f32| {
+                let to = [from[0] + dir[0] * len, from[1] + dir[1] * len, from[2] + dir[2] * len];
+                let (a, mut b) = (world(from), world(to));
+                // Le faisceau s'arrête sur le premier objet touché (et y laisse un point lumineux).
+                let wd = sub(b, a);
+                let len_w = dot(wd, wd).sqrt().max(1e-4);
+                let dn = wd.map(|v| v / len_w);
+                if let Some(h) = first_hit(a, dn, &targets).filter(|&h| h < len_w) {
+                    b = [a[0] + dn[0] * h, a[1] + dn[1] * h, a[2] + dn[2] * h];
+                    if let Some((p, z)) = view.project(b) {
+                        items.push((z - 0.01, Item::Puff { p, r: 2.5, c: glow(c, 0.9), ring: false }));
+                    }
+                }
+                if let Some((pa, pb)) = view.segment(a, b) {
+                    items.push(((pa.1 + pb.1) * 0.5, Item::Beam { a: pa.0, b: pb.0, c, w }));
+                }
+            };
+            let color = |v: f32, j: usize, n: usize| -> [u8; 3] {
+                // Couleur 0 : multicolore ; sinon une teinte.
+                let h = if v < 0.03 { j as f32 / n.max(1) as f32 } else { v };
+                leds::hue(h).map(|x| x as u8)
+            };
+            match d.kind {
+                Kind::Laser if on && get(Role::Mode) > 0.0 => {
+                    let n = 3 + (get(Role::Pattern) * 8.0) as usize;
+                    let spread = (5.0 + get(Role::Size) * 55.0).to_radians();
+                    let spin = (get(Role::Rotation) - 0.0) * 4.0 * t;
+                    let (yaw, pitch) = ((get(Role::PosX) - 0.5) * 0.7, (get(Role::PosY) - 0.5) * 0.5);
+                    for j in 0..n {
+                        let a = -spread / 2.0 + spread * j as f32 / (n - 1) as f32;
+                        let (ox, oy) = (a.sin() * spin.cos(), a.sin() * spin.sin());
+                        let dir = norm([ox + yaw, oy + pitch, -1.0]);
+                        beam(items, front, dir, 9.0, color(get(Role::Color), j, n), 1.2);
+                    }
+                }
+                Kind::Derby if on && get(Role::Mode) > 0.0 => {
+                    let phase = t * (0.3 + get(Role::Rotation) * 3.0);
+                    const RGBW: [[u8; 3]; 4] = [[255, 40, 40], [40, 255, 60], [60, 90, 255], [255, 255, 255]];
+                    for j in 0..8 {
+                        let az = phase + j as f32 * std::f32::consts::TAU / 8.0;
+                        let dir = norm([az.sin() * 0.8, -0.7, az.cos() * 0.8]);
+                        let c = if get(Role::Color) < 0.03 { RGBW[j % 4] } else { color(get(Role::Color), j, 8) };
+                        beam(items, [0.0, 0.0, 0.0], dir, 4.0, c, 2.0);
+                    }
+                }
+                Kind::Par | Kind::Generic if on => {
+                    let dim = if d.kind == Kind::Par { get(Role::Dimmer) } else { 1.0 };
+                    let c = [get(Role::Red), get(Role::Green), get(Role::Blue)].map(|v| (v * dim * 255.0) as u8);
+                    if c.iter().any(|&v| v > 4) {
+                        for j in 0..5 {
+                            let a = (j as f32 - 2.0) * 0.06;
+                            beam(items, front, norm([a, -0.25, -1.0]), 3.5, c, 4.0);
+                        }
+                    }
+                }
+                Kind::Smoke | Kind::Bubble => {
+                    let out = get(Role::Output);
+                    if out < 0.02 {
+                        continue;
+                    }
+                    let bubbles = d.kind == Kind::Bubble;
+                    let n = if bubbles { 28 } else { 16 };
+                    for k in 0..n {
+                        let r1 = crate::leds::hash01(d.id, k as u32, 1);
+                        let r2 = crate::leds::hash01(d.id, k as u32, 2);
+                        let age = (t * if bubbles { 0.22 } else { 0.35 } + k as f32 / n as f32 + r1 * 0.3).fract();
+                        let local = if bubbles {
+                            [(r2 - 0.5) * age * 2.0, front[1] + age * 1.4 - age * age * 0.5, front[2] - age * (1.0 + r1) * 1.2]
+                        } else {
+                            [(r2 - 0.5) * age, front[1] + age * 0.5, front[2] - age * 2.5]
+                        };
+                        let Some((p, z)) = view.project(world(local)) else { continue };
+                        if bubbles {
+                            let r = (0.035 * view.focal / z).clamp(1.5, 10.0);
+                            let a = ((1.0 - age) * 220.0 * out) as u8;
+                            items.push((z, Item::Puff { p, r, c: Color32::from_white_alpha(a), ring: true }));
+                        } else {
+                            let r = ((0.15 + age * 0.9) * view.focal / z).clamp(2.0, 400.0);
+                            let a = ((1.0 - age).powf(1.5) * 60.0 * out) as u8;
+                            items.push((z, Item::Puff { p, r, c: Color32::from_rgba_unmultiplied(200, 200, 210, a), ring: false }));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Onglet latéral DMX : appareils, puis sortie.
+    pub(super) fn dmx_ui(&mut self, ui: &mut egui::Ui) {
+        let sec = self.section();
+        sec.show(ui, 0, |ui| self.dmx_scene_ui(ui));
+        sec.show(ui, 1, |ui| self.dmx_output_ui(ui));
+    }
+
+    /// Faces du décor et le sol, pour arrêter les faisceaux laser sur ce qu'ils touchent.
+    fn laser_targets(&self, beat: f32) -> Vec<[[f32; 3]; 4]> {
+        let room = self.project.leds.room;
+        let mut faces: Vec<[[f32; 3]; 4]> = self
+            .project
+            .leds
+            .surfaces
+            .iter()
+            .filter(|s| s.kind != leds::SurfaceKind::Projector)
+            .flat_map(|s| s.faces(beat).into_iter().map(|f| f.quad))
+            .collect();
+        let (hw, d) = (room[0] * 0.5 + 20.0, room[1] + 20.0);
+        faces.push([[-hw, 0.0, -20.0], [hw, 0.0, -20.0], [hw, 0.0, d], [-hw, 0.0, d]]);
+        faces
+    }
+
+    /// Faisceaux des lasers ILDA : un rayon vers chaque point de la forme, arrêté sur le premier
+    /// objet touché ; la forme se dessine sur ce qu'elle touche.
+    fn ilda_beams(&self, view: &View, items: &mut Vec<(f32, Item)>, targets: &[[[f32; 3]; 4]]) {
+        let t = self.clock() as f32;
+        for l in &self.project.leds.lasers {
+            let frame = crate::laser::frame(l, t, self.rhythm.pulse.env, 360, &self.laser_input(&l.cue));
+            let spread = (l.fov.clamp(5.0, 120.0) * 0.5).to_radians().tan();
+            let from = leds::place(l.pos, l.rot, [0.0, 0.07, -0.17]);
+            let mut prev: Option<([f32; 3], [u8; 3])> = None;
+            for (k, p) in frame.iter().step_by(2).enumerate() {
+                if !p.lit() {
+                    prev = None;
+                    continue;
+                }
+                let local = norm([p.x * spread, p.y * spread, -1.0]);
+                let dir = sub(leds::place(l.pos, l.rot, [local[0], 0.07 + local[1], -0.17 + local[2]]), from);
+                let dist = first_hit(from, dir, targets).unwrap_or(9.0).min(30.0);
+                let hit = [from[0] + dir[0] * dist, from[1] + dir[1] * dist, from[2] + dir[2] * dist];
+                let c = [p.r, p.g, p.b].map(|v| (v * 255.0) as u8);
+                // Un rayon sur trois, pour voir les faisceaux sans tout noyer.
+                if k % 4 == 0 {
+                    if let Some((a, b)) = view.segment(from, hit) {
+                        items.push(((a.1 + b.1) * 0.5, Item::Beam { a: a.0, b: b.0, c: c.map(|v| v / 2), w: 0.8 }));
+                    }
+                }
+                // Le dessin sur la surface touchée.
+                if let Some((q, _)) = prev {
+                    if let Some((pa, pb)) = view.segment(q, hit) {
+                        if pa.0.distance(pb.0) < 80.0 {
+                            // Nettement devant la surface touchée : jamais recouvert par elle.
+                            items.push(((pa.1 + pb.1) * 0.5 - 0.15, Item::Beam { a: pa.0, b: pb.0, c, w: 2.0 }));
+                        }
+                    }
+                }
+                prev = Some((hit, c));
+            }
+        }
+    }
+
+    /// Appareils DMX de la scène : ajout, liste, réglages.
+    fn dmx_scene_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::dmx::{self, Kind};
+        theme::section(ui, ic::LIGHTNING, "Appareils DMX");
+        ui.label(
+            egui::RichText::new("Lasers, derbys, machines à bulles et à fumée, projecteurs : posés dans la scène, pilotés en DMX (envoi : DMX › Sortie).")
+                .small()
+                .color(TEXT_WEAK),
+        );
+        let setup = &mut self.project.leds;
+        ui.horizontal_wrapped(|ui| {
+            for kind in Kind::ALL {
+                if ui.button(with_icon(ic::PLUS, kind.name())).clicked() {
+                    let channels = dmx::profile(kind);
+                    let id = setup.next_dmx_id();
+                    let n = setup.dmx.iter().filter(|d| d.kind == kind).count() + 1;
+                    let depth = setup.room[1];
+                    // Lasers et derbys en hauteur au fond, face à la salle ; fumée et bulles au sol.
+                    let pos = match kind {
+                        Kind::Laser | Kind::Derby | Kind::Par => [0.0, 2.2, (depth - 1.0).max(0.5)],
+                        _ => [0.0, 0.0, (depth - 1.5).max(0.5)],
+                    };
+                    let pos = self.led.cursor3d.unwrap_or(pos);
+                    let address = setup.next_dmx_address(channels.len());
+                    setup.dmx.push(dmx::Fixture {
+                        id,
+                        name: format!("{} {n}", kind.name()),
+                        kind,
+                        address,
+                        channels,
+                        pos,
+                        ..dmx::Fixture::default()
+                    });
+                    self.led.selected_dmx = Some(setup.dmx.len() - 1);
+                    self.led.selected = None;
+                    self.led.selected_surface = None;
+                }
+            }
+        });
+        let mut action: Option<(usize, u8)> = None;
+        for (i, d) in setup.dmx.iter_mut().enumerate() {
+            let sel = self.led.selected_dmx == Some(i);
+            ui.horizontal(|ui| {
+                let text = egui::RichText::new(format!("{}  ·  U{} @{}", d.name, d.universe, d.address));
+                if ui.selectable_label(sel, if sel { text.strong() } else { text }).clicked() {
+                    action = Some((i, 9));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(theme::icon_button(ic::TRASH).small().frame(false)).on_hover_text("Supprimer").clicked() {
+                        action = Some((i, 0));
+                    }
+                    if ui.add(theme::icon_button(ic::COPY).small().frame(false)).on_hover_text("Dupliquer").clicked() {
+                        action = Some((i, 1));
+                    }
+                    let icon = if d.on { ic::SUN } else { ic::MOON };
+                    if ui.add(theme::icon_button(icon).small().frame(false)).on_hover_text(if d.on { "Éteindre" } else { "Allumer" }).clicked() {
+                        d.on = !d.on;
+                    }
+                });
+            });
+        }
+        match action {
+            Some((i, 0)) => {
+                setup.dmx.remove(i);
+                self.led.selected_dmx = None;
+            }
+            Some((i, 1)) => {
+                let mut d = setup.dmx[i].clone();
+                d.id = setup.next_dmx_id();
+                d.name = format!("{} (copie)", d.name);
+                d.pos[0] += 0.6;
+                d.address = setup.next_dmx_address(d.channels.len());
+                setup.dmx.insert(i + 1, d);
+                self.led.selected_dmx = Some(i + 1);
+            }
+            Some((i, _)) => {
+                self.select(Target::Dmx(i));
+            }
+            None => {}
+        }
+        let setup = &mut self.project.leds;
+        let Some(di) = self.led.selected_dmx.filter(|&i| i < setup.dmx.len()) else { return };
+        let now = self.start.elapsed().as_secs_f64();
+        let d = &mut setup.dmx[di];
+        let mut hold: Option<bool> = None;
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label("Nom");
+                ui.text_edit_singleline(&mut d.name);
+            });
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut d.on, "Allumé");
+                let label = match d.kind {
+                    Kind::Smoke => "Fumée !",
+                    Kind::Bubble => "Bulles !",
+                    _ => "Flash !",
+                };
+                let r = ui.add(egui::Button::new(egui::RichText::new(with_icon(ic::LIGHTNING, label)).strong()).sense(Sense::click_and_drag()))
+                    .on_hover_text("À fond tant qu'on appuie");
+                if r.is_pointer_button_down_on() {
+                    hold = Some(true);
+                } else if r.drag_stopped() || r.clicked() {
+                    hold = Some(false);
+                }
+                if matches!(d.kind, Kind::Laser | Kind::Par) {
+                    ui.checkbox(&mut d.beat, "Sur les temps").on_hover_text(if d.kind == Kind::Laser {
+                        "Le motif change à chaque temps (onglet Rythme)"
+                    } else {
+                        "L'intensité flashe sur les temps (onglet Rythme)"
+                    });
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Univers");
+                ui.add(egui::DragValue::new(&mut d.universe).range(0..=32767));
+                ui.label("Adresse");
+                ui.add(egui::DragValue::new(&mut d.address).range(1..=512));
+                ui.label(egui::RichText::new(format!("→ {}", d.last_address())).small().color(TEXT_WEAK));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Profil");
+                egui::ComboBox::from_id_salt("dmx_profile").selected_text("Remettre un profil…").show_ui(ui, |ui| {
+                    for k in Kind::ALL {
+                        if ui.selectable_label(false, k.name()).clicked() {
+                            d.kind = k;
+                            d.channels = dmx::profile(k);
+                        }
+                    }
+                });
+            });
+            ui.label(egui::RichText::new("Canaux (vérifiez l'ordre dans la notice de l'appareil)").small().color(TEXT_WEAK));
+            let mut remove = None;
+            for (k, c) in d.channels.iter_mut().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{}", d.address as usize + k)).small().color(TEXT_WEAK));
+                    ui.add(egui::TextEdit::singleline(&mut c.name).desired_width(100.0));
+                    egui::ComboBox::from_id_salt(("dmx_role", k)).selected_text(c.role.name()).width(80.0).show_ui(ui, |ui| {
+                        for r in dmx::Role::ALL {
+                            ui.selectable_value(&mut c.role, r, r.name());
+                        }
+                    });
+                    ui.add(egui::Slider::new(&mut c.value, 0..=255));
+                    if ui.small_button(ic::X).on_hover_text("Retirer ce canal").clicked() {
+                        remove = Some(k);
+                    }
+                });
+            }
+            if let Some(k) = remove {
+                d.channels.remove(k);
+            }
+            if ui.small_button(with_icon(ic::PLUS, "Canal")).clicked() {
+                let n = d.channels.len() + 1;
+                d.channels.push(dmx::Channel { name: format!("Canal {n}"), ..dmx::Channel::default() });
+            }
+            ui.horizontal(|ui| {
+                ui.label("Position");
+                for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                    ui.add(egui::DragValue::new(&mut d.pos[k]).speed(0.01).prefix(format!("{axis} ")).suffix(" m"));
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Rotation");
+                for (k, name) in ["cap", "incl.", "roulis"].iter().enumerate() {
+                    ui.add(egui::DragValue::new(&mut d.rot[k]).speed(1.0).range(-360.0..=360.0).prefix(format!("{name} ")).suffix("°"));
+                }
+            });
+        });
+        match hold {
+            Some(true) => {
+                self.led.bursts.insert(self.project.leds.dmx[di].id, f64::INFINITY);
+            }
+            Some(false) => {
+                self.led.bursts.insert(self.project.leds.dmx[di].id, now + 0.2);
+            }
+            None => {}
+        }
+    }
+
+    /// Branchements : chaque bandeau, son contrôleur et sa sortie (pin), modifiables d'un coup d'œil.
+    fn plugs_ui(&mut self, ui: &mut egui::Ui) {
+        let setup = &mut self.project.leds;
+        if setup.fixtures.is_empty() {
+            return;
+        }
+        theme::section(ui, ic::LIST, "Branchements");
+        ui.label(egui::RichText::new("Quel contrôleur et quel pin pilotent chaque bandeau. Renvoyez la configuration au contrôleur après un changement.").small().color(TEXT_WEAK));
+        let ctrls: Vec<(u32, String, Vec<Option<u8>>)> = setup.controllers.iter().map(|c| (c.id, c.name.clone(), c.pins.clone())).collect();
+        egui::Grid::new("led_plugs").striped(true).num_columns(4).spacing([8.0, 4.0]).show(ui, |ui| {
+            for f in &mut setup.fixtures {
+                ui.label(elide_name(&f.name)).on_hover_text(&f.name);
+                let cur = ctrls.iter().find(|c| c.0 == f.controller);
+                egui::ComboBox::from_id_salt(("plug_ctrl", f.id)).selected_text(cur.map_or("aucun".to_owned(), |c| c.1.clone())).width(100.0).show_ui(ui, |ui| {
+                    for (id, name, _) in &ctrls {
+                        ui.selectable_value(&mut f.controller, *id, name);
+                    }
+                    ui.selectable_value(&mut f.controller, 0, "aucun");
+                });
+                let pins = cur.map_or(Vec::new(), |c| c.2.clone());
+                let out_name = |o: usize| match pins.get(o).copied().flatten() {
+                    Some(p) => format!("S{} · pin {p}", o + 1),
+                    None => format!("S{}", o + 1),
+                };
+                egui::ComboBox::from_id_salt(("plug_out", f.id)).selected_text(out_name(f.output)).width(90.0).show_ui(ui, |ui| {
+                    for o in 0..pins.len().max(1) {
+                        ui.selectable_value(&mut f.output, o, out_name(o));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("{} LEDs", f.led_count())).small().color(TEXT_WEAK));
+                    ui.checkbox(&mut f.reverse, "").on_hover_text("Câblé à l'envers");
+                });
+                ui.end_row();
+            }
+        });
+    }
+
+    /// Sortie DMX (onglet Contrôleurs).
+    fn dmx_output_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::dmx::Protocol;
+        theme::section(ui, ic::LIGHTNING, "Sortie DMX");
+        let out = &mut self.project.leds.dmx_out;
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label("Protocole");
+                egui::ComboBox::from_id_salt("dmx_proto").selected_text(out.protocol.name()).width(180.0).show_ui(ui, |ui| {
+                    for p in Protocol::ALL {
+                        ui.selectable_value(&mut out.protocol, p, p.name());
+                    }
+                });
+            });
+            match out.protocol {
+                Protocol::ArtNet | Protocol::Sacn => {
+                    ui.horizontal(|ui| {
+                        ui.label("Boîtier");
+                        ui.add(egui::TextEdit::singleline(&mut out.host).hint_text("vide : tout le réseau").desired_width(150.0))
+                            .on_hover_text("Adresse IP du boîtier Art-Net / sACN (ou du laser s'il le reçoit directement). Vide : diffusion Art-Net, ou multicast sACN.");
+                    });
+                }
+                Protocol::EnttecPro => {
+                    ui.horizontal(|ui| {
+                        ui.label("Port");
+                        let ports = &mut self.led.serial_ports;
+                        let shown = if out.serial.is_empty() { "Choisir…".to_owned() } else { out.serial.clone() };
+                        let r = egui::ComboBox::from_id_salt("dmx_serial").selected_text(shown).width(200.0).show_ui(ui, |ui| {
+                            for p in ports.iter() {
+                                ui.selectable_value(&mut out.serial, p.clone(), p);
+                            }
+                        });
+                        if r.response.clicked() || ports.is_empty() {
+                            *ports = crate::dmx::serial_ports();
+                        }
+                    });
+                }
+            }
+            fit_slider(ui, "Images/s", egui::Slider::new(&mut out.fps, 10..=44));
+            let live = self.led.dmx_live;
+            let text = if live { with_icon(ic::WIFI_HIGH, "ENVOI DMX : ACTIF") } else { with_icon(ic::CUBE, "DMX : simulation seulement") };
+            let mut b = egui::Button::new(egui::RichText::new(text).strong().color(if live { BG } else { TEXT_WEAK }))
+                .min_size(Vec2::new(ui.available_width(), 30.0));
+            if live {
+                b = b.fill(ACCENT);
+            }
+            if ui.add(b).clicked() {
+                self.led.dmx_live = !live;
+            }
+            if live {
+                let (msg, color) = match self.led.dmx_sender.status.lock().unwrap().clone() {
+                    Some(Ok(t)) if t.elapsed().as_secs_f32() < 1.0 => ("envoi en cours".to_owned(), ACCENT),
+                    Some(Err(e)) => (e, theme::DANGER),
+                    _ => ("en attente…".to_owned(), TEXT_WEAK),
+                };
+                ui.label(egui::RichText::new(msg).small().color(color));
+            }
+            ui.label(
+                egui::RichText::new("Laserworld : par l'entrée DMX du laser (leur réseau ShowNET est réservé à leur logiciel). Il faut un boîtier Art-Net / sACN ou une interface Enttec DMX USB Pro.")
+                    .small()
+                    .color(TEXT_WEAK),
+            );
+        });
     }
 
     /// Mode dessin du tracé libre (clics : points ; Entrée ou double-clic : terminer).
@@ -1145,43 +2591,56 @@ impl OzApp {
     /// Lance le dessin d'un tracé libre dans la vue 3D.
     fn start_drawing(&mut self, fixture: Option<usize>) {
         self.led.drawing = Some(Drawing { points: Vec::new(), fixture });
-        if self.led.view == LedView::Output {
-            self.led.view = LedView::Both;
+        if self.shown_view() == LedView::Output {
+            self.led.view = Some(LedView::Both);
         }
     }
 
-    /// Met à jour la texture de l'image de sortie affichée sur les écrans de la scène.
+    /// Met à jour l'image de chaque sortie affichée sur les écrans de la scène.
     fn update_screen_texture(&mut self, ctx: &egui::Context) {
-        if !self.project.leds.surfaces.iter().any(|s| s.show_output) {
-            return;
-        }
-        let frame = self.led.frame.lock().unwrap();
-        if frame.serial == self.led.tex_serial || frame.size.0 == 0 {
-            return;
-        }
-        self.led.tex_serial = frame.serial;
-        let (w, h) = (frame.size.0 as usize, frame.size.1 as usize);
-        if frame.pixels.len() < w * h * 4 {
-            return;
-        }
-        // Lignes lues sur le GPU du bas vers le haut : on les remet dans l'ordre.
-        let mut rgba = Vec::with_capacity(w * h * 4);
-        for row in (0..h).rev() {
-            rgba.extend_from_slice(&frame.pixels[row * w * 4..(row + 1) * w * 4]);
-        }
-        let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
-        match &mut self.led.screen_tex {
-            Some(t) => t.set(image, egui::TextureOptions::LINEAR),
-            None => self.led.screen_tex = Some(ctx.load_texture("led_scene_output", image, egui::TextureOptions::LINEAR)),
+        let n = self.project.outputs.len().max(1);
+        let mut outs: Vec<usize> = self.project.leds.surfaces.iter().filter(|s| s.show_output).map(|s| s.output.min(n - 1)).collect();
+        outs.sort_unstable();
+        outs.dedup();
+        for k in outs {
+            let src = self.frame_of(k);
+            let frame = src.lock().unwrap();
+            let shown = self.led.screen_tex.get(&k).map(|t| t.1);
+            if shown == Some(frame.serial) || frame.size.0 == 0 {
+                continue;
+            }
+            let (w, h) = (frame.size.0 as usize, frame.size.1 as usize);
+            if frame.pixels.len() < w * h * 4 {
+                continue;
+            }
+            // Lignes lues sur le GPU du bas vers le haut : on les remet dans l'ordre.
+            let mut rgba = Vec::with_capacity(w * h * 4);
+            for row in (0..h).rev() {
+                rgba.extend_from_slice(&frame.pixels[row * w * 4..(row + 1) * w * 4]);
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+            let serial = frame.serial;
+            match self.led.screen_tex.get_mut(&k) {
+                Some(t) => {
+                    t.0.set(image, egui::TextureOptions::LINEAR);
+                    t.1 = serial;
+                }
+                None => {
+                    let tex = ctx.load_texture(format!("led_scene_output_{k}"), image, egui::TextureOptions::LINEAR);
+                    self.led.screen_tex.insert(k, (tex, serial));
+                }
+            }
         }
     }
 
     fn select(&mut self, t: Target) {
+        self.led.multi_surf.clear();
+        self.led.multi_dmx.clear();
         let set = self.target_set(t);
         self.led.selected_set = (set != 0).then_some(set);
         self.led.multi = match t {
             Target::Fixture(i) => self.project.leds.fixtures.get(i).map(|f| vec![f.id]).unwrap_or_default(),
-            Target::Surface(_) => Vec::new(),
+            Target::Surface(_) | Target::Dmx(_) | Target::Laser(_) => Vec::new(),
         };
         if let Target::Fixture(i) = t {
             self.led.anchor = Some(i);
@@ -1197,6 +2656,23 @@ impl OzApp {
                 self.led.selected = None;
                 self.sub_tab[RightTab::Leds as usize] = 0;
             }
+            Target::Dmx(i) => {
+                self.led.selected_dmx = Some(i);
+                self.led.selected = None;
+                self.led.selected_surface = None;
+                self.right_tab = RightTab::Dmx;
+                self.sub_tab[RightTab::Dmx as usize] = 0;
+            }
+            Target::Laser(i) => {
+                self.laser.selected = Some(i);
+                self.led.selected = None;
+                self.led.selected_surface = None;
+                self.right_tab = RightTab::Laser;
+                self.sub_tab[RightTab::Laser as usize] = 0;
+            }
+        }
+        if !matches!(t, Target::Dmx(_)) {
+            self.led.selected_dmx = None;
         }
     }
 
@@ -1204,6 +2680,8 @@ impl OzApp {
         match t {
             Target::Fixture(i) => self.project.leds.fixtures.get(i).map(|f| f.pos),
             Target::Surface(i) => self.project.leds.surfaces.get(i).map(|s| s.pos),
+            Target::Dmx(i) => self.project.leds.dmx.get(i).map(|d| d.pos),
+            Target::Laser(i) => self.project.leds.lasers.get(i).map(|l| l.pos),
         }
     }
 
@@ -1226,11 +2704,179 @@ impl OzApp {
         self.led.anchor = Some(i);
     }
 
+    /// Nombre d'objets choisis ensemble (bandeaux, décor, appareils DMX).
+    fn multi_count(&self) -> usize {
+        self.led.multi.len() + self.led.multi_surf.len() + self.led.multi_dmx.len()
+    }
+
+    /// L'objet fait partie de la sélection multiple.
+    fn in_multi(&self, t: Target) -> bool {
+        let l = &self.project.leds;
+        match t {
+            Target::Fixture(i) => l.fixtures.get(i).is_some_and(|f| self.led.multi.contains(&f.id)),
+            Target::Surface(i) => l.surfaces.get(i).is_some_and(|s| self.led.multi_surf.contains(&s.id)),
+            Target::Dmx(i) => l.dmx.get(i).is_some_and(|d| self.led.multi_dmx.contains(&d.id)),
+            Target::Laser(_) => false,
+        }
+    }
+
+    /// Applique `op` à tous les objets choisis, réunis le temps de l'opération dans un groupe
+    /// provisoire (les opérations de groupe : déplacer, tourner, redimensionner).
+    fn with_multi(&mut self, op: impl FnOnce(&mut LedSetup, u32)) {
+        const TEMP: u32 = u32::MAX;
+        let (mf, ms, md) = (self.led.multi.clone(), self.led.multi_surf.clone(), self.led.multi_dmx.clone());
+        let l = &mut self.project.leds;
+        let saved_f: Vec<(usize, u32)> = l.fixtures.iter().enumerate().filter(|(_, f)| mf.contains(&f.id)).map(|(i, f)| (i, f.set)).collect();
+        let saved_s: Vec<(usize, u32)> = l.surfaces.iter().enumerate().filter(|(_, s)| ms.contains(&s.id)).map(|(i, s)| (i, s.set)).collect();
+        let saved_d: Vec<(usize, u32)> = l.dmx.iter().enumerate().filter(|(_, d)| md.contains(&d.id)).map(|(i, d)| (i, d.set)).collect();
+        for &(i, _) in &saved_f {
+            l.fixtures[i].set = TEMP;
+        }
+        for &(i, _) in &saved_s {
+            l.surfaces[i].set = TEMP;
+        }
+        for &(i, _) in &saved_d {
+            l.dmx[i].set = TEMP;
+        }
+        op(l, TEMP);
+        for (i, v) in saved_f {
+            l.fixtures[i].set = v;
+        }
+        for (i, v) in saved_s {
+            l.surfaces[i].set = v;
+        }
+        for (i, v) in saved_d {
+            l.dmx[i].set = v;
+        }
+    }
+
+    fn clear_multi(&mut self) {
+        self.led.multi.clear();
+        self.led.multi_surf.clear();
+        self.led.multi_dmx.clear();
+    }
+
+    /// Supprime tous les objets choisis.
+    fn delete_multi(&mut self) {
+        let (mf, ms, md) = (std::mem::take(&mut self.led.multi), std::mem::take(&mut self.led.multi_surf), std::mem::take(&mut self.led.multi_dmx));
+        let l = &mut self.project.leds;
+        l.fixtures.retain(|f| !mf.contains(&f.id));
+        l.surfaces.retain(|s| !ms.contains(&s.id));
+        l.dmx.retain(|d| !md.contains(&d.id));
+        if l.image_on.is_some_and(|i| ms.contains(&i)) {
+            l.image_on = None;
+        }
+        l.prune_sets();
+        self.led.selected = None;
+        self.led.selected_surface = None;
+        self.led.selected_dmx = None;
+    }
+
+    /// Rectangle de sélection : tout ce dont le centre (ou une LED) tombe dedans.
+    fn select_in_rect(&mut self, r: Rect, view: &View, add: bool) {
+        if !add {
+            self.clear_multi();
+        }
+        let l = &self.project.leds;
+        let inside = |p: [f32; 3]| view.project(p).is_some_and(|(q, _)| r.contains(q));
+        for (fi, f) in l.fixtures.iter().enumerate() {
+            if self.led.leds.iter().any(|x| x.fixture == fi && inside(x.pos)) && !self.led.multi.contains(&f.id) {
+                self.led.multi.push(f.id);
+            }
+        }
+        for s in &l.surfaces {
+            if inside(leds::place(s.pos, s.rot, [0.0, s.size[1] * 0.5, 0.0])) && !self.led.multi_surf.contains(&s.id) {
+                self.led.multi_surf.push(s.id);
+            }
+        }
+        for d in &l.dmx {
+            if inside(leds::place(d.pos, d.rot, [0.0, 0.1, 0.0])) && !self.led.multi_dmx.contains(&d.id) {
+                self.led.multi_dmx.push(d.id);
+            }
+        }
+        self.led.selected = None;
+        self.led.selected_surface = None;
+        self.led.selected_dmx = None;
+        self.led.selected_set = None;
+    }
+
+    /// Barre d'actions sur plusieurs objets choisis (rectangle de sélection).
+    fn multi_scene_bar(&mut self, ui: &mut egui::Ui) {
+        let n = self.multi_count();
+        if n < 2 {
+            return;
+        }
+        let mut action = 0;
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(
+                egui::RichText::new(format!(
+                    "{n} objets choisis  ·  {} bandeau(x), {} décor, {} DMX",
+                    self.led.multi.len(),
+                    self.led.multi_surf.len(),
+                    self.led.multi_dmx.len()
+                ))
+                .strong()
+                .color(ACCENT),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui.small_button(with_icon(ic::STACK, "Grouper")).on_hover_text("En faire un groupe d'objets").clicked() {
+                    action = 1;
+                }
+                if ui.small_button(with_icon(ic::TRASH, "Supprimer")).clicked() {
+                    action = 2;
+                }
+                if ui.small_button("Désélectionner").clicked() {
+                    action = 3;
+                }
+            });
+            ui.label(egui::RichText::new("Glisser l'un d'eux, ou flèches / Q E / PgHaut PgBas : tous bougent ensemble.").small().color(TEXT_WEAK));
+        });
+        match action {
+            1 => {
+                let id = self.project.leds.next_set_id();
+                self.project.leds.sets.push(leds::LedGroup { id, name: format!("Groupe d'objets {id}"), effect: None });
+                self.with_multi(|l, temp| {
+                    for f in l.fixtures.iter_mut().filter(|f| f.set == temp) {
+                        f.set = id;
+                    }
+                    for s in l.surfaces.iter_mut().filter(|s| s.set == temp) {
+                        s.set = id;
+                    }
+                    for d in l.dmx.iter_mut().filter(|d| d.set == temp) {
+                        d.set = id;
+                    }
+                });
+                // `with_multi` remet les anciens groupes : on refait l'affectation après.
+                let (mf, ms, md) = (self.led.multi.clone(), self.led.multi_surf.clone(), self.led.multi_dmx.clone());
+                let l = &mut self.project.leds;
+                for f in l.fixtures.iter_mut().filter(|f| mf.contains(&f.id)) {
+                    f.set = id;
+                }
+                for s in l.surfaces.iter_mut().filter(|s| ms.contains(&s.id)) {
+                    s.set = id;
+                }
+                for d in l.dmx.iter_mut().filter(|d| md.contains(&d.id)) {
+                    d.set = id;
+                }
+                l.prune_sets();
+                self.clear_multi();
+                self.led.selected_set = Some(id);
+            }
+            2 => self.delete_multi(),
+            3 => self.clear_multi(),
+            _ => {}
+        }
+        ui.add_space(4.0);
+    }
+
     /// Groupe d'objets d'un objet (0 : aucun).
     fn target_set(&self, t: Target) -> u32 {
         match t {
             Target::Fixture(i) => self.project.leds.fixtures.get(i).map_or(0, |f| f.set),
             Target::Surface(i) => self.project.leds.surfaces.get(i).map_or(0, |s| s.set),
+            Target::Dmx(i) => self.project.leds.dmx.get(i).map_or(0, |d| d.set),
+            Target::Laser(i) => self.project.leds.lasers.get(i).map_or(0, |l| l.set),
         }
     }
 
@@ -1246,14 +2892,25 @@ impl OzApp {
                     s.set = id;
                 }
             }
+            Target::Dmx(i) => {
+                if let Some(d) = self.project.leds.dmx.get_mut(i) {
+                    d.set = id;
+                }
+            }
+            Target::Laser(i) => {
+                if let Some(l) = self.project.leds.lasers.get_mut(i) {
+                    l.set = id;
+                }
+            }
         }
     }
 
     /// L'objet choisi (ou son groupe), sous forme de cible.
     fn current_target(&self) -> Option<Target> {
-        match (self.led.selected, self.led.selected_surface) {
-            (Some(i), _) => Some(Target::Fixture(i)),
-            (_, Some(i)) => Some(Target::Surface(i)),
+        match (self.led.selected, self.led.selected_surface, self.led.selected_dmx) {
+            (Some(i), _, _) => Some(Target::Fixture(i)),
+            (_, Some(i), _) => Some(Target::Surface(i)),
+            (_, _, Some(i)) => Some(Target::Dmx(i)),
             _ => None,
         }
     }
@@ -1270,7 +2927,7 @@ impl OzApp {
         let mut id = self.target_set(cur);
         if id == 0 {
             id = self.project.leds.next_set_id();
-            self.project.leds.sets.push(leds::LedGroup { id, name: format!("Groupe d'objets {id}") });
+            self.project.leds.sets.push(leds::LedGroup { id, name: format!("Groupe d'objets {id}"), effect: None });
             self.put_in_set(cur, id);
         }
         // Un objet déjà dans un autre groupe y amène tout son groupe.
@@ -1295,6 +2952,25 @@ impl OzApp {
     /// Reporte sur tout le groupe choisi le déplacement et la rotation qu'on vient de faire subir
     /// à l'un de ses membres (`before` : sa position et sa rotation avant).
     fn spread_to_set(&mut self, t: Target, before: ([f32; 3], [f32; 3])) {
+        // Sélection multiple : tous les objets choisis suivent.
+        if self.multi_count() > 1 && self.in_multi(t) {
+            let Some((p1, r1)) = self.target_pos(t).zip(self.target_rot(t)) else { return };
+            if let Some((pos, rot)) = self.target_mut(t) {
+                *pos = before.0;
+                *rot = before.1;
+            }
+            let d = [p1[0] - before.0[0], p1[1] - before.0[1], p1[2] - before.0[2]];
+            let turn = (r1[0] - before.1[0] + 180.0).rem_euclid(360.0) - 180.0;
+            self.with_multi(|l, id| {
+                if d != [0.0; 3] {
+                    l.move_set(id, d);
+                }
+                if turn.abs() > 1e-4 {
+                    l.rotate_set(id, turn);
+                }
+            });
+            return;
+        }
         let Some(id) = self.led.selected_set.filter(|&id| id == self.target_set(t)) else { return };
         let Some((p1, r1)) = self.target_pos(t).zip(self.target_rot(t)) else { return };
         if let Some((pos, rot)) = self.target_mut(t) {
@@ -1315,6 +2991,8 @@ impl OzApp {
         match t {
             Target::Fixture(i) => self.project.leds.fixtures.get(i).map(|f| f.rot),
             Target::Surface(i) => self.project.leds.surfaces.get(i).map(|s| s.rot),
+            Target::Dmx(i) => self.project.leds.dmx.get(i).map(|d| d.rot),
+            Target::Laser(i) => self.project.leds.lasers.get(i).map(|l| l.rot),
         }
     }
 
@@ -1322,6 +3000,8 @@ impl OzApp {
         match t {
             Target::Fixture(i) => self.project.leds.fixtures.get_mut(i).map(|f| (&mut f.pos, &mut f.rot)),
             Target::Surface(i) => self.project.leds.surfaces.get_mut(i).map(|s| (&mut s.pos, &mut s.rot)),
+            Target::Dmx(i) => self.project.leds.dmx.get_mut(i).map(|d| (&mut d.pos, &mut d.rot)),
+            Target::Laser(i) => self.project.leds.lasers.get_mut(i).map(|l| (&mut l.pos, &mut l.rot)),
         }
     }
 
@@ -1333,6 +3013,7 @@ impl OzApp {
         sec.show(ui, 1, |ui| self.leds_install_ui(ui));
         sec.show(ui, 2, |ui| self.leds_controllers_ui(ui));
         sec.show(ui, 3, |ui| self.leds_output_ui(ui));
+
         self.push_confirm(ui.ctx());
     }
 
@@ -1462,6 +3143,8 @@ impl OzApp {
     }
 
     fn scene_ui(&mut self, ui: &mut egui::Ui) {
+        let cursor3d = self.led.cursor3d;
+        self.multi_scene_bar(ui);
         self.set_card(ui);
         let layers: Vec<(String, [f32; 4])> = self
             .project
@@ -1501,7 +3184,7 @@ impl OzApp {
         );
         ui.horizontal_wrapped(|ui| {
             let room = setup.room;
-            let presets: [(&str, leds::Surface); 7] = [
+            let presets: [(&str, leds::Surface); 12] = [
                 ("Écran", leds::Surface { pos: [0.0, 0.8, (room[1] - 0.3).max(0.5)], ..leds::Surface::default() }),
                 (
                     "Boîte",
@@ -1555,6 +3238,65 @@ impl OzApp {
                         ..leds::Surface::default()
                     },
                 ),
+                (
+                    "Vidéoprojecteur",
+                    leds::Surface {
+                        kind: leds::SurfaceKind::Projector,
+                        // À l'avant de la salle, tourné vers le fond.
+                        pos: [0.0, 1.4, 0.6],
+                        rot: [180.0, 0.0, 0.0],
+                        size: [0.4, 0.16, 0.32],
+                        color: [210, 210, 214],
+                        show_output: true,
+                        throw: 1.5,
+                        ..leds::Surface::default()
+                    },
+                ),
+                (
+                    "Soleil",
+                    leds::Surface {
+                        kind: leds::SurfaceKind::Sun,
+                        pos: [0.0, 0.6, (room[1] - 1.1).max(1.0)],
+                        size: [1.3, 1.3, 0.02],
+                        color: [242, 200, 30],
+                        show_output: false,
+                        ..leds::Surface::default()
+                    },
+                ),
+                (
+                    "Caisson de basses",
+                    leds::Surface {
+                        kind: leds::SurfaceKind::Sub,
+                        pos: [-(room[0] * 0.5 - 0.6).max(0.5), 0.0, (room[1] - 1.5).max(1.0)],
+                        size: [0.6, 0.7, 0.75],
+                        color: [28, 28, 32],
+                        show_output: false,
+                        ..leds::Surface::default()
+                    },
+                ),
+                (
+                    "Enceinte d'aigus",
+                    leds::Surface {
+                        kind: leds::SurfaceKind::Top,
+                        pos: [-(room[0] * 0.5 - 0.6).max(0.5), 0.0, (room[1] - 2.0).max(1.0)],
+                        size: [0.4, 0.6, 0.35],
+                        color: [28, 28, 32],
+                        show_output: false,
+                        stand: 1.4,
+                        ..leds::Surface::default()
+                    },
+                ),
+                (
+                    "Pont",
+                    leds::Surface {
+                        kind: leds::SurfaceKind::Truss,
+                        pos: [0.0, 0.0, (room[1] - 1.2).max(1.0)],
+                        size: [(room[0] - 0.6).clamp(1.0, 12.0), 3.0, 0.3],
+                        color: [170, 172, 178],
+                        show_output: false,
+                        ..leds::Surface::default()
+                    },
+                ),
                 ("Cabine DJ", {
                     // Posée au milieu de la scène s'il y en a une.
                     let stage = setup.surfaces.iter().find(|s| s.kind == leds::SurfaceKind::Stage);
@@ -1571,6 +3313,10 @@ impl OzApp {
             ];
             for (name, mut s) in presets {
                 if ui.button(with_icon(ic::PLUS, name)).clicked() {
+                    // Au point d'ajout, s'il est posé.
+                    if let Some(c) = cursor3d {
+                        s.pos = c;
+                    }
                     s.id = setup.next_surface_id();
                     let n = setup.surfaces.iter().filter(|o| o.name.starts_with(name)).count() + 1;
                     s.name = format!("{name} {n}");
@@ -1590,6 +3336,10 @@ impl OzApp {
                     leds::SurfaceKind::Booth => ic::DISC,
                     leds::SurfaceKind::Crowd => ic::USERS,
                     leds::SurfaceKind::Panels => ic::STACK,
+                    leds::SurfaceKind::Sub | leds::SurfaceKind::Top => ic::WAVES,
+                    leds::SurfaceKind::Truss => ic::GRID_FOUR,
+                    leds::SurfaceKind::Sun => ic::SUN,
+                    leds::SurfaceKind::Projector => ic::PROJECTOR_SCREEN,
                     _ => ic::CUBE,
                 };
                 let text = egui::RichText::new(with_icon(icon, &s.name));
@@ -1632,7 +3382,9 @@ impl OzApp {
             return;
         };
         ui.add_space(6.0);
+        let out_names: Vec<String> = self.project.outputs.iter().map(|o| o.name.clone()).collect();
         let mut panel_leds: Option<(String, Vec<(f32, Vec<[f32; 3]>)>)> = None;
+        let mut detach_sun = false;
         let controllers: Vec<(u32, String)> = setup.controllers.iter().map(|c| (c.id, c.name.clone())).collect();
         let chips_ctrl = &mut self.led.chips_ctrl;
         let image_on = &mut setup.image_on;
@@ -1661,6 +3413,28 @@ impl OzApp {
                 });
                 ui.color_edit_button_srgb(&mut s.color).on_hover_text("Couleur");
             });
+            if s.kind == leds::SurfaceKind::Projector {
+                ui.horizontal(|ui| {
+                    ui.label("Rapport de projection");
+                    ui.add(egui::DragValue::new(&mut s.throw).range(0.2..=10.0).speed(0.01))
+                        .on_hover_text("Distance / largeur de l'image (voir la notice du projecteur : 1,5 = à 3 m, image de 2 m)");
+                    ui.label(egui::RichText::new(format!("à 5 m : {:.2} m de large", 5.0 / s.throw.max(0.2))).small().color(TEXT_WEAK));
+                });
+            }
+            if s.kind == leds::SurfaceKind::Top {
+                ui.horizontal(|ui| {
+                    ui.label("Hauteur du pied");
+                    ui.add(egui::DragValue::new(&mut s.stand).range(0.0..=5.0).speed(0.01).suffix(" m"));
+                    if let Some(top) = stage_top {
+                        if ui.small_button("Poser sur la scène").clicked() {
+                            s.pos[1] = top;
+                        }
+                    }
+                });
+            }
+            if s.kind == leds::SurfaceKind::Truss {
+                ui.label(egui::RichText::new("Taille : L = portée, H = hauteur, P = section du treillis. Accrochez-y lasers, derbys ou bandeaux (Maj+clic pour les grouper avec le pont).").small().color(TEXT_WEAK));
+            }
             if s.kind == leds::SurfaceKind::Crowd {
                 ui.horizontal(|ui| {
                     ui.label("Personnes");
@@ -1689,12 +3463,13 @@ impl OzApp {
                     ui.label("→");
                     ui.color_edit_button_srgb(&mut p.outer).on_hover_text("Couleur des bords");
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Soleil");
-                    ui.add(egui::DragValue::new(&mut p.sun).range(0.0..=5.0).speed(0.01).suffix(" m"))
-                        .on_hover_text("Diamètre du soleil au centre (0 : aucun)");
-                    ui.color_edit_button_srgb(&mut p.sun_color);
-                });
+                if p.sun > 0.01 && ui
+                    .button(with_icon(ic::SUN, "Séparer le soleil"))
+                    .on_hover_text("Le soleil devient un objet à part (bouton « Soleil » de la scène), au même endroit")
+                    .clicked()
+                {
+                    detach_sun = true;
+                }
                 // Contrôleur de chaque côté (les bandes peuvent aller sur des contrôleurs différents).
                 for side in 0..2 {
                     if !controllers.iter().any(|c| c.0 == chips_ctrl[side]) {
@@ -1764,7 +3539,18 @@ impl OzApp {
             if s.kind == leds::SurfaceKind::Crowd {
                 s.show_output = false;
             } else {
-                ui.checkbox(&mut s.show_output, "Affiche l'image de la sortie (face avant)");
+                ui.horizontal(|ui| {
+                    let label = if s.kind == leds::SurfaceKind::Projector { "Projette" } else { "Affiche l'image de" };
+                    ui.checkbox(&mut s.show_output, label);
+                    let shown = out_names.get(s.output).cloned().unwrap_or_else(|| "la sortie".into());
+                    egui::ComboBox::from_id_salt("surface_out").selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                        for (k, name) in out_names.iter().enumerate() {
+                            ui.selectable_value(&mut s.output, k, name);
+                        }
+                    });
+                })
+                .response
+                .on_hover_text("Quelle sortie cet écran (ou cet élément mappé) montre, face avant");
             }
             if s.show_output {
                 ui.horizontal(|ui| {
@@ -1805,6 +3591,30 @@ impl OzApp {
         if let Some((name, paths)) = panel_leds {
             self.place_panel_leds(&name, &paths);
         }
+        if detach_sun {
+            // Même place qu'avant : devant le panneau du centre, à la hauteur du soleil des chips.
+            let setup = &mut self.project.leds;
+            let c = setup.surfaces[si].clone();
+            let (d, h, low, gap) = (c.panels.sun, c.size[1], c.panels.low, c.panels.gap);
+            let r = d / 2.0;
+            let cy = (h * low - r * 0.75).max(r);
+            let id = setup.next_surface_id();
+            setup.surfaces.push(leds::Surface {
+                id,
+                name: "Soleil".into(),
+                kind: leds::SurfaceKind::Sun,
+                pos: leds::place(c.pos, c.rot, [0.0, cy - r, -gap]),
+                rot: c.rot,
+                size: [d, d, 0.02],
+                color: c.panels.sun_color,
+                show_output: false,
+                set: c.set,
+                ..leds::Surface::default()
+            });
+            setup.surfaces[si].panels.sun = 0.0;
+        }
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new(with_icon(ic::LIGHTNING, "Lasers, derbys, bulles, fumée : onglet DMX (à droite).")).small().color(TEXT_WEAK));
     }
 
     /// Bandes LED des panneaux superposés : une par tracé, nommées G1, G2… et D1, D2… du centre
@@ -1843,7 +3653,7 @@ impl OzApp {
             let mut id = setup.surfaces[si].set;
             if id == 0 {
                 id = setup.next_set_id();
-                setup.sets.push(leds::LedGroup { id, name: name.to_owned() });
+                setup.sets.push(leds::LedGroup { id, name: name.to_owned(), effect: None });
                 setup.surfaces[si].set = id;
             }
             for f in setup.fixtures.iter_mut().filter(|f| f.name.starts_with(&prefix)) {
@@ -1853,7 +3663,7 @@ impl OzApp {
         }
         // Premières bandes : groupes en paires gauche/droite, du centre vers les bords (pour les scénarios).
         if setup.groups.is_empty() {
-            setup.auto_groups(true);
+            setup.auto_groups(leds::GroupOrder::CenterOut);
         }
         self.led.selected = None;
     }
@@ -1865,6 +3675,7 @@ impl OzApp {
         if !self.project.leds.fixtures.is_empty() {
             self.wiring_ui(ui);
         }
+        self.tunnel_ui(ui);
         let mut start = false;
         let mut redraw = None;
         self.leds_install_body(ui, &mut start, &mut redraw);
@@ -1873,6 +3684,9 @@ impl OzApp {
         }
         if redraw.is_some() {
             self.start_drawing(redraw);
+        }
+        if let Some(target) = self.led.sketch_req.take() {
+            self.open_sketch(target);
         }
     }
 
@@ -1883,14 +3697,22 @@ impl OzApp {
             for kind in FixtureKind::ALL {
                 if kind == FixtureKind::Path {
                     if ui
-                        .button(with_icon(ic::PENCIL_SIMPLE, "Dessiner un tracé"))
-                        .on_hover_text("Dessinez le parcours du bandeau point par point dans la vue 3D")
+                        .button(with_icon(ic::PENCIL_SIMPLE, "Dessiner en 2D"))
+                        .on_hover_text("Dessinez la forme du bandeau à plat, en mètres, sur la planche 2D, puis ajoutez-la à la scène")
+                        .clicked()
+                    {
+                        self.led.sketch_req = Some(None);
+                    }
+                    if ui
+                        .button(with_icon(ic::PENCIL_SIMPLE, "Dessiner en 3D"))
+                        .on_hover_text("Dessinez le parcours point par point dans la vue 3D, au sol ou sur les murs")
                         .clicked()
                     {
                         *start = true;
                     }
                     continue;
                 }
+
                 if ui.button(with_icon(ic::PLUS, kind.name())).clicked() {
                     let id = setup.next_fixture_id();
                     let n = setup.fixtures.iter().filter(|f| f.kind == kind).count() + 1;
@@ -1904,6 +3726,9 @@ impl OzApp {
                         }
                     } else if let Some(c) = setup.controllers.first() {
                         f.controller = c.id;
+                    }
+                    if let Some(c) = self.led.cursor3d {
+                        f.pos = c;
                     }
                     setup.fixtures.push(f);
                     self.led.selected = Some(setup.fixtures.len() - 1);
@@ -2184,10 +4009,31 @@ impl OzApp {
                         }
                     }
                     ui.checkbox(&mut f.closed, "Boucle fermée");
-                    if ui.button(with_icon(ic::PENCIL_SIMPLE, "Redessiner")).clicked() {
+                    if f.is_flat() {
+                        if ui.button(with_icon(ic::PENCIL_SIMPLE, "Modifier en 2D")).on_hover_text("Ouvre sa forme sur la planche 2D").clicked() {
+                            self.led.sketch_req = Some(Some(si));
+                        }
+                    } else if ui.button(with_icon(ic::PENCIL_SIMPLE, "Redessiner")).clicked() {
                         *redraw = Some(si);
                     }
                 });
+                if f.is_flat() {
+                    // Orientation de la forme dessinée en 2D.
+                    ui.horizontal(|ui| {
+                        ui.label("Poser");
+                        if ui.small_button("Debout, face à la salle").clicked() {
+                            f.rot = [0.0, 0.0, 0.0];
+                        }
+                        if ui.small_button("Au sol").clicked() {
+                            f.rot = [0.0, -90.0, 0.0];
+                            f.pos[1] = 0.02;
+                        }
+                        if ui.small_button("Au plafond").clicked() {
+                            f.rot = [0.0, 90.0, 0.0];
+                            f.pos[1] = 2.5;
+                        }
+                    });
+                }
                 egui::CollapsingHeader::new(format!("Points du tracé ({})", f.points.len())).id_salt("path_pts").show(ui, |ui| {
                     let mut remove = None;
                     for (k, p) in f.points.iter_mut().enumerate() {
@@ -2207,15 +4053,18 @@ impl OzApp {
                     ui.label(egui::RichText::new("Coordonnées relatives à la position de l'élément.").small().color(TEXT_WEAK));
                 });
             }
-            ui.horizontal(|ui| {
-                ui.label("Position");
-                for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
-                    ui.add(egui::DragValue::new(&mut f.pos[k]).speed(0.01).prefix(format!("{axis} ")).suffix(" m"));
-                }
-            })
-            .response
-            .on_hover_text("X : gauche/droite · Y : hauteur · Z : de l'avant vers le fond de la salle");
-            if f.kind != FixtureKind::Column {
+            let in_room = true;
+            if in_room {
+                ui.horizontal(|ui| {
+                    ui.label("Position");
+                    for (k, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                        ui.add(egui::DragValue::new(&mut f.pos[k]).speed(0.01).prefix(format!("{axis} ")).suffix(" m"));
+                    }
+                })
+                .response
+                .on_hover_text("X : gauche/droite · Y : hauteur · Z : de l'avant vers le fond de la salle");
+            }
+            if in_room && f.kind != FixtureKind::Column {
                 ui.horizontal(|ui| {
                     ui.label("Rotation");
                     for (k, name) in ["cap", "incl.", "roulis"].iter().enumerate() {
@@ -2365,6 +4214,8 @@ impl OzApp {
             let id = self.project.leds.next_controller_id();
             self.project.leds.controllers.push(leds::Controller::new(id, &format!("ESP32 {id}"), 0));
         }
+        ui.add_space(8.0);
+        self.plugs_ui(ui);
     }
 
     /// Confirmation avant d'écrire la configuration dans un WLED (il redémarre).
@@ -2418,8 +4269,23 @@ impl OzApp {
     }
 
     fn leds_output_ui(&mut self, ui: &mut egui::Ui) {
+        let out_names: Vec<String> = self.project.outputs.iter().map(|o| o.name.clone()).collect();
         let setup = &mut self.project.leds;
         theme::section(ui, ic::PLAY, "Ce que montrent les LEDs");
+        // Sortie suivie (image ou couleur de la vidéo), quand il y en a plusieurs.
+        if out_names.len() > 1 {
+            ui.horizontal(|ui| {
+                ui.label(with_icon(ic::MONITOR, "Sortie suivie"));
+                let shown = out_names.get(setup.video_output).cloned().unwrap_or_default();
+                egui::ComboBox::from_id_salt("led_video_out_main").selected_text(shown).show_ui(ui, |ui| {
+                    for (k, name) in out_names.iter().enumerate() {
+                        ui.selectable_value(&mut setup.video_output, k, name);
+                    }
+                });
+            })
+            .response
+            .on_hover_text("Sortie dont l'image (ou la couleur) est suivie par les LEDs ; chaque groupe peut en suivre une autre");
+        }
         for s in Source::ALL {
             ui.radio_value(&mut setup.source, s, s.name());
             if s == Source::Video && setup.source == Source::Video {
@@ -2454,7 +4320,7 @@ impl OzApp {
                 });
             }
             if s == Source::Scenario && setup.source == Source::Scenario {
-                ui.indent("led_scenario", |ui| scenario_ui(ui, setup, &mut self.led.list_drag));
+                ui.indent("led_scenario", |ui| scenario_ui(ui, setup));
             }
             if s == Source::Solid && setup.source == Source::Solid {
                 ui.indent("led_color", |ui| {
@@ -2462,6 +4328,32 @@ impl OzApp {
                 });
             }
         }
+        ui.add_space(6.0);
+        ui.add_space(6.0);
+        // Réaction au son : par-dessus n'importe quel effet.
+        theme::section(ui, ic::WAVES, "Réaction au son");
+        let pulse = &self.rhythm.pulse;
+        let lv = if setup.sound.bass { pulse.bass } else { pulse.level }.clamp(0.0, 1.0);
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut setup.sound.bass, true, "Basses (kick)");
+            ui.selectable_value(&mut setup.sound.bass, false, "Tout le son");
+            // Niveau en direct.
+            let (r, _) = ui.allocate_exact_size(Vec2::new(90.0, 8.0), Sense::hover());
+            ui.painter().rect_filled(r, 4.0, theme::WIDGET);
+            ui.painter().rect_filled(Rect::from_min_size(r.min, Vec2::new(r.width() * lv, r.height())), 4.0, ACCENT);
+        });
+        percent_slider(ui, &mut setup.sound.follow, "Suit le volume");
+        percent_slider(ui, &mut setup.sound.flash, "Flash sur les temps");
+        ui.label(
+            egui::RichText::new("Le son vient de l'onglet Rythme (micro, carte son ; ou le tempo tapé avec T). Marche avec tous les effets, image de la vidéo comprise.")
+                .small()
+                .color(TEXT_WEAK),
+        );
+        if setup.sound.follow > 0.0 || setup.sound.flash > 0.0 {
+            ui.ctx().request_repaint();
+        }
+        ui.add_space(6.0);
+        groups_ui(ui, setup, &mut self.led.list_drag, &out_names);
         ui.add_space(6.0);
         theme::section(ui, ic::SLIDERS_HORIZONTAL, "Réglages");
         percent_slider(ui, &mut setup.brightness, "Luminosité");
@@ -2471,6 +4363,19 @@ impl OzApp {
                 .small()
                 .color(TEXT_WEAK),
         );
+    }
+}
+
+/// Nom court d'un effet, pour les listes de groupes.
+fn short_source(s: Source) -> &'static str {
+    match s {
+        Source::Video => "Image de la sortie",
+        Source::VideoAverage => "Couleur de la vidéo",
+        Source::Scenario => "Scénario",
+        Source::Solid => "Couleur unie",
+        Source::Rainbow => "Arc-en-ciel",
+        Source::Off => "Éteint",
+        other => other.name(),
     }
 }
 
@@ -2540,7 +4445,7 @@ fn multi_bar(ui: &mut egui::Ui, setup: &mut LedSetup, multi: &mut Vec<u32>) {
                 .clicked()
             {
                 let id = setup.next_group_id();
-                setup.groups.push(leds::LedGroup { id, name: format!("Groupe {id}") });
+                setup.groups.push(leds::LedGroup { id, name: format!("Groupe {id}"), effect: None });
                 for f in setup.fixtures.iter_mut().filter(|f| picked(f)) {
                     f.group = id;
                 }
@@ -2551,7 +4456,7 @@ fn multi_bar(ui: &mut egui::Ui, setup: &mut LedSetup, multi: &mut Vec<u32>) {
                 .clicked()
             {
                 let id = setup.next_set_id();
-                setup.sets.push(leds::LedGroup { id, name: format!("Groupe d'objets {id}") });
+                setup.sets.push(leds::LedGroup { id, name: format!("Groupe d'objets {id}"), effect: None });
                 for f in setup.fixtures.iter_mut().filter(|f| picked(f)) {
                     f.set = id;
                 }
@@ -2566,7 +4471,7 @@ fn multi_bar(ui: &mut egui::Ui, setup: &mut LedSetup, multi: &mut Vec<u32>) {
 }
 
 /// Réglages du scénario et groupes de bandeaux (dans l'ordre d'animation).
-fn scenario_ui(ui: &mut egui::Ui, setup: &mut LedSetup, drag: &mut Option<(u8, Vec<usize>)>) {
+fn scenario_ui(ui: &mut egui::Ui, setup: &mut LedSetup) {
     let sc = &mut setup.scenario;
     ui.horizontal(|ui| {
         ui.label("Scénario");
@@ -2592,22 +4497,28 @@ fn scenario_ui(ui: &mut egui::Ui, setup: &mut LedSetup, drag: &mut Option<(u8, V
         ui.add_enabled(sc.chain, egui::DragValue::new(&mut sc.chain_secs).range(3.0..=600.0).suffix(" s"));
     });
 
-    ui.add_space(4.0);
-    ui.label(egui::RichText::new("Groupes de bandeaux").strong());
+}
+
+/// Groupes de bandeaux : ordre d'animation des scénarios, et effet propre à chaque groupe.
+fn groups_ui(ui: &mut egui::Ui, setup: &mut LedSetup, drag: &mut Option<(u8, Vec<usize>)>, out_names: &[String]) {
+    theme::section(ui, ic::STACK, "Groupes de bandeaux");
     ui.label(
         egui::RichText::new(
-            "Les éléments d'un groupe s'allument ensemble ; les scénarios passent d'un groupe au suivant dans cet ordre. \
-             Sans groupe, chaque élément est son propre groupe.",
+            "Les bandeaux d'un groupe s'allument ensemble ; les scénarios passent d'un groupe au suivant dans cet ordre. \
+             Chaque groupe peut avoir son propre effet. Sans groupe, chaque bandeau est son propre groupe.",
         )
         .small()
         .color(TEXT_WEAK),
     );
     ui.horizontal_wrapped(|ui| {
         if ui.small_button("Du centre vers les bords").on_hover_text("Paires symétriques gauche/droite, du centre vers l'extérieur").clicked() {
-            setup.auto_groups(true);
+            setup.auto_groups(leds::GroupOrder::CenterOut);
         }
         if ui.small_button("De gauche à droite").clicked() {
-            setup.auto_groups(false);
+            setup.auto_groups(leds::GroupOrder::LeftRight);
+        }
+        if ui.small_button("De l'avant vers le fond").on_hover_text("Rangée par rangée en profondeur : l'effet tunnel").clicked() {
+            setup.auto_groups(leds::GroupOrder::FrontBack);
         }
         if !setup.groups.is_empty() && ui.small_button("Aucun groupe").clicked() {
             setup.groups.clear();
@@ -2617,7 +4528,7 @@ fn scenario_ui(ui: &mut egui::Ui, setup: &mut LedSetup, drag: &mut Option<(u8, V
         }
         if ui.small_button(with_icon(ic::PLUS, "Groupe")).clicked() {
             let id = setup.next_group_id();
-            setup.groups.push(leds::LedGroup { id, name: format!("Groupe {id}") });
+            setup.groups.push(leds::LedGroup { id, name: format!("Groupe {id}"), effect: None });
         }
     });
     let mut action: Option<(usize, i32)> = None;
@@ -2636,6 +4547,22 @@ fn scenario_ui(ui: &mut egui::Ui, setup: &mut LedSetup, drag: &mut Option<(u8, V
             ui.label(egui::RichText::new(format!("{}", i + 1)).small().color(TEXT_WEAK));
             ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(110.0));
             ui.label(egui::RichText::new(format!("{members} élém.")).small().color(TEXT_WEAK));
+            // Effet du groupe : l'effet général, ou le sien.
+            let shown = g.effect.as_ref().map_or("Effet général", |e| short_source(e.source));
+            egui::ComboBox::from_id_salt(("group_fx", g.id)).selected_text(shown).width(120.0).show_ui(ui, |ui| {
+                if ui.selectable_label(g.effect.is_none(), "Effet général").clicked() {
+                    g.effect = None;
+                }
+                for src in [Source::Video, Source::VideoAverage, Source::Scenario, Source::Solid, Source::Rainbow, Source::Off] {
+                    let on = g.effect.as_ref().is_some_and(|e| e.source == src);
+                    if ui.selectable_label(on, short_source(src)).clicked() {
+                        let e = g.effect.get_or_insert_with(leds::GroupEffect::default);
+                        e.source = src;
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Ce groupe peut suivre l'effet général, ou en avoir un à lui");
             if i > 0 && ui.small_button(ic::CARET_UP).on_hover_text("Plus tôt").clicked() {
                 action = Some((i, -1));
             }
@@ -2647,6 +4574,36 @@ fn scenario_ui(ui: &mut egui::Ui, setup: &mut LedSetup, drag: &mut Option<(u8, V
             }
         });
         rows.push(row.response.rect);
+        // Réglages de l'effet propre au groupe.
+        if let Some(e) = &mut g.effect {
+            ui.horizontal(|ui| {
+                ui.add_space(28.0);
+                if matches!(e.source, Source::Video | Source::VideoAverage) && out_names.len() > 1 {
+                    let shown = e.output.and_then(|k| out_names.get(k).cloned()).unwrap_or_else(|| "Sortie suivie".into());
+                    egui::ComboBox::from_id_salt(("group_out", g.id)).selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut e.output, None, "Sortie suivie (générale)");
+                        for (k, name) in out_names.iter().enumerate() {
+                            ui.selectable_value(&mut e.output, Some(k), name);
+                        }
+                    });
+                }
+                match e.source {
+                    Source::Scenario => {
+                        egui::ComboBox::from_id_salt(("group_sc", g.id)).selected_text(e.scenario.name()).width(150.0).show_ui(ui, |ui| {
+                            for k in leds::ScenarioKind::ALL {
+                                ui.selectable_value(&mut e.scenario, k, k.name());
+                            }
+                        });
+                    }
+                    Source::Solid => {
+                        ui.color_edit_button_srgb(&mut e.color);
+                    }
+                    _ => {}
+                }
+                ui.add(egui::Slider::new(&mut e.brightness, 0.0..=1.0).show_value(false)).on_hover_text("Luminosité du groupe");
+                ui.checkbox(&mut e.sound, "Son").on_hover_text("Réagit au son (réglages « Réaction au son »)");
+            });
+        }
     }
     if let Some((1, items)) = drag.clone() {
         if let Some(at) = drop_slot(ui, &rows, &items) {
@@ -2712,9 +4669,26 @@ impl View {
     }
 
     fn line(&self, painter: &egui::Painter, a: [f32; 3], b: [f32; 3], stroke: Stroke) {
-        if let (Some((pa, _)), Some((pb, _))) = (self.project(a), self.project(b)) {
+        if let Some(((pa, _), (pb, _))) = self.segment(a, b) {
             painter.line_segment([pa, pb], stroke);
         }
+    }
+
+    /// Segment de la salle à l'écran, coupé là où il passe derrière la caméra : un faisceau
+    /// qui file vers la caméra (et finit dans son dos) reste visible jusqu'au bord de la vue.
+    fn segment(&self, a: [f32; 3], b: [f32; 3]) -> Option<((egui::Pos2, f32), (egui::Pos2, f32))> {
+        const NEAR: f32 = 0.08;
+        let (za, zb) = (dot(sub(a, self.eye), self.fwd), dot(sub(b, self.eye), self.fwd));
+        if za < NEAR && zb < NEAR {
+            return None;
+        }
+        let cut = |p: [f32; 3], q: [f32; 3], zp: f32, zq: f32| {
+            let t = (NEAR - zp) / (zq - zp);
+            [0, 1, 2].map(|k| p[k] + (q[k] - p[k]) * t)
+        };
+        let a2 = if za < NEAR { cut(a, b, za, zb) } else { a };
+        let b2 = if zb < NEAR { cut(b, a, zb, za) } else { b };
+        Some((self.project(a2)?, self.project(b2)?))
     }
 
     /// Point d'un plan (passant par `p0`, de normale `n`) sous le pointeur.
@@ -2748,6 +4722,58 @@ fn glow(c: [u8; 3], k: f32) -> Color32 {
     Color32::from_rgba_premultiplied(v(c[0]), v(c[1]), v(c[2]), 0)
 }
 
+/// Longueur d'une forme de la planche 2D (m).
+fn sketch_length(pts: &[[f32; 2]], closed: bool) -> f32 {
+    let mut l: f32 = pts.windows(2).map(|w| ((w[1][0] - w[0][0]).powi(2) + (w[1][1] - w[0][1]).powi(2)).sqrt()).sum();
+    if closed && pts.len() > 2 {
+        let (a, b) = (pts[0], pts[pts.len() - 1]);
+        l += ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt();
+    }
+    l
+}
+
+/// Distance du premier quadrilatère touché par le rayon (origine `o`, direction unitaire `d`).
+fn first_hit(o: [f32; 3], d: [f32; 3], quads: &[[[f32; 3]; 4]]) -> Option<f32> {
+    let mut best: Option<f32> = None;
+    for q in quads {
+        let n = cross(sub(q[1], q[0]), sub(q[3], q[0]));
+        let den = dot(n, d);
+        if den.abs() < 1e-6 {
+            continue;
+        }
+        let t = dot(n, sub(q[0], o)) / den;
+        if t <= 0.05 || best.is_some_and(|b| t >= b) {
+            continue;
+        }
+        let p = [o[0] + d[0] * t, o[1] + d[1] * t, o[2] + d[2] * t];
+        // Dans le quadrilatère (convexe) : du même côté de ses quatre bords.
+        let inside = (0..4).all(|k| dot(cross(sub(q[(k + 1) % 4], q[k]), sub(p, q[k])), n) >= -1e-6);
+        if inside {
+            best = Some(t);
+        }
+    }
+    best
+}
+
+/// Distance d'un point à un segment (pixels).
+fn seg_dist(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
+}
+
+fn elide_name(s: &str) -> String {
+    if s.chars().count() <= 18 { s.to_owned() } else { s.chars().take(17).collect::<String>() + "…" }
+}
+
+/// Photo de fond du plan 2D (réduite à 2048 px au plus).
+fn load_photo(ctx: &egui::Context, path: &std::path::Path) -> Option<egui::TextureHandle> {
+    let img = image::open(path).ok()?.thumbnail(2048, 2048).to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    Some(ctx.load_texture("led_plan_photo", color, egui::TextureOptions::LINEAR))
+}
+
 /// Marque les LEDs cachées par une face : la face passe, à l'endroit précis de la LED à l'écran,
 /// devant elle (le tri par morceau ne suffit pas pour des LEDs glissées entre deux panneaux).
 fn hide_covered_leds(items: &mut [(f32, Item)]) {
@@ -2778,7 +4804,7 @@ fn hide_covered_leds(items: &mut [(f32, Item)]) {
             Item::Led { p, hidden, .. } => *hidden = covered(*p, *z, 0.005),
             // Un trait est caché si son milieu l'est (sa propre face, à la même distance, ne compte pas).
             Item::Wire { a, b, z: wz, hidden, .. } => *hidden = covered(egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5), *wz, 0.015),
-            Item::Tile { .. } => {}
+            Item::Tile { .. } | Item::Beam { .. } | Item::Puff { .. } => {}
         }
     }
 }
@@ -2806,6 +4832,14 @@ const TILE: f32 = 0.4;
 
 /// Découpe une face en morceaux (maillages sans anticrénelage : pas de pointes sur les faces
 /// vues par la tranche, pas de jointures visibles) et ajoute ses arêtes, un peu en avant.
+/// Vidéoprojecteur qui éclaire la scène : l'objet, l'image de sa sortie, ses proportions.
+struct Beamer<'a> {
+    surface: &'a leds::Surface,
+    tex: egui::TextureId,
+    aspect: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn face_tiles(
     view: &View,
     q: [[f32; 3]; 4],
@@ -2815,10 +4849,21 @@ fn face_tiles(
     edges: u8,
     surface: usize,
     items: &mut Vec<(f32, Item)>,
+    beamers: &[Beamer],
 ) {
     let len = |a: [f32; 3], b: [f32; 3]| dot(sub(a, b), sub(a, b)).sqrt();
-    // Une image garde des morceaux plus petits, pour que la perspective reste juste.
-    let tile = if texture.is_some() { TILE * 0.6 } else { TILE };
+    // Vidéoprojecteurs tournés vers cette face (les autres ne l'éclairent pas).
+    let n = norm(cross(sub(q[1], q[0]), sub(q[3], q[0])));
+    let center = [0, 1, 2].map(|k| q.iter().map(|p| p[k]).sum::<f32>() / 4.0);
+    let lit: Vec<&Beamer> = beamers
+        .iter()
+        .filter(|b| {
+            let to = sub(b.surface.lens(), center);
+            dot(n, to) > 0.0
+        })
+        .collect();
+    // Une image (de la face ou projetée) garde des morceaux plus petits : la perspective reste juste.
+    let tile = if texture.is_some() || !lit.is_empty() { TILE * 0.6 } else { TILE };
     let nu = ((len(q[0], q[1]) / tile).ceil() as usize).clamp(1, 48);
     let nv = ((len(q[0], q[3]) / tile).ceil() as usize).clamp(1, 48);
     let mut grid = Vec::with_capacity((nu + 1) * (nv + 1));
@@ -2831,7 +4876,7 @@ fn face_tiles(
                 top + (bottom - top) * t
             });
             let Some(pp) = view.project(p) else { return };
-            grid.push((pp.0, pp.1, s, t));
+            grid.push((pp.0, pp.1, s, t, p));
         }
     }
     let at = |i: usize, j: usize| grid[j * (nu + 1) + i];
@@ -2867,6 +4912,24 @@ fn face_tiles(
             mesh.add_triangle(0, 2, 3);
             let depth = c.iter().map(|v| v.1).sum::<f32>() / 4.0;
             items.push((depth, Item::Tile { pts, z: c.map(|v| v.1), mesh, surface, quad: q }));
+            // Lumière des vidéoprojecteurs : leur image, ajoutée à la couleur de la face.
+            for b in &lit {
+                let uvs = c.map(|v| b.surface.projected_uv(v.4, b.aspect));
+                if uvs.iter().all(|u| u.is_none_or(|u| !(-0.05..=1.05).contains(&u[0]) || !(-0.05..=1.05).contains(&u[1]))) {
+                    continue;
+                }
+                let mut over = egui::Mesh::with_texture(b.tex);
+                for (v, uv) in c.iter().zip(uvs) {
+                    let inside = uv.is_some_and(|u| (0.0..=1.0).contains(&u[0]) && (0.0..=1.0).contains(&u[1]));
+                    let u = uv.unwrap_or([0.5, 0.5]);
+                    // Mélange additif : la projection éclaire, elle ne recouvre pas.
+                    let color = if inside { Color32::from_rgba_premultiplied(235, 235, 235, 0) } else { Color32::TRANSPARENT };
+                    over.vertices.push(egui::epaint::Vertex { pos: v.0, uv: egui::pos2(u[0].clamp(0.0, 1.0), u[1].clamp(0.0, 1.0)), color });
+                }
+                over.add_triangle(0, 1, 2);
+                over.add_triangle(0, 2, 3);
+                items.push((depth - 0.002, Item::Tile { pts, z: c.map(|v| v.1), mesh: over, surface, quad: q }));
+            }
         }
     }
     // Arêtes, découpées comme la face et un peu en avant d'elle.

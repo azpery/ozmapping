@@ -263,8 +263,8 @@ pub struct Renderer {
     face_error: Option<String>,
     /// Cible hors écran de l'enregistrement vidéo.
     capture_target: Option<GenTarget>,
-    /// Cible hors écran des LEDs (petite image lue à chaque rendu).
-    led_target: Option<GenTarget>,
+    /// Cibles hors écran des images lues pour les LEDs et la scène 3D, une par sortie.
+    led_targets: HashMap<usize, GenTarget>,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     black: glow::Texture,
@@ -2800,7 +2800,7 @@ impl Renderer {
                 face: None,
                 face_error: None,
                 capture_target: None,
-                led_target: None,
+                led_targets: HashMap::new(),
                 vao,
                 vbo,
                 black,
@@ -2846,7 +2846,7 @@ impl Renderer {
             for (_, sim) in self.paint_sims.drain() {
                 Self::delete_paint_sim(gl, &sim);
             }
-            if let Some(t) = self.led_target.take() {
+            for (_, t) in self.led_targets.drain() {
                 gl.delete_framebuffer(t.fbo);
                 gl.delete_texture(t.texture);
             }
@@ -3376,11 +3376,13 @@ impl Renderer {
         out
     }
 
-    /// Comme `capture`, dans une cible à part : l'image lue pour les LEDs.
-    pub fn capture_leds(&mut self, gl: &glow::Context, size: (u32, u32), p: &DrawParams) -> Option<Vec<u8>> {
-        let mut target = self.led_target.take();
+    /// Comme `capture`, dans une cible à part par sortie : l'image lue pour les LEDs et la scène 3D.
+    pub fn capture_leds(&mut self, gl: &glow::Context, slot: usize, size: (u32, u32), p: &DrawParams) -> Option<Vec<u8>> {
+        let mut target = self.led_targets.remove(&slot);
         let out = self.capture_into(gl, &mut target, size, p);
-        self.led_target = target;
+        if let Some(t) = target {
+            self.led_targets.insert(slot, t);
+        }
         out
     }
 
@@ -3752,13 +3754,14 @@ pub fn led_capture_callback(
     rect: egui::Rect,
     renderer: Arc<Mutex<Renderer>>,
     params: DrawParams,
+    slot: usize,
     size: (u32, u32),
     sink: Arc<Mutex<crate::leds::Frame>>,
 ) -> egui::PaintCallback {
     egui::PaintCallback {
         rect,
         callback: Arc::new(egui_glow::CallbackFn::new(move |_info, painter| {
-            if let Some(pixels) = renderer.lock().unwrap().capture_leds(painter.gl(), size, &params) {
+            if let Some(pixels) = renderer.lock().unwrap().capture_leds(painter.gl(), slot, size, &params) {
                 let mut f = sink.lock().unwrap();
                 let serial = f.serial + 1;
                 *f = crate::leds::Frame { pixels, size, serial };

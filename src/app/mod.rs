@@ -34,8 +34,10 @@ mod files;
 mod grid;
 mod layer_runtime;
 mod layers;
+mod laser_ui;
 mod leds_ui;
 mod midi_ui;
+mod net_ui;
 mod output;
 mod panels;
 mod playback;
@@ -52,12 +54,14 @@ use cutout_ui::*;
 use files::*;
 use grid::*;
 use layer_runtime::*;
+use laser_ui::*;
 use leds_ui::*;
 use midi_ui::*;
+use net_ui::*;
 use output::*;
 use widgets::*;
 
-const MAX_LAYERS: usize = 8;
+const MAX_LAYERS: usize = 16;
 /// Touche de commande affichée dans les libellés (les raccourcis utilisent Ctrl hors macOS).
 const CMD: &str = if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" };
 
@@ -74,6 +78,12 @@ struct Session {
     bpm: Option<f32>,
     /// Contrôleur MIDI : port et commandes assignées (indépendants du projet).
     midi: crate::midi::MidiSetup,
+    /// Envoi aux WLED et en DMX actifs : ils reprennent tout seuls après un redémarrage
+    /// (un crash en plein spectacle ne laisse pas les LEDs éteintes).
+    leds_live: bool,
+    dmx_live: bool,
+    /// Synchronisation avec les autres OZ Mapping du réseau local.
+    net: crate::net::NetSettings,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,11 +101,13 @@ enum RightTab {
     Mix,
     Rhythm,
     Leds,
+    Dmx,
+    Laser,
     Midi,
 }
 
 impl RightTab {
-    const COUNT: usize = 8;
+    const COUNT: usize = 10;
 
     /// Onglets horizontaux de chaque onglet latéral (vide : une seule page).
     fn sections(self) -> &'static [(&'static str, &'static str)] {
@@ -127,6 +139,8 @@ impl RightTab {
             ],
             RightTab::Rhythm => &[(ic::WAVES, "Source"), (ic::SPARKLE, "Réaction")],
             RightTab::Leds => &[(ic::CUBE, "Scène"), (ic::LIGHTBULB, "LEDs"), (ic::WIFI_HIGH, "Contrôleurs"), (ic::PLAY, "Sortie")],
+            RightTab::Dmx => &[(ic::LIGHTNING, "Appareils"), (ic::WIFI_HIGH, "Sortie")],
+            RightTab::Laser => &[(ic::PENCIL_SIMPLE, "ILDA (formes)"), (ic::SQUARES_FOUR, "DMX (motifs)")],
             RightTab::Photo | RightTab::Mix | RightTab::Midi => &[],
         }
     }
@@ -167,6 +181,11 @@ pub struct OzApp {
     output_size: Vec2,
     output_screen: Option<String>,
     output_move: Option<OutputMove>,
+    /// Sorties 2 et suivantes (index = rang de la sortie ; l'entrée 0 n'est pas utilisée : la
+    /// sortie 1 a les champs ci-dessus) ; sortie montrée par l'aperçu ; dernier calque choisi.
+    outs: Vec<ExtraOut>,
+    preview_out: usize,
+    last_sel: usize,
     screens: Vec<screens::Screen>,
     screens_at: f64,
     rhythm: Rhythm,
@@ -176,6 +195,10 @@ pub struct OzApp {
     /// Contrôleur MIDI : connexion, dessin ; et ses commandes assignées (gardées entre sessions).
     midi: MidiRuntime,
     midi_setup: crate::midi::MidiSetup,
+    /// Lasers ILDA : armement, envoi aux boîtiers.
+    laser: LaserRuntime,
+    /// Plusieurs OZ Mapping ensemble sur le réseau local.
+    net: NetRuntime,
 
     blackout: bool,
     blackout_level: f32,
@@ -268,12 +291,17 @@ impl OzApp {
             output_size: Vec2::new(1920.0, 1080.0),
             output_screen: None,
             output_move: None,
+            outs: Vec::new(),
+            preview_out: 0,
+            last_sel: usize::MAX,
             screens: screens::list(),
             screens_at: 0.0,
             rhythm: Rhythm::default(),
             cutout: None,
             led: LedRuntime::default(),
             midi: MidiRuntime::default(),
+            laser: LaserRuntime::default(),
+            net: NetRuntime::default(),
             midi_setup: crate::midi::MidiSetup::default(),
             blackout: false,
             blackout_level: 0.0,
@@ -326,6 +354,9 @@ impl OzApp {
         }
         app.rhythm.band = session.rhythm_band;
         app.midi_setup = session.midi.clone();
+        app.led.live = session.leds_live;
+        app.led.dmx_live = session.dmx_live;
+        app.net.settings = session.net.clone();
         if session.rhythm_source != rhythm::Source::Off {
             app.rhythm.set_source(session.rhythm_source.clone());
         }
@@ -372,15 +403,10 @@ impl eframe::App for OzApp {
         self.tick(&ctx);
         self.midi_tick(&ctx);
         self.leds_tick(&ctx);
-        // TEMP-DEBUG-REC
-        if let Ok(path) = std::env::var("OZ_DEBUG_REC") {
-            if self.recorder.is_none() && ctx.cumulative_frame_nr() == 30 {
-                if let Ok(r) = recorder::Recorder::start(std::path::Path::new(&path), (960, 540), 30, 20.0) {
-                    self.recorder = Some(Arc::new(Mutex::new(r)));
-                }
-            }
-        }
+        self.laser_tick(&ctx);
+        self.net_tick(&ctx);
         if self.cutout.is_none() {
+            self.drone_keys(&ctx);
             self.scene_shortcuts(&ctx);
             self.handle_shortcuts(&ctx);
         }
@@ -418,6 +444,8 @@ impl eframe::App for OzApp {
                     let rec_result = self.rec_result.lock().unwrap().clone();
                     if let Some(s) = &self.status {
                         ui.label(egui::RichText::new(with_icon(ic::PROHIBIT, s)).color(theme::DANGER));
+                    } else if let Some(n) = self.net_notice() {
+                        ui.label(egui::RichText::new(with_icon(ic::WIFI_HIGH, n)).color(ACCENT));
                     } else if let Some(Ok(path)) = &rec_result {
                         ui.label(egui::RichText::new(with_icon(ic::CHECK_SQUARE, &format!("Vidéo enregistrée : {}", file_name(path)))).color(ACCENT));
                         if ui.small_button("Afficher le fichier").clicked() {
@@ -434,7 +462,7 @@ impl eframe::App for OzApp {
                     } else if self.right_tab == RightTab::Leds {
                         ui.label(
                             egui::RichText::new(format!(
-                                "Scène 3D :  flèches déplacer (Maj ×10)  ·  PgHaut/PgBas monter/descendre  ·  Q/E ou [ ] tourner de 15°  ·  Suppr supprimer  ·  {CMD}+D dupliquer  ·  D dessiner un tracé  ·  V changer de vue  ·  Échap désélectionner"
+                                "Scène 3D :  flèches : haut, bas, gauche, droite (Maj ×10)  ·  PgHaut/PgBas : profondeur  ·  Q/E ou [ ] tourner de 15°  ·  Suppr supprimer  ·  {CMD}+D dupliquer  ·  D dessiner un tracé  ·  V changer de vue  ·  Échap désélectionner"
                             ))
                             .small()
                             .color(TEXT_WEAK),
@@ -473,22 +501,31 @@ impl eframe::App for OzApp {
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
                 self.leds_capture(ui);
-                if self.right_tab == RightTab::Leds {
-                    self.leds_central(ui);
-                } else {
-                    self.preview(ui);
-                }
+                // Sortie, scène 3D ou les deux, quel que soit l'onglet de droite.
+                self.leds_central(ui);
             });
 
         self.media_drag_preview(&ctx);
         self.cutout_window(&ctx);
 
         self.undo_end(&ctx);
+        // Sorties 2 et suivantes : chacune sa fenêtre.
+        self.sync_outputs();
+        for k in 1..self.outs.len() {
+            if self.outs[k].open {
+                let title = format!("OZ Mapping — {}", self.project.outputs[k].name);
+                ctx.show_viewport_immediate(
+                    extra_viewport_id(k),
+                    ViewportBuilder::default().with_title(title).with_inner_size([960.0, 540.0]),
+                    |ui, _class| self.extra_output_window(ui, k),
+                );
+            }
+        }
         if self.output_open {
             ctx.show_viewport_immediate(
                 output_viewport_id(),
                 ViewportBuilder::default()
-                    .with_title("OZ Mapping — Sortie")
+                    .with_title(format!("OZ Mapping — {}", self.project.outputs.first().map_or("Sortie", |o| o.name.as_str())))
                     .with_inner_size([960.0, 540.0]),
                 |ui, _class| self.output_window(ui),
             );
@@ -505,8 +542,16 @@ impl eframe::App for OzApp {
             rhythm_band: self.rhythm.band,
             bpm: Some(self.rhythm.tempo.bpm),
             midi: self.midi_setup.clone(),
+            leds_live: self.led.live,
+            dmx_live: self.led.dmx_live,
+            net: self.net.settings.clone(),
         };
         eframe::set_value(storage, eframe::APP_KEY, &session);
+    }
+
+    /// Session enregistrée toutes les 5 s : après un crash, on repart de là.
+    fn auto_save_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(5)
     }
 
     fn on_exit(&mut self, gl: Option<&glow::Context>) {
