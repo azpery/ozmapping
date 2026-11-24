@@ -709,10 +709,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(a.peers().len(), 1);
-        b.send_all(&Msg::Want);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Renvoyé jusqu'à l'arrivée : si les deux se sont aussi trouvés par la diffusion (réseau
+        // de la machine de test), l'une des deux connexions est fermée et ce qui y passait est
+        // perdu — dans l'app, l'état est renvoyé en continu.
+        let deadline = Instant::now() + Duration::from_secs(8);
         let mut got = false;
+        let mut sent = Instant::now() - Duration::from_secs(1);
         while !got && Instant::now() < deadline {
+            if sent.elapsed() >= Duration::from_millis(400) {
+                b.send_all(&Msg::Want);
+                sent = Instant::now();
+            }
             if let Ok(Event::Msg { msg: Msg::Want, .. }) = a.events.recv_timeout(Duration::from_millis(100)) {
                 got = true;
             }
