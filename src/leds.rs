@@ -663,10 +663,18 @@ pub enum SurfaceKind {
     Rock,
     /// Barrière : poteaux et deux lisses.
     Fence,
+    /// Caisson d'infra à pavillon replié (21 pouces) : grande bouche en fente en bas de la façade.
+    InfraMth,
+    /// Bass bin « scoop » (18 pouces) : haut-parleur en haut, la courbe du scoop dessous.
+    SuperScoop,
+    /// Kick « Cubo » (15 pouces) : caisson presque cubique à court pavillon ; la membrane bat sur les temps.
+    CuboKick,
+    /// Tête MT 130 : deux pavillons médium et un pavillon d'aigus au-dessus.
+    Mt130,
 }
 
 impl SurfaceKind {
-    pub const ALL: [SurfaceKind; 24] = [
+    pub const ALL: [SurfaceKind; 28] = [
         SurfaceKind::Screen,
         SurfaceKind::Box,
         SurfaceKind::Stage,
@@ -691,6 +699,10 @@ impl SurfaceKind {
         SurfaceKind::Lamp,
         SurfaceKind::Rock,
         SurfaceKind::Fence,
+        SurfaceKind::InfraMth,
+        SurfaceKind::SuperScoop,
+        SurfaceKind::CuboKick,
+        SurfaceKind::Mt130,
     ];
 
     pub fn name(self) -> &'static str {
@@ -719,6 +731,10 @@ impl SurfaceKind {
             SurfaceKind::Lamp => "Lampadaire",
             SurfaceKind::Rock => "Rocher",
             SurfaceKind::Fence => "Barrière",
+            SurfaceKind::InfraMth => "Infra MTH 21\"",
+            SurfaceKind::SuperScoop => "Super Scoop 18\"",
+            SurfaceKind::CuboKick => "Cubo Kick 15\"",
+            SurfaceKind::Mt130 => "Tête MT 130",
         }
     }
 }
@@ -997,6 +1013,11 @@ impl Surface {
             ("Canapé", deco(SurfaceKind::Sofa, [0.0, 0.0, mid + 1.5], [2.0, 0.85, 0.9], [72, 82, 112])),
             ("Bar", deco(SurfaceKind::Bar, [side, 0.0, mid], [3.0, 1.1, 0.6], [58, 44, 34])),
             ("Lampadaire", deco(SurfaceKind::Lamp, [-side, 0.0, mid + 1.0], [0.45, 1.7, 0.45], [246, 226, 172])),
+            // Enceintes de sound system (dimensions approchées, à ajuster).
+            ("Infra MTH 21\"", deco(SurfaceKind::InfraMth, [-side, 0.0, (room[1] - 1.5).max(1.0)], [0.8, 1.25, 1.0], [32, 32, 36])),
+            ("Super Scoop Mogale 18\"", deco(SurfaceKind::SuperScoop, [-side + 0.9, 0.0, (room[1] - 1.5).max(1.0)], [0.62, 0.95, 0.85], [32, 32, 36])),
+            ("Cubo Kick 15\"", deco(SurfaceKind::CuboKick, [-side, 1.25, (room[1] - 1.5).max(1.0)], [0.56, 0.56, 0.62], [32, 32, 36])),
+            ("Tête MT 130", deco(SurfaceKind::Mt130, [-side, 1.81, (room[1] - 1.5).max(1.0)], [0.56, 0.72, 0.6], [32, 32, 36])),
         ]
     }
 }
@@ -1058,10 +1079,87 @@ impl Surface {
             }
         }
         // Formes rondes (troncs, feuillages, pots…) : facettes sans contour.
-        for (quad, color) in self.curved() {
+        for (quad, color) in self.curved(beat) {
             faces.push(Face3 { quad: quad.map(|p| self.world(p)), color, output: false, uv: full, edges: 0 });
         }
         faces
+    }
+
+    /// Enceintes de sound system : caisson et façade (bouches de pavillons en retrait, en marches
+    /// pour l'évasement). Les haut-parleurs ronds sont dans `curved`.
+    fn speaker_blocks(&self, _beat: f32) -> Vec<Block> {
+        let [w, h, d] = self.size;
+        let (hw, hd) = (w / 2.0, d / 2.0);
+        let dark = [14, 14, 16];
+        let inner = [26, 26, 30];
+        let t = 0.025;
+        let mut b = vec![([-hw, 0.0, -hd + t], [hw, h, hd], self.color, false)];
+        // Bouche de pavillon : cadre de la façade autour d'un creux qui s'évase vers l'avant.
+        let mouth = |b: &mut Vec<Block>, x0: f32, y0: f32, x1: f32, y1: f32| {
+            let steps = 3;
+            for k in 0..steps {
+                let f = k as f32 / steps as f32;
+                let (ix, iy) = ((x1 - x0) * 0.12 * f, (y1 - y0) * 0.12 * f);
+                let z0 = -hd + t + 0.04 * k as f32;
+                let col = if k == 0 { dark } else { inner };
+                // Quatre bords du creux à cette profondeur.
+                let e = 0.02;
+                b.push(([x0 + ix, y0 + iy, z0], [x0 + ix + e, y1 - iy, z0 + 0.04], col, false));
+                b.push(([x1 - ix - e, y0 + iy, z0], [x1 - ix, y1 - iy, z0 + 0.04], col, false));
+                b.push(([x0 + ix, y0 + iy, z0], [x1 - ix, y0 + iy + e, z0 + 0.04], col, false));
+                b.push(([x0 + ix, y1 - iy - e, z0], [x1 - ix, y1 - iy, z0 + 0.04], col, false));
+            }
+            // Fond du pavillon.
+            let (ix, iy) = ((x1 - x0) * 0.36, (y1 - y0) * 0.36);
+            b.push(([x0 + ix, y0 + iy, -hd + t + 0.12], [x1 - ix, y1 - iy, -hd + t + 0.13], dark, false));
+        };
+        // Cadre de façade (le reste de la face avant).
+        let face = |b: &mut Vec<Block>, holes: &[(f32, f32, f32, f32)]| {
+            let _ = holes;
+            b.push(([-hw, 0.0, -hd], [hw, 0.03, -hd + t], self.color, false));
+            b.push(([-hw, h - 0.03, -hd], [hw, h, -hd + t], self.color, false));
+            b.push(([-hw, 0.0, -hd], [-hw + 0.03, h, -hd + t], self.color, false));
+            b.push(([hw - 0.03, 0.0, -hd], [hw, h, -hd + t], self.color, false));
+        };
+        match self.kind {
+            SurfaceKind::InfraMth => {
+                // Grande fente en bas (sortie du pavillon replié), façade pleine au-dessus.
+                let slot = (h * 0.32).max(0.15);
+                mouth(&mut b, -hw + 0.05, 0.05, hw - 0.05, slot);
+                b.push(([-hw, slot, -hd], [hw, h, -hd + t], shade(self.color, 1.08), false));
+                face(&mut b, &[]);
+            }
+            SurfaceKind::SuperScoop => {
+                // Scoop : marches qui descendent en s'avançant sous le haut-parleur (la courbe).
+                let n = 7;
+                let top = h * 0.5;
+                for k in 0..n {
+                    let f = (k as f32 + 1.0) / n as f32;
+                    let y = top * (1.0 - f);
+                    let z = -hd + t + d * 0.55 * (1.0 - (f * std::f32::consts::FRAC_PI_2).sin());
+                    b.push(([-hw + 0.04, y, z], [hw - 0.04, y + top / n as f32 + 0.005, hd - 0.05], inner, false));
+                }
+                b.push(([-hw, top, -hd], [hw, h, -hd + t], shade(self.color, 1.08), false));
+                b.push(([-hw, 0.0, -hd], [-hw + 0.04, top, hd], self.color, false));
+                b.push(([hw - 0.04, 0.0, -hd], [hw, top, hd], self.color, false));
+            }
+            SurfaceKind::CuboKick => {
+                mouth(&mut b, -hw + 0.04, 0.04, hw - 0.04, h - 0.04);
+                face(&mut b, &[]);
+            }
+            SurfaceKind::Mt130 => {
+                // Deux pavillons médium côte à côte, le pavillon d'aigus au-dessus.
+                let split = h * 0.62;
+                mouth(&mut b, -hw + 0.03, 0.03, -0.01, split);
+                mouth(&mut b, 0.01, 0.03, hw - 0.03, split);
+                mouth(&mut b, -hw * 0.75, split + 0.03, hw * 0.75, h - 0.03);
+                b.push(([-hw, split, -hd], [-hw * 0.75, h, -hd + t], self.color, false));
+                b.push(([hw * 0.75, split, -hd], [hw, h, -hd + t], self.color, false));
+                face(&mut b, &[]);
+            }
+            _ => {}
+        }
+        b
     }
 
     /// Pierres du mur, en rangs décalés, de tailles et de teintes variées, sur un fond de joints.
@@ -1102,7 +1200,7 @@ impl Surface {
     }
 
     /// Facettes des formes rondes, en coordonnées locales (le bas de l'objet en y = 0).
-    fn curved(&self) -> Vec<([[f32; 3]; 4], [u8; 3])> {
+    fn curved(&self, beat: f32) -> Vec<([[f32; 3]; 4], [u8; 3])> {
         let [w, h, d] = self.size;
         let mut q = Vec::new();
         let id = self.id;
@@ -1153,6 +1251,27 @@ impl Surface {
                 tube(&mut q, [0.0, 0.03, 0.0], [0.0, h * 0.82, 0.0], 0.015, 0.015, 6, metal);
                 tube(&mut q, [0.0, h * 0.72, 0.0], [0.0, h, 0.0], w * 0.5, w * 0.32, 16, self.color);
                 blob(&mut q, [0.0, h * 0.78, 0.0], [w * 0.1; 3], [255, 244, 210], (id, 0, 0.0));
+            }
+            SurfaceKind::SuperScoop | SurfaceKind::CuboKick => {
+                // Haut-parleur vu de face : saladier et cône, qui avance sur les temps (le kick).
+                let kick = 0.03 * (-(beat.fract()) * 7.0).exp();
+                let [_, _, dd] = self.size;
+                let (cy, r, z) = if self.kind == SurfaceKind::SuperScoop {
+                    (h * 0.75, (w.min(h * 0.5) * 0.4).max(0.05), -dd / 2.0 + 0.03)
+                } else {
+                    (h * 0.5, (w.min(h) * 0.3).max(0.05), -dd / 2.0 + 0.16)
+                };
+                let n = 24;
+                let ring = |rr: f32, zz: f32, k: usize| {
+                    let a = k as f32 / n as f32 * std::f32::consts::TAU;
+                    [a.cos() * rr, cy + a.sin() * rr, zz]
+                };
+                for k in 0..n {
+                    // Suspension (anneau clair), cône sombre jusqu'au cache-noyau.
+                    q.push(([ring(r, z - 0.005, k), ring(r, z - 0.005, k + 1), ring(r * 0.88, z - 0.01 - kick * 0.5, k + 1), ring(r * 0.88, z - 0.01 - kick * 0.5, k)], [60, 60, 66]));
+                    q.push(([ring(r * 0.88, z - 0.01 - kick * 0.5, k), ring(r * 0.88, z - 0.01 - kick * 0.5, k + 1), ring(r * 0.25, z + 0.04 - kick, k + 1), ring(r * 0.25, z + 0.04 - kick, k)], [20, 20, 24]));
+                    q.push(([ring(r * 0.25, z + 0.04 - kick, k), ring(r * 0.25, z + 0.04 - kick, k + 1), [0.0, cy, z + 0.02 - kick], [0.0, cy, z + 0.02 - kick]], [40, 40, 46]));
+                }
             }
             SurfaceKind::Rock => {
                 blob(&mut q, [0.0, h * 0.45, 0.0], [w * 0.5, h * 0.55, d * 0.5], self.color, (id, 0, 0.3));
@@ -1409,6 +1528,7 @@ impl Surface {
                     ([-hw, 0.0, -hd], [hw, 0.08, -hd + 0.05], shade(self.color, 0.6), false),
                 ]
             }
+            SurfaceKind::InfraMth | SurfaceKind::SuperScoop | SurfaceKind::CuboKick | SurfaceKind::Mt130 => self.speaker_blocks(beat),
             SurfaceKind::Fence => {
                 let mut b = Vec::new();
                 let n = ((w / 1.0).ceil() as usize).max(1);

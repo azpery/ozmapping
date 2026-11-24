@@ -571,7 +571,7 @@ impl OzApp {
         let tex_of = |k: usize| self.led.screen_tex.get(&k.min(n_out - 1)).map(|t| t.0.id());
         // Les personnages dansent sur le tempo de l'onglet Rythme.
         let beat = self.rhythm.tempo.beat_at(self.clock()) as f32;
-        if self.project.leds.surfaces.iter().any(|s| matches!(s.kind, leds::SurfaceKind::Crowd | leds::SurfaceKind::Sub) || (s.kind == leds::SurfaceKind::Booth && s.dj)) {
+        if self.project.leds.surfaces.iter().any(|s| matches!(s.kind, leds::SurfaceKind::Crowd | leds::SurfaceKind::Sub | leds::SurfaceKind::SuperScoop | leds::SurfaceKind::CuboKick) || (s.kind == leds::SurfaceKind::Booth && s.dj)) {
             ui.ctx().request_repaint();
         }
         let set = self.led.selected_set.unwrap_or(u32::MAX);
