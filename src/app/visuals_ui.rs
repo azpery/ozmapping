@@ -43,14 +43,17 @@ impl OzApp {
             );
         }
         sec.show(ui, 0, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for p in Pattern::ALL.into_iter().filter(|p| *p != Pattern::Off) {
-                    let resp = ui.selectable_label(g.pattern == p, p.label()).on_hover_text(p.description());
-                    if resp.clicked() {
-                        g.pattern = p;
+            for (title, patterns) in Pattern::by_family() {
+                family_title(ui, title);
+                ui.horizontal_wrapped(|ui| {
+                    for p in patterns {
+                        let resp = ui.selectable_label(g.pattern == p, p.label()).on_hover_text(p.description());
+                        if resp.clicked() {
+                            g.pattern = p;
+                        }
                     }
-                }
-            });
+                });
+            }
         });
         sec.show(ui, 1, |ui| {
             ui.horizontal_wrapped(|ui| {

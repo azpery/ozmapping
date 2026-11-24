@@ -128,6 +128,14 @@ impl OzApp {
             {
                 self.add_media(files);
             }
+            if ui
+                .button(with_icon(ic::FOLDER, "Dossier"))
+                .on_hover_text("Ajouter un dossier par référence : ses vidéos et photos, sous-dossiers compris, apparaissent ici et suivent ce qu'on y dépose ou retire (rien n'est copié). On peut aussi glisser un dossier sur la fenêtre.")
+                .clicked()
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                self.add_media_folder(dir);
+            }
             });
         });
         ui.label(
@@ -149,7 +157,7 @@ impl OzApp {
             .max_height(ui.available_height() * 0.5)
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                if media.is_empty() {
+                if media.is_empty() && self.project.media_folders.is_empty() {
                     theme::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.vertical_centered(|ui| {
@@ -278,6 +286,8 @@ impl OzApp {
                         to_cue = Some(i);
                     }
                 }
+                // Dossiers suivis, sous les médias ajoutés un par un.
+                self.media_folders_ui(ui);
             });
         if let Some(i) = to_cue {
             self.cue_media(&ctx, &media[i]);
@@ -320,9 +330,12 @@ impl OzApp {
         let size = Vec2::new(70.0, 40.0);
         let mut launch = None;
         egui::ScrollArea::vertical().id_salt("generated").max_height(150.0).auto_shrink([false, true]).show(ui, |ui| {
+            for (title, patterns) in Pattern::by_family() {
+            family_title(ui, title);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = Vec2::splat(4.0);
-                for p in Pattern::ALL.into_iter().filter(|p| *p != Pattern::Off) {
+                let has_chem = patterns.contains(&Pattern::Chemistry);
+                for p in patterns {
                     // Calques qui affichent ce motif.
                     let on_layers: Vec<String> = self
                         .project
@@ -357,14 +370,39 @@ impl OzApp {
                         egui::DragAndDrop::set_payload(&ctx, MediaDrag::Pattern(p));
                     }
                     if resp.clicked() {
-                        launch = Some(p);
+                        launch = Some(MediaDrag::Pattern(p));
+                    }
+                }
+                // Avec la chimie de l'iPad : son dessin, à poser aussi sur une case.
+                if has_chem {
+                    let on_layers: Vec<String> =
+                        self.project.layers.iter().enumerate().filter(|(_, l)| l.sketch).map(|(k, _)| format!("C{}", k + 1)).collect();
+                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
+                    let painter = ui.painter();
+                    paint_drawing_swatch(painter, rect);
+                    let band = Rect::from_min_max(egui::pos2(rect.min.x, rect.max.y - 14.0), rect.max);
+                    painter.rect_filled(band, 0.0, Color32::from_black_alpha(170));
+                    painter.text(band.left_center() + Vec2::new(3.0, 0.0), egui::Align2::LEFT_CENTER, DRAWING_NAME, egui::FontId::proportional(10.0), TEXT);
+                    let stroke = if !on_layers.is_empty() { Stroke::new(2.0, ACCENT) } else if resp.hovered() { Stroke::new(1.0, TEXT) } else { Stroke::new(1.0, theme::BORDER) };
+                    painter.rect_stroke(rect, 4.0, stroke, egui::StrokeKind::Inside);
+                    let mut hover = format!("{DRAWING_NAME}\nLe dessin fait sur l'iPad (traits et photos posées dedans), en direct. À glisser sur une case du tableau.");
+                    if !on_layers.is_empty() {
+                        hover.push_str(&format!("\nSur : {}", on_layers.join(" ")));
+                    }
+                    let resp = resp.on_hover_text(hover);
+                    if resp.drag_started() {
+                        egui::DragAndDrop::set_payload(&ctx, MediaDrag::Drawing);
+                    }
+                    if resp.clicked() {
+                        launch = Some(MediaDrag::Drawing);
                     }
                 }
             });
+            }
         });
-        if let Some(p) = launch {
+        if let Some(m) = launch {
             let sel = self.sel();
-            self.launch_any(&ctx, sel, &MediaDrag::Pattern(p));
+            self.launch_any(&ctx, sel, &m);
         }
     }
 
@@ -472,8 +510,10 @@ impl OzApp {
                 for (tab, icon, name) in [
                     (RightTab::Effects, ic::SPARKLE, "Effets"),
                     (RightTab::Visuals, ic::SUN, "Visuels"),
+                    (RightTab::Sketch, ic::PENCIL_SIMPLE, "Dessin"),
                     (RightTab::Photo, ic::IMAGE, "Photo"),
                     (RightTab::Shape, ic::POLYGON, "Forme"),
+                    (RightTab::Layout, ic::PROJECTOR_SCREEN, "Dispo."),
                     (RightTab::Mix, ic::FILM_REEL, "Mix"),
                     (RightTab::Rhythm, ic::WAVES, "Rythme"),
                     (RightTab::Leds, ic::LIGHTBULB, "LEDs"),
@@ -492,7 +532,7 @@ impl OzApp {
     /// Contenu de l'onglet latéral choisi, avec ses onglets horizontaux.
     pub(super) fn settings_pane(&mut self, ui: &mut egui::Ui) {
         // Les LEDs ne dépendent pas du calque sélectionné.
-        if !matches!(self.right_tab, RightTab::Leds | RightTab::Dmx | RightTab::Laser | RightTab::Midi) {
+        if !matches!(self.right_tab, RightTab::Leds | RightTab::Dmx | RightTab::Laser | RightTab::Midi | RightTab::Layout) {
             self.layer_badge(ui);
         }
         self.settings_body(ui);
@@ -551,6 +591,8 @@ impl OzApp {
                 RightTab::Dmx => self.dmx_ui(ui),
                 RightTab::Laser => self.laser_ui(ui),
                 RightTab::Midi => self.midi_ui(ui),
+                RightTab::Sketch => self.sketch_ui(ui),
+                RightTab::Layout => self.layout_ui(ui),
             });
         // Un effet vient d'être choisi sur un calque qui ne se voit pas : on le signale.
         // (« Aucun » ne compte pas : retirer les effets d'un calque caché n'a rien d'étonnant.)

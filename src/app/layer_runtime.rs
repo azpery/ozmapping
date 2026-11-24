@@ -13,6 +13,8 @@ pub(super) struct FxAnim {
 /// État d'exécution d'un calque (sa configuration est dans `Project::layers`).
 #[derive(Default)]
 pub(super) struct LayerRuntime {
+    /// Identifiant stable du calque pour le rendu (0 : pas encore attribué, voir `uid`).
+    pub(super) uid: u64,
     pub(super) current: Option<VideoPlayer>,
     pub(super) next: Option<VideoPlayer>,
     pub(super) fade: f32,
@@ -52,6 +54,12 @@ pub(super) struct LayerRuntime {
     /// Taches de peinture : cadence des gouttes, et gouttes de l'image en cours.
     pub(super) paint: crate::paint::Spawner,
     pub(super) paint_draw: crate::paint::PaintDraw,
+    /// Chimie : ce que l'iPad a versé (en attente) et ce que le bassin reçoit sur l'image en cours.
+    pub(super) chem: crate::chem::ChemState,
+    /// Bassin enregistré déjà repris (à l'ouverture), dernière photo du bassin (horloge de l'app).
+    pub(super) chem_restored: bool,
+    pub(super) chem_saved_at: f64,
+    pub(super) chem_draw: crate::chem::ChemDraw,
     /// Route cartoon : tracé de la route, et ce qu'on en dessine sur l'image en cours.
     pub(super) road: crate::road::Track,
     pub(super) road_draw: crate::road::RoadDraw,

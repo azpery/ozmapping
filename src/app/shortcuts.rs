@@ -4,6 +4,7 @@ use super::*;
 
 impl OzApp {
     pub(super) fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        self.corner_keys(ctx);
         let cmd = |shift: bool, key: Key| {
             let mods = if shift { Modifiers::COMMAND | Modifiers::SHIFT } else { Modifiers::COMMAND };
             ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(mods, key)))

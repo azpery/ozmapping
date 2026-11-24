@@ -104,20 +104,20 @@ impl OzApp {
     }
 
     pub(super) fn launch_media(&mut self, ctx: &egui::Context, index: usize) {
-        if let Some(path) = self.project.media.get(index).cloned() {
+        if let Some(path) = self.media_folders.all.get(index).cloned() {
             // Une vidéo envoyée remplace le visuel généré du calque.
             self.launch_any(ctx, self.sel(), &MediaDrag::File(path));
         }
     }
 
     pub(super) fn launch_relative(&mut self, ctx: &egui::Context, delta: isize) {
-        let n = self.project.media.len() as isize;
+        let n = self.media_folders.all.len() as isize;
         if n == 0 {
             return;
         }
         let current = self.layers[self.sel()]
             .active()
-            .and_then(|p| self.project.media.iter().position(|m| *m == p.path));
+            .and_then(|p| self.media_folders.all.iter().position(|m| *m == p.path));
         let i = current.map_or(0, |i| (i as isize + delta).rem_euclid(n));
         self.launch_media(ctx, i as usize);
     }
@@ -165,7 +165,9 @@ impl OzApp {
     /// Générateur : passe le calque `i` sur un autre motif (et souvent une autre palette) au hasard.
     pub(super) fn generator_next(&mut self, i: usize) {
         let g = self.project.layers[i].generator;
-        let patterns: Vec<Pattern> = Pattern::ALL.into_iter().filter(|p| *p != Pattern::Off && *p != g.pattern).collect();
+        // Pas « Chimie » au hasard : le bassin reste noir tant que l'iPad n'y a rien versé.
+        let patterns: Vec<Pattern> =
+            Pattern::ALL.into_iter().filter(|p| *p != Pattern::Off && *p != Pattern::Chemistry && *p != g.pattern).collect();
         let pattern = patterns[(self.next_random() % patterns.len() as u64) as usize];
         let palette = if self.next_random() % 10 < 7 {
             Palette::ALL[(self.next_random() % Palette::ALL.len() as u64) as usize]
@@ -220,7 +222,15 @@ impl OzApp {
             }
         }
 
-        for (rt, cfg) in self.layers.iter_mut().zip(&mut self.project.layers) {
+        let shown: Vec<bool> =
+            (0..self.project.layers.len()).map(|i| self.project.layer_visible(i) && self.project.layer_opacity(i) > 0.0).collect();
+        for ((rt, cfg), shown) in self.layers.iter_mut().zip(&mut self.project.layers).zip(shown) {
+            // Calque qui ne se voit pas (masqué, lui ou son groupe, opacité nulle, ou remplacé par
+            // le dessin) : sa vidéo n'est plus décodée, sa position continue d'avancer.
+            let hidden = !shown || cfg.sketch;
+            for p in rt.players() {
+                p.set_hidden(hidden);
+            }
             // Fondu enchaîné : démarre dès que la nouvelle vidéo a sa première image.
             if rt.next.as_ref().is_some_and(|n| n.has_frame()) {
                 let secs = rt.fade_secs.unwrap_or(self.project.fade_secs);
@@ -303,6 +313,16 @@ impl OzApp {
                 detail: g.detail,
             };
             rt.paint_draw = rt.paint.step(rhythm_on.then_some(&pulse), dt, g.speed, &look, &mut rand);
+        }
+        // Chimie : les gouttes versées depuis l'iPad entrent dans le bassin (quelques-unes par image).
+        let beat = if rhythm_on { self.beat_env() } else { 0.0 };
+        for rt in &mut self.layers {
+            if rt.gen_shown.0 == Pattern::Chemistry || rt.gen_from.0 == Pattern::Chemistry {
+                // Le bassin vibre avec le son (rien sans entrée audio ni tempo).
+                let sound = if rhythm_on { [pulse.level, pulse.bass, pulse.high] } else { [0.0; 3] };
+                rt.chem.hear(sound, dt);
+                rt.chem_draw = rt.chem.step(dt, beat, rhythm_on && pulse.beat);
+            }
         }
         // Route cartoon : la route avance, la météo et les éclairs suivent.
         for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
@@ -429,11 +449,6 @@ impl OzApp {
         react.enabled && n(react) > 0 && self.rhythm.active() && self.rhythm.source != rhythm::Source::Manual
     }
 
-    /// Image de la sortie 1 (enregistrement, LEDs par défaut).
-    pub(super) fn draw_params(&mut self) -> DrawParams {
-        self.draw_params_for(0)
-    }
-
     /// Image d'une sortie : les calques qui lui sont attribués.
     pub(super) fn draw_params_for(&mut self, out: usize) -> DrawParams {
         let mut layers = Vec::new();
@@ -447,22 +462,47 @@ impl OzApp {
         let pulse = self.rhythm.pulse;
         // Champ de forme : moitié de la définition du masque (il varie en douceur).
         let shape_size = (mask_size.0 / 2, mask_size.1 / 2);
-        for (rt, cfg) in self.layers.iter_mut().zip(&self.project.layers) {
-            if !cfg.visible || cfg.opacity <= 0.0 || cfg.output.min(n_out - 1) != out {
+        let sketch = self.sketch_source();
+        let group_lights = self.group_lights();
+        for (li, (rt, cfg)) in self.layers.iter_mut().zip(&self.project.layers).enumerate() {
+            // Visibilité et opacité du groupe comprises.
+            let mut opacity = self.project.layer_opacity(li);
+            if !self.project.layer_visible(li) || opacity <= 0.0 || cfg.output.min(n_out - 1) != out {
                 continue;
             }
-            let effects = if self.bypass_fx {
+            let mut effects = if self.bypass_fx {
                 Effects::default()
             } else if cfg.react.enabled && rhythm_on {
                 cfg.react.apply(&cfg.effects, &pulse, &rt.beat)
             } else {
                 cfg.effects
             };
+            // Effet de son groupe : lumière et couleur de ce calque à cet instant.
+            if let Some(Some((light, fx))) = group_lights.get(li) {
+                opacity *= fx.dim + (1.0 - fx.dim) * light.level;
+                if fx.palette != crate::group_fx::GroupPalette::White && fx.tint > 0.0 {
+                    effects.tint = light.color;
+                    effects.tint_amount = effects.tint_amount.max(fx.tint);
+                }
+                effects.brightness += 0.12 * light.level;
+                if opacity <= 0.001 {
+                    continue;
+                }
+            }
             let feather = cfg.mask.feather / out_size.y.max(1.0) / 2.0;
+            // Dessin à distance : il remplace la vidéo du calque.
+            let drawn = sketch.as_ref().filter(|_| cfg.sketch);
+            if rt.uid == 0 {
+                rt.uid = video::new_source_uid();
+            }
             layers.push(LayerDraw {
-                a: rt.current.as_ref().map(source),
-                b: rt.next.as_ref().map(source),
-                mix: rt.fade.clamp(0.0, 1.0),
+                id: rt.uid,
+                // Calque du dessin sans serveur (onglet fermé, rien de dessiné) : pas d'image, et
+                // surtout pas la vidéo (non décodée) qu'il remplace.
+                a: drawn.cloned().or_else(|| rt.current.as_ref().filter(|_| !cfg.sketch).map(source)),
+                src_alpha: drawn.is_some(),
+                b: if cfg.sketch { None } else { rt.next.as_ref().map(source) },
+                mix: if drawn.is_some() { 0.0 } else { rt.fade.clamp(0.0, 1.0) },
                 mesh: rt.mesh(&cfg.warp),
                 mask: cfg
                     .mask
@@ -485,6 +525,7 @@ impl OzApp {
                     paint: rt.paint_draw,
                     road: rt.road_draw,
                     face: rt.face_draw,
+                    chem: rt.chem_draw,
                 },
                 face_photo: rt.face_photo.as_ref().and_then(|(_, p)| p.clone()).filter(|_| rt.face_draw.photo != 0),
                 // Destruction : réglage manuel, boucle ou « Casser ! », le plus avancé des trois.
@@ -494,7 +535,7 @@ impl OzApp {
                     .max(rt.shatter_shot.map_or(0.0, Effects::shatter_cycle)),
                 shatter_center: if cfg.mask.is_active() { cfg.mask.centroid() } else { [0.5, 0.5] },
                 effects,
-                opacity: cfg.opacity,
+                opacity,
                 blend: cfg.blend,
                 fit: cfg.fit,
                 media_rotate: cfg.media_rotate,
@@ -508,6 +549,40 @@ impl OzApp {
             time: self.start.elapsed().as_secs_f32(),
             master: self.project.master * (1.0 - self.blackout_level),
             white: self.white_screen || self.cutout.as_ref().is_some_and(|ed| ed.white),
+        }
+    }
+
+    /// Effets de groupe : pour chaque calque d'un groupe animé, sa lumière et l'effet du groupe.
+    pub(super) fn group_lights(&self) -> Vec<Option<(crate::group_fx::Light, crate::group_fx::GroupEffect)>> {
+        let mut out = vec![None; self.project.layers.len()];
+        let now = self.clock();
+        let beats = self.rhythm.tempo.beat_at(now);
+        let sound = if self.rhythm.active() { self.rhythm.pulse.level } else { 0.0 };
+        for g in &self.project.groups {
+            let fx = g.fx;
+            if fx.kind == crate::group_fx::GroupFx::Off {
+                continue;
+            }
+            let members = self.project.group_members(g.id);
+            let n = members.len();
+            let phase = if fx.sync { beats } else { now } * f64::from(fx.speed.max(0.01));
+            for (pos, &li) in members.iter().enumerate() {
+                // La liste montre le haut d'abord : « vers le bas » part du calque le plus haut.
+                let k = if fx.upward { pos } else { n - 1 - pos };
+                out[li] = Some((fx.light(k, n, phase, sound), fx));
+            }
+        }
+        out
+    }
+
+    /// Battement des temps (0..1, 1 sur le temps puis décroît) : rythme actif, sinon tempo tapé.
+    pub(super) fn beat_env(&self) -> f32 {
+        if self.rhythm.active() {
+            self.rhythm.pulse.env
+        } else {
+            let t = &self.rhythm.tempo;
+            let since = t.beat_at(self.clock()).rem_euclid(1.0) * 60.0 / f64::from(t.bpm.max(1.0));
+            (-(since as f32) * 7.0).exp()
         }
     }
 

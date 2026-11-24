@@ -3,6 +3,8 @@
 
 mod app;
 mod automix;
+mod chem;
+mod chem_gpu;
 mod cpu;
 mod cutout;
 mod dmx;
@@ -10,6 +12,7 @@ mod effects;
 mod face;
 mod face_mesh;
 mod generator;
+mod group_fx;
 mod icons;
 mod laser;
 mod leds;
@@ -22,10 +25,13 @@ mod recorder;
 mod renderer;
 mod rhythm;
 mod road;
+mod room;
 mod screens;
+mod sketch;
 mod surface;
 mod theme;
 mod thumbs;
+mod tls;
 mod video;
 
 use eframe::egui;

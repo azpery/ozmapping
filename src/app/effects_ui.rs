@@ -315,13 +315,24 @@ impl OzApp {
         let mut apply: Option<(Option<String>, Effects)> = None;
         let mut auto_next = false;
         sec.show(ui, 0, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                for p in &self.builtin_presets {
-                    if ui.selectable_label(is_active(p), &p.name).clicked() {
-                        apply = Some((Some(p.name.clone()), p.effects));
-                    }
+            // Rangés par famille (un preset intégré inconnu de la liste va dans « Autres »).
+            let families = effects::PRESET_FAMILIES.iter().map(|f| (*f, Some(f))).chain([("Autres", None)]);
+            for (k, (title, _)) in families.enumerate() {
+                let family = (k < effects::PRESET_FAMILIES.len()).then_some(k);
+                let items: Vec<&Preset> = self.builtin_presets.iter().filter(|p| effects::preset_family(&p.name) == family).collect();
+                if items.is_empty() {
+                    continue;
                 }
-            });
+                family_title(ui, title);
+                ui.horizontal_wrapped(|ui| {
+                    for p in items {
+                        if ui.selectable_label(is_active(p), &p.name).clicked() {
+                            apply = Some((Some(p.name.clone()), p.effects));
+                        }
+                    }
+                });
+            }
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
                     .button(with_icon(ic::SHUFFLE, "Aléatoire"))
@@ -398,7 +409,7 @@ impl OzApp {
             let rt = &self.layers[sel];
             (rt.mix_timer, rt.mix_len, rt.mix_seg.clone())
         };
-        let media = self.project.media.clone();
+        let media = self.media_folders.all.clone();
         let mut next = false;
         let mut started = false;
         let mix = &mut self.project.layers[sel].mix;

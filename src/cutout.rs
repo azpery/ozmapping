@@ -83,6 +83,14 @@ impl Cutout {
     }
 
     pub fn with_method(img: &image::DynamicImage, method: Method) -> Self {
+        let mut cut = Self::base(img, method);
+        cut.mask = cut.compute_auto();
+        cut.undo.clear();
+        cut
+    }
+
+    /// Image préparée (taille de travail, couleurs), masque vide.
+    fn base(img: &image::DynamicImage, method: Method) -> Self {
         let rgba = img.to_rgba8();
         let (w0, h0) = rgba.dimensions();
         let scale = (WORK_MAX as f32 / w0.max(h0).max(1) as f32).min(1.0);
@@ -100,7 +108,7 @@ impl Cutout {
             })
             .collect();
         let lab = rgb.iter().map(|&c| to_lab(c)).collect();
-        let mut cut = Self {
+        Self {
             width: w as usize,
             height: h as usize,
             rgb,
@@ -117,8 +125,17 @@ impl Cutout {
             sal: None,
             model_error: None,
             projection: None,
-        };
-        cut.mask = cut.compute_auto();
+        }
+    }
+
+    /// Photo dont le détourage est déjà fait ailleurs (au stylet sur l'iPad) : `mask` (blanc =
+    /// sujet, n'importe quelle taille) est mis à la taille de travail ; rien n'est recalculé.
+    pub fn with_mask(img: &image::DynamicImage, mask: &image::GrayImage) -> Self {
+        // Sans transparence (photo JPEG), « Couleurs » ne lance pas le réseau du sujet.
+        let opaque = image::DynamicImage::ImageRgb8(img.to_rgb8());
+        let mut cut = Self::base(&opaque, Method::Color);
+        let small = image::imageops::resize(mask, cut.width as u32, cut.height as u32, image::imageops::FilterType::Triangle);
+        cut.mask = small.pixels().map(|p| p[0] >= 128).collect();
         cut.undo.clear();
         cut
     }
@@ -896,6 +913,17 @@ fn dilate(region: &[bool], w: usize, h: usize) -> Vec<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mask_drawn_elsewhere() {
+        // Photo 200 × 100, objet dessiné au stylet : un rectangle au milieu (masque à une autre taille).
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(200, 100, image::Rgb([90, 120, 60])));
+        let mask = image::GrayImage::from_fn(400, 200, |x, y| image::Luma([if (100..300).contains(&x) && (50..150).contains(&y) { 255 } else { 0 }]));
+        let cut = Cutout::with_mask(&img, &mask);
+        assert!((cut.coverage() - 0.25).abs() < 0.03, "part du sujet : {}", cut.coverage());
+        let (rings, _) = cut.rings(2.0).unwrap();
+        assert!(!rings.is_empty());
+    }
+
     use super::*;
 
     /// « Photo » : fond en dégradé bleu-gris bruité, sujet orangé texturé (une arche).

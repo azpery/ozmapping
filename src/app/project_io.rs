@@ -5,6 +5,8 @@ use super::*;
 impl OzApp {
     pub(super) fn set_project(&mut self, ctx: &egui::Context, project: Project, path: Option<PathBuf>) {
         self.layers = project.layers.iter().map(|_| LayerRuntime::default()).collect();
+        // Le serveur de dessin reprend le dessin du nouveau projet.
+        self.sketch.doc_synced = false;
         self.history.clear();
         self.project = project;
         self.saved = self.project.clone();
@@ -94,6 +96,7 @@ impl OzApp {
             }
         };
         self.store_active_cells();
+        self.adopt_ipad_files(&path);
         match self.project.save(&path) {
             Ok(()) => {
                 self.saved = self.project.clone();
@@ -117,11 +120,64 @@ impl OzApp {
 
     pub(super) fn add_media(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
         for p in paths {
+            // Un dossier : ajouté par référence (son contenu est suivi).
+            if p.is_dir() {
+                self.add_media_folder(p);
+                continue;
+            }
             // `absolute` plutôt que `canonicalize` : sous Windows ce dernier produit des chemins
             // « \\?\C:\… » que ffmpeg gère mal.
             let p = std::path::absolute(&p).unwrap_or(p);
             if (is_video_file(&p) || video::is_still_image(&p)) && !self.project.media.contains(&p) {
                 self.project.media.push(p);
+            }
+        }
+    }
+
+    /// Fichiers venus de l'iPad (photos, photos du dessin, bassins de chimie), rangés jusque-là
+    /// dans le dossier de l'app : copiés à côté du projet, dans « <projet> - fichiers iPad », et
+    /// le projet pointe vers ces copies (il reste complet si on le déplace ou le copie).
+    fn adopt_ipad_files(&mut self, project_file: &Path) {
+        let Some(app_dir) = crate::sketch::data_dir() else { return };
+        let Some(dir) = project_file.parent() else { return };
+        let stem = project_file.file_stem().map_or_else(|| "Projet".into(), |s| s.to_string_lossy().into_owned());
+        let target = dir.join(format!("{stem} - fichiers iPad"));
+        let mut moved: std::collections::HashMap<PathBuf, PathBuf> = Default::default();
+        let mut adopt = |p: &mut PathBuf| {
+            if !p.starts_with(&app_dir) {
+                return;
+            }
+            if let Some(new) = moved.get(p) {
+                *p = new.clone();
+                return;
+            }
+            let Some(name) = p.file_name() else { return };
+            let new = target.join(name);
+            let ok = new.exists() || (std::fs::create_dir_all(&target).is_ok() && std::fs::copy(&*p, &new).is_ok());
+            if ok {
+                moved.insert(p.clone(), new.clone());
+                *p = new;
+            }
+        };
+        let pr = &mut self.project;
+        for m in &mut pr.media {
+            adopt(m);
+        }
+        for f in pr.drawing.iter_mut().flat_map(|d| d.files_mut()) {
+            adopt(f);
+        }
+        for l in &mut pr.layers {
+            if let Some(c) = &mut l.clip {
+                adopt(c);
+            }
+            if let Some(f) = l.chem.as_mut().and_then(|c| c.file.as_mut()) {
+                adopt(f);
+            }
+            for c in l.cells.iter_mut().flatten().filter_map(|c| c.clip.as_mut()) {
+                adopt(c);
+            }
+            for c in &mut l.mix.clips {
+                adopt(c);
             }
         }
     }

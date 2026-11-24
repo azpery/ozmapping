@@ -35,6 +35,8 @@ mod grid;
 mod layer_runtime;
 mod layers;
 mod laser_ui;
+mod layout_ui;
+mod media_folders;
 mod leds_ui;
 mod midi_ui;
 mod net_ui;
@@ -46,6 +48,7 @@ mod recording;
 mod rhythm_ui;
 mod shape_ui;
 mod shortcuts;
+mod sketch_ui;
 mod undo;
 mod visuals_ui;
 mod widgets;
@@ -58,6 +61,7 @@ use laser_ui::*;
 use leds_ui::*;
 use midi_ui::*;
 use net_ui::*;
+use sketch_ui::*;
 use output::*;
 use widgets::*;
 
@@ -104,10 +108,13 @@ enum RightTab {
     Dmx,
     Laser,
     Midi,
+    Sketch,
+    /// Disposition des vidéoprojecteurs : orientation, écran, masques de chaque sortie.
+    Layout,
 }
 
 impl RightTab {
-    const COUNT: usize = 10;
+    const COUNT: usize = 12;
 
     /// Onglets horizontaux de chaque onglet latéral (vide : une seule page).
     fn sections(self) -> &'static [(&'static str, &'static str)] {
@@ -141,7 +148,7 @@ impl RightTab {
             RightTab::Leds => &[(ic::CUBE, "Scène"), (ic::LIGHTBULB, "LEDs"), (ic::WIFI_HIGH, "Contrôleurs"), (ic::PLAY, "Sortie")],
             RightTab::Dmx => &[(ic::LIGHTNING, "Appareils"), (ic::WIFI_HIGH, "Sortie")],
             RightTab::Laser => &[(ic::PENCIL_SIMPLE, "ILDA (formes)"), (ic::SQUARES_FOUR, "DMX (motifs)")],
-            RightTab::Photo | RightTab::Mix | RightTab::Midi => &[],
+            RightTab::Photo | RightTab::Mix | RightTab::Midi | RightTab::Sketch | RightTab::Layout => &[],
         }
     }
 }
@@ -199,6 +206,8 @@ pub struct OzApp {
     laser: LaserRuntime,
     /// Plusieurs OZ Mapping ensemble sur le réseau local.
     net: NetRuntime,
+    /// Dessin depuis un iPad ou un téléphone.
+    sketch: SketchRuntime,
 
     blackout: bool,
     blackout_level: f32,
@@ -211,6 +220,9 @@ pub struct OzApp {
     edit_target: EditTarget,
     /// Édition sur l'aperçu de l'ensemble média + masque (cadre à redimensionner).
     edit_both: bool,
+    /// Réglage des 4 coins de cette sortie en cours, et le coin choisi (flèches du clavier).
+    corner_edit: Option<usize>,
+    corner_sel: usize,
     right_tab: RightTab,
     /// Calque dont on vient de changer les effets alors qu'il ne se voit pas à l'écran.
     fx_hidden_alert: Option<usize>,
@@ -221,6 +233,10 @@ pub struct OzApp {
     chain_col: Option<usize>,
     chain_timer: f32,
     layer_card_w: f32,
+    /// Calques cochés pour être groupés (Cmd ou Maj + clic sur leur nom).
+    group_pick: std::collections::BTreeSet<usize>,
+    /// Dossiers de médias suivis : leur contenu et la liste de tous les médias.
+    media_folders: media_folders::MediaFolders,
     /// Défilement horizontal commun aux lignes du tableau.
     grid_offset: f32,
     /// Enregistrement de la sortie en cours, et ses réglages (hauteur, images/s, durée max).
@@ -302,6 +318,7 @@ impl OzApp {
             midi: MidiRuntime::default(),
             laser: LaserRuntime::default(),
             net: NetRuntime::default(),
+            sketch: SketchRuntime::default(),
             midi_setup: crate::midi::MidiSetup::default(),
             blackout: false,
             blackout_level: 0.0,
@@ -311,12 +328,16 @@ impl OzApp {
             edit_mapping: false,
             edit_target: EditTarget::Warp,
             edit_both: false,
+            corner_edit: None,
+            corner_sel: 0,
             right_tab: RightTab::Effects,
             fx_hidden_alert: None,
             sub_tab: [0; RightTab::COUNT],
             chain_col: None,
             chain_timer: 0.0,
             layer_card_w: 0.0,
+            group_pick: Default::default(),
+            media_folders: Default::default(),
             grid_offset: 0.0,
             recorder: None,
             rec_height: 1080,
@@ -397,6 +418,13 @@ impl OzApp {
 }
 
 impl eframe::App for OzApp {
+    /// Fenêtre principale cachée (autre app devant, sortie en plein écran par-dessus) : eframe
+    /// n'appellerait plus que cette fonction, et la lecture, les sorties, les LEDs et l'iPad
+    /// s'arrêteraient. Le spectacle continue : on redemande l'interface complète à chaque image.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::RequestPaintWhileHidden);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.undo_begin(&ctx);
@@ -405,6 +433,9 @@ impl eframe::App for OzApp {
         self.leds_tick(&ctx);
         self.laser_tick(&ctx);
         self.net_tick(&ctx);
+        self.media_folders_tick(&ctx);
+        self.chem_persist_tick();
+        self.sketch_tick(&ctx);
         if self.cutout.is_none() {
             self.drone_keys(&ctx);
             self.scene_shortcuts(&ctx);
@@ -501,6 +532,7 @@ impl eframe::App for OzApp {
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
                 self.leds_capture(ui);
+                self.sketch_capture(ui, None);
                 // Sortie, scène 3D ou les deux, quel que soit l'onglet de droite.
                 self.leds_central(ui);
             });

@@ -48,10 +48,12 @@ pub enum Pattern {
     TimeWarp,
     // Tête en 3D animée par l'application (voir `face`)
     Face,
+    // Bassin de liquides rempli depuis l'iPad (voir `chem`)
+    Chemistry,
 }
 
 impl Pattern {
-    pub const ALL: [Pattern; 35] = [
+    pub const ALL: [Pattern; 36] = [
         Pattern::Off,
         Pattern::Plasma,
         Pattern::Spiral,
@@ -87,7 +89,40 @@ impl Pattern {
         Pattern::Road,
         Pattern::TimeWarp,
         Pattern::Face,
+        Pattern::Chemistry,
     ];
+
+    /// Familles des visuels, dans l'ordre d'affichage.
+    pub const FAMILIES: [&'static str; 6] = ["Hypnotiques", "Nature", "Fractales et 3D", "Cosmos", "Rétro", "Spéciaux"];
+
+    /// Famille du visuel (indice dans `FAMILIES`).
+    pub fn family(self) -> usize {
+        match self {
+            Pattern::Off | Pattern::Plasma | Pattern::Spiral | Pattern::Tunnel | Pattern::Moire | Pattern::OpArt | Pattern::Mandala | Pattern::Rings => 0,
+            Pattern::Lava | Pattern::Clouds | Pattern::Aurora | Pattern::Flames | Pattern::Caustics | Pattern::Ripples | Pattern::Electric | Pattern::Crystals => 1,
+            Pattern::Julia
+            | Pattern::Quasicrystal
+            | Pattern::Mandelbulb
+            | Pattern::Menger
+            | Pattern::CubeField
+            | Pattern::Gyroid
+            | Pattern::Kifs
+            | Pattern::SphereField
+            | Pattern::Pillars => 2,
+            Pattern::Galaxy | Pattern::Hyperspace | Pattern::Rays => 3,
+            Pattern::Synthwave | Pattern::Maze | Pattern::Hive => 4,
+            Pattern::Paint | Pattern::Road | Pattern::TimeWarp | Pattern::Face | Pattern::Chemistry => 5,
+        }
+    }
+
+    /// Visuels (sans « Aucun ») rangés par famille : (nom de la famille, visuels).
+    pub fn by_family() -> Vec<(&'static str, Vec<Pattern>)> {
+        Self::FAMILIES
+            .iter()
+            .enumerate()
+            .map(|(f, name)| (*name, Self::ALL.into_iter().filter(|p| *p != Pattern::Off && p.family() == f).collect()))
+            .collect()
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -126,6 +161,7 @@ impl Pattern {
             Pattern::Road => "Route cartoon",
             Pattern::TimeWarp => "Voyage temporel",
             Pattern::Face => "Visage qui parle",
+            Pattern::Chemistry => "Chimie (iPad)",
         }
     }
 
@@ -178,6 +214,11 @@ impl Pattern {
                 "Tête en 3D qui parle, cligne des yeux et regarde autour d'elle, à projeter sur une tête de \
                  mannequin ou une boule de cristal : âge, genre, cheveux, expression et parole se règlent \
                  dans Visuels › Visage"
+            }
+            Pattern::Chemistry => {
+                "Bassin de liquides qu'on remplit depuis l'iPad (onglet Chimie) : eau, lait, encre, colorant, \
+                 huile, essence, peintures, savon, alcool ; on touille au doigt, et le liquide coule ou \
+                 s'agite quand on penche ou secoue l'iPad"
             }
         }
     }

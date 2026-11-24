@@ -1223,6 +1223,23 @@ pub fn mask_anim_presets() -> Vec<Preset> {
     ]
 }
 
+/// Familles des presets intégrés, dans l'ordre d'affichage.
+pub const PRESET_FAMILIES: [&str; 5] = ["Couleur", "Psyché", "Rétro", "3D", "Mouvement et optique"];
+
+/// Famille d'un preset intégré (indice dans `PRESET_FAMILIES`) ; None : preset de l'utilisateur.
+pub fn preset_family(name: &str) -> Option<usize> {
+    Some(match name {
+        "Noir & blanc" | "Duotone rose" | "Bleu glacé" | "Négatif" | "Pop art" | "Arc-en-ciel" | "Solarisé" | "Thermique" | "Halo" => 0,
+        "Néon" | "Kaléido" | "Mandala" | "Miroir 4" | "Psyché" | "Rêve" | "Vortex" | "Tunnel acide" | "Liquide" | "Acide" | "Trip"
+        | "Mosaïque" | "Droste" | "Hexagones" => 1,
+        "Rétro VHS" | "Glitch" | "8-bit" | "Télé cathodique" | "Glitch numérique" | "Pellicule" | "Trame BD" | "ASCII" => 2,
+        "Cube 3D" | "Sphère" | "Carte 3D" | "Cylindre" | "Tore" | "Terrain 3D" | "Pixels 3D" | "Relief" | "Anaglyphe" | "Drapeau"
+        | "Accordéon" => 3,
+        "Tunnel" | "Strobe" | "Écho" | "Respiration" | "Onde de choc" | "Fish-eye" | "Zoom radial" => 4,
+        _ => return None,
+    })
+}
+
 pub fn builtin_presets() -> Vec<Preset> {
     let d = Effects::default;
     let p = |name: &str, effects: Effects| Preset {
@@ -1322,6 +1339,13 @@ pub fn builtin_presets() -> Vec<Preset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_builtin_preset_has_a_family() {
+        for p in builtin_presets() {
+            assert!(preset_family(&p.name).is_some(), "preset sans famille : {}", p.name);
+        }
+    }
 
     #[test]
     fn builtin_preset_names_are_unique() {

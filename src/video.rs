@@ -25,6 +25,16 @@ const REVERSE_CHUNK_SECS: f64 = 0.4;
 static NEXT_FRAME_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_PLAYER_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Nouvel identifiant d'image (le rendu ré-uploade la texture quand il change).
+pub fn new_frame_id() -> u64 {
+    NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Nouvelle clé de texture pour une source d'images qui n'est pas un lecteur (dessin à distance).
+pub fn new_source_uid() -> u64 {
+    NEXT_PLAYER_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Frame {
     pub data: Vec<u8>,
     pub width: u32,
@@ -252,6 +262,9 @@ struct Shared {
     looping: AtomicBool,
     reverse: AtomicBool,
     ended: AtomicBool,
+    /// Calque invisible : ffmpeg est arrêté et la position avance à l'horloge (reprise au bon
+    /// endroit quand il réapparaît).
+    hidden: AtomicBool,
     speed: AtomicU32,    // f32 bits
     position: AtomicU64, // f64 bits, secondes
     seek: Mutex<Option<f64>>,
@@ -279,6 +292,7 @@ impl VideoPlayer {
             looping: AtomicBool::new(opts.looping),
             reverse: AtomicBool::new(opts.reverse),
             ended: AtomicBool::new(false),
+            hidden: AtomicBool::new(false),
             speed: AtomicU32::new(opts.speed.to_bits()),
             position: AtomicU64::new(start.to_bits()),
             seek: Mutex::new(None),
@@ -346,6 +360,11 @@ impl VideoPlayer {
 
     pub fn speed(&self) -> f32 {
         f32::from_bits(self.shared.speed.load(Ordering::Relaxed))
+    }
+
+    /// Le calque ne se voit pas : plus de décodage, la lecture continue « à vide ».
+    pub fn set_hidden(&self, hidden: bool) {
+        self.shared.hidden.store(hidden, Ordering::Relaxed);
     }
 
     pub fn set_speed(&self, speed: f32) {
@@ -564,6 +583,10 @@ impl Decoder {
                 pacer.reset();
                 continue;
             }
+            if self.hidden() {
+                self.kill_child();
+                return Ok(self.coast(pos, false));
+            }
             if stdout.read_exact(&mut buf).is_err() {
                 break; // fin du fichier (ou ffmpeg tué pour un seek)
             }
@@ -654,6 +677,9 @@ impl Decoder {
                         pacer.reset();
                         continue;
                     }
+                    if self.hidden() {
+                        return Ok(self.coast(pos, true));
+                    }
                     break;
                 }
                 self.set_position(chunk_start + (n - 1 - k) as f64 * frame_dur);
@@ -673,6 +699,45 @@ impl Decoder {
                 }
                 None => return Ok(self.wait_ended(0.0)),
             }
+        }
+    }
+
+    /// Invisible, et une image est déjà là (le fondu enchaîné attend la première).
+    fn hidden(&self) -> bool {
+        self.shared.hidden.load(Ordering::Relaxed) && self.slot.lock().unwrap().is_some()
+    }
+
+    /// Lecture sans décodage tant que le calque est invisible : la position suit l'horloge
+    /// (vitesse, pause, boucle, fin), puis le décodage reprend là où on en est.
+    fn coast(&self, mut pos: f64, reverse: bool) -> Next {
+        let duration = self.info.duration;
+        let mut last = Instant::now();
+        loop {
+            if self.stopped() {
+                return Next::Stop;
+            }
+            if let Some(p) = self.take_seek() {
+                return Next::At(p);
+            }
+            if self.shared.reverse.load(Ordering::Relaxed) != reverse || !self.shared.hidden.load(Ordering::Relaxed) {
+                // Fin atteinte sans boucle : on repart juste avant pour retrouver la dernière image.
+                let back = if reverse || duration <= 0.0 { pos } else { pos.min(duration - 1.0 / self.info.fps) };
+                return Next::At(back.max(0.0));
+            }
+            let now = Instant::now();
+            let dt = now.duration_since(last).as_secs_f64();
+            last = now;
+            if !self.shared.paused.load(Ordering::Relaxed) {
+                pos += dt * self.speed() as f64 * if reverse { -1.0 } else { 1.0 };
+            }
+            let looping = self.shared.looping.load(Ordering::Relaxed);
+            if duration > 0.0 && (pos >= duration || pos < 0.0) {
+                pos = if looping { pos.rem_euclid(duration) } else { pos.clamp(0.0, duration) };
+            }
+            let at_end = !looping && duration > 0.0 && if reverse { pos <= 0.0 } else { pos >= duration };
+            self.shared.ended.store(at_end, Ordering::Relaxed);
+            self.set_position(pos);
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -793,6 +858,25 @@ mod tests {
         rev.set_reverse(false);
         std::thread::sleep(Duration::from_millis(800));
         assert!(rev.position() > before, "{} -> {}", before, rev.position());
+    }
+
+    #[test]
+    fn hidden_layer_stops_decoding_but_keeps_time() {
+        let Some(path) = test_video() else { return };
+        let (player, _) = play(&path, PlayOptions::new(true, OUTPUT_MAX), 0.4);
+        player.set_hidden(true);
+        std::thread::sleep(Duration::from_millis(200));
+        let id = |p: &VideoPlayer| p.slot.lock().unwrap().as_ref().map(|f| f.id);
+        let (frame, before) = (id(&player), player.position());
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(id(&player), frame, "caché : plus aucune image décodée");
+        assert!(player.shared.child.lock().unwrap().is_none(), "caché : ffmpeg arrêté");
+        let moved = player.position() - before;
+        assert!(moved > 0.4 && moved < 0.8, "la position suit l'horloge : {moved}");
+        player.set_hidden(false);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_ne!(id(&player), frame, "visible : le décodage reprend");
+        assert!(player.error().is_none(), "{:?}", player.error());
     }
 
     #[test]

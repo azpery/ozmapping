@@ -478,6 +478,76 @@ impl Dancer {
     }
 }
 
+/// Couleur plus sombre (k < 1) ou plus claire (k > 1).
+fn shade(c: [u8; 3], k: f32) -> [u8; 3] {
+    c.map(|v| (v as f32 * k).clamp(0.0, 255.0) as u8)
+}
+
+type Facet = ([[f32; 3]; 4], [u8; 3]);
+
+/// Tube (ou cône si un rayon est nul) de `a` à `b`, rayons `r0` en bas et `r1` en haut.
+fn tube(out: &mut Vec<Facet>, a: [f32; 3], b: [f32; 3], r0: f32, r1: f32, n: usize, color: [u8; 3]) {
+    let axis = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = (axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
+    if len < 1e-5 {
+        return;
+    }
+    let ax = axis.map(|v| v / len);
+    // Repère autour de l'axe.
+    let helper = if ax[1].abs() < 0.9 { [0.0, 1.0, 0.0] } else { [1.0, 0.0, 0.0] };
+    let u = norm3(cross3(ax, helper));
+    let v = cross3(ax, u);
+    let ring = |c: [f32; 3], r: f32, k: usize| {
+        let t = k as f32 / n as f32 * std::f32::consts::TAU;
+        let (s, co) = (t.sin(), t.cos());
+        [0, 1, 2].map(|i| c[i] + (u[i] * co + v[i] * s) * r)
+    };
+    for k in 0..n {
+        // Un peu d'ombre d'un côté : les facettes se distinguent même sans lumière.
+        let lit = 0.82 + 0.18 * ((k as f32 + 0.5) / n as f32 * std::f32::consts::TAU).cos();
+        out.push(([ring(b, r1, k), ring(b, r1, k + 1), ring(a, r0, k + 1), ring(a, r0, k)], shade(color, lit)));
+    }
+}
+
+/// Disque horizontal (dessous d'un cône, terre d'un pot).
+fn disc(out: &mut Vec<Facet>, c: [f32; 3], r: f32, n: usize, color: [u8; 3]) {
+    for k in 0..n {
+        let p = |k: usize| {
+            let t = k as f32 / n as f32 * std::f32::consts::TAU;
+            [c[0] + t.cos() * r, c[1], c[2] + t.sin() * r]
+        };
+        out.push(([p(k), p(k + 1), c, c], color));
+    }
+}
+
+/// Boule (rayons par axe), un peu bosselée (`bump` : part du rayon) : feuillage, rocher.
+fn blob(out: &mut Vec<Facet>, c: [f32; 3], r: [f32; 3], color: [u8; 3], (id, salt, bump): (u32, u32, f32)) {
+    let (lon, lat) = (12usize, 7usize);
+    let pt = |i: usize, j: usize| {
+        let (a, b) = (i as f32 / lon as f32 * std::f32::consts::TAU, j as f32 / lat as f32 * std::f32::consts::PI);
+        // Même bosse pour un point partagé (le tour se referme, les pôles sont uniques).
+        let key = if j == 0 || j == lat { j as u32 * 1000 } else { (i % lon) as u32 + j as u32 * 1000 };
+        let k = 1.0 + bump * (hash01(id, salt * 7919 + key, 11) - 0.5) * 2.0;
+        [c[0] + r[0] * b.sin() * a.cos() * k, c[1] + r[1] * b.cos() * k, c[2] + r[2] * b.sin() * a.sin() * k]
+    };
+    for j in 0..lat {
+        for i in 0..lon {
+            // Plus clair en haut, plus sombre dessous.
+            let lit = 1.1 - 0.45 * (j as f32 + 0.5) / lat as f32;
+            out.push(([pt(i, j), pt(i + 1, j), pt(i + 1, j + 1), pt(i, j + 1)], shade(color, lit)));
+        }
+    }
+}
+
+fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+}
+
+fn norm3(a: [f32; 3]) -> [f32; 3] {
+    let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt().max(1e-9);
+    a.map(|v| v / l)
+}
+
 /// Point situé à la distance `d` le long du tracé.
 fn point_at(pts: &[[f32; 3]], mut d: f32) -> [f32; 3] {
     for w in pts.windows(2) {
@@ -567,10 +637,36 @@ pub enum SurfaceKind {
     Sun,
     /// Vidéoprojecteur : projette l'image d'une sortie sur ce qu'il y a devant lui.
     Projector,
+    /// Arbre feuillu : tronc et feuillage en boules ; largeur = feuillage, hauteur totale.
+    Tree,
+    /// Sapin : tronc et trois étages de branches.
+    Pine,
+    /// Mur en pierres irrégulières, jointoyées.
+    StoneWall,
+    /// Tapis posé au sol, avec bordure et franges.
+    Rug,
+    /// Table : plateau sur quatre pieds (hauteur = dessus du plateau).
+    Table,
+    /// Chaise tournée vers l'avant (dossier derrière).
+    Chair,
+    /// Canapé : assise, coussins, dossier et accoudoirs.
+    Sofa,
+    /// Plante en pot.
+    Plant,
+    /// Comptoir de bar avec son plateau et son repose-pieds.
+    Bar,
+    /// Colonne ronde avec base et chapiteau.
+    Pillar,
+    /// Lampadaire : pied, tige et abat-jour.
+    Lamp,
+    /// Rocher irrégulier.
+    Rock,
+    /// Barrière : poteaux et deux lisses.
+    Fence,
 }
 
 impl SurfaceKind {
-    pub const ALL: [SurfaceKind; 11] = [
+    pub const ALL: [SurfaceKind; 24] = [
         SurfaceKind::Screen,
         SurfaceKind::Box,
         SurfaceKind::Stage,
@@ -582,6 +678,19 @@ impl SurfaceKind {
         SurfaceKind::Truss,
         SurfaceKind::Sun,
         SurfaceKind::Projector,
+        SurfaceKind::Tree,
+        SurfaceKind::Pine,
+        SurfaceKind::StoneWall,
+        SurfaceKind::Rug,
+        SurfaceKind::Table,
+        SurfaceKind::Chair,
+        SurfaceKind::Sofa,
+        SurfaceKind::Plant,
+        SurfaceKind::Bar,
+        SurfaceKind::Pillar,
+        SurfaceKind::Lamp,
+        SurfaceKind::Rock,
+        SurfaceKind::Fence,
     ];
 
     pub fn name(self) -> &'static str {
@@ -597,6 +706,19 @@ impl SurfaceKind {
             SurfaceKind::Truss => "Pont",
             SurfaceKind::Sun => "Soleil",
             SurfaceKind::Projector => "Vidéoprojecteur",
+            SurfaceKind::Tree => "Arbre",
+            SurfaceKind::Pine => "Sapin",
+            SurfaceKind::StoneWall => "Mur en pierre",
+            SurfaceKind::Rug => "Tapis",
+            SurfaceKind::Table => "Table",
+            SurfaceKind::Chair => "Chaise",
+            SurfaceKind::Sofa => "Canapé",
+            SurfaceKind::Plant => "Plante",
+            SurfaceKind::Bar => "Bar",
+            SurfaceKind::Pillar => "Pilier",
+            SurfaceKind::Lamp => "Lampadaire",
+            SurfaceKind::Rock => "Rocher",
+            SurfaceKind::Fence => "Barrière",
         }
     }
 }
@@ -722,6 +844,164 @@ impl Default for Surface {
 }
 
 impl Surface {
+    /// Objets du décor proposés à l'ajout (nom, objet placé d'après la salle).
+    pub fn presets(setup: &LedSetup) -> Vec<(&'static str, Surface)> {
+        let room = setup.room;
+        let mid = (room[1] * 0.5).max(1.0);
+        let side = (room[0] * 0.5 - 1.0).max(0.8);
+        let deco = |kind: SurfaceKind, pos: [f32; 3], size: [f32; 3], color: [u8; 3]| Surface {
+            kind,
+            pos,
+            size,
+            color,
+            show_output: false,
+            ..Surface::default()
+        };
+    vec![
+            ("Écran", Surface { pos: [0.0, 0.8, (room[1] - 0.3).max(0.5)], ..Surface::default() }),
+            (
+                "Boîte",
+                Surface {
+                    kind: SurfaceKind::Box,
+                    pos: [0.0, 0.0, room[1] * 0.5],
+                    size: [1.0, 1.0, 1.0],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Mur",
+                Surface {
+                    kind: SurfaceKind::Box,
+                    pos: [0.0, 0.0, room[1]],
+                    size: [room[0], 3.0, 0.15],
+                    color: [120, 124, 132],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Scène",
+                Surface {
+                    kind: SurfaceKind::Stage,
+                    pos: [0.0, 0.0, (room[1] - 2.3).max(2.0)],
+                    size: [(room[0] - 1.0).clamp(1.0, 8.0), 0.8, 4.0],
+                    color: [48, 48, 56],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Public",
+                Surface {
+                    kind: SurfaceKind::Crowd,
+                    pos: [0.0, 0.0, (room[1] * 0.3).max(1.5)],
+                    size: [(room[0] - 1.5).clamp(1.0, 6.0), 1.75, (room[1] * 0.35).clamp(1.0, 5.0)],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Chips",
+                Surface {
+                    kind: SurfaceKind::Panels,
+                    pos: [0.0, 0.5, (room[1] - 1.0).max(1.0)],
+                    size: [5.5, 2.6, 0.5],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Vidéoprojecteur",
+                Surface {
+                    kind: SurfaceKind::Projector,
+                    // À l'avant de la salle, tourné vers le fond.
+                    pos: [0.0, 1.4, 0.6],
+                    rot: [180.0, 0.0, 0.0],
+                    size: [0.4, 0.16, 0.32],
+                    color: [210, 210, 214],
+                    show_output: true,
+                    throw: 1.5,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Soleil",
+                Surface {
+                    kind: SurfaceKind::Sun,
+                    pos: [0.0, 0.6, (room[1] - 1.1).max(1.0)],
+                    size: [1.3, 1.3, 0.02],
+                    color: [242, 200, 30],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Caisson de basses",
+                Surface {
+                    kind: SurfaceKind::Sub,
+                    pos: [-(room[0] * 0.5 - 0.6).max(0.5), 0.0, (room[1] - 1.5).max(1.0)],
+                    size: [0.6, 0.7, 0.75],
+                    color: [28, 28, 32],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Enceinte d'aigus",
+                Surface {
+                    kind: SurfaceKind::Top,
+                    pos: [-(room[0] * 0.5 - 0.6).max(0.5), 0.0, (room[1] - 2.0).max(1.0)],
+                    size: [0.4, 0.6, 0.35],
+                    color: [28, 28, 32],
+                    show_output: false,
+                    stand: 1.4,
+                    ..Surface::default()
+                },
+            ),
+            (
+                "Pont",
+                Surface {
+                    kind: SurfaceKind::Truss,
+                    pos: [0.0, 0.0, (room[1] - 1.2).max(1.0)],
+                    size: [(room[0] - 0.6).clamp(1.0, 12.0), 3.0, 0.3],
+                    color: [170, 172, 178],
+                    show_output: false,
+                    ..Surface::default()
+                },
+            ),
+            ("Cabine DJ", {
+                // Posée au milieu de la scène s'il y en a une.
+                let stage = setup.surfaces.iter().find(|s| s.kind == SurfaceKind::Stage);
+                let (y, z) = stage.map_or((0.0, room[1] * 0.6), |st| (st.top(), st.pos[2] - 0.4));
+                Surface {
+                    kind: SurfaceKind::Booth,
+                    pos: [stage.map_or(0.0, |st| st.pos[0]), y, z],
+                    size: [1.8, 1.05, 0.7],
+                    color: [30, 30, 34],
+                    show_output: true,
+                    ..Surface::default()
+                }
+            }),
+            // Nature et mobilier.
+            ("Arbre", deco(SurfaceKind::Tree, [-side, 0.0, mid], [2.2, 4.0, 2.2], [70, 132, 60])),
+            ("Sapin", deco(SurfaceKind::Pine, [side, 0.0, mid], [1.8, 4.5, 1.8], [38, 96, 56])),
+            ("Plante", deco(SurfaceKind::Plant, [side, 0.0, mid * 0.6], [0.5, 1.3, 0.5], [62, 142, 70])),
+            ("Rocher", deco(SurfaceKind::Rock, [-side, 0.0, mid * 0.6], [1.0, 0.6, 0.8], [122, 118, 110])),
+            ("Mur en pierre", deco(SurfaceKind::StoneWall, [0.0, 0.0, room[1]], [room[0].min(6.0), 2.2, 0.4], [150, 142, 128])),
+            ("Barrière", deco(SurfaceKind::Fence, [0.0, 0.0, mid * 0.5], [3.0, 1.0, 0.08], [132, 100, 70])),
+            ("Pilier", deco(SurfaceKind::Pillar, [-side, 0.0, mid], [0.5, 3.0, 0.5], [205, 200, 190])),
+            ("Tapis", deco(SurfaceKind::Rug, [0.0, 0.0, mid], [3.0, 0.015, 2.0], [150, 42, 52])),
+            ("Table", deco(SurfaceKind::Table, [0.0, 0.0, mid], [1.6, 0.75, 0.9], [122, 86, 56])),
+            ("Chaise", deco(SurfaceKind::Chair, [0.0, 0.0, mid - 0.8], [0.45, 0.9, 0.48], [122, 86, 56])),
+            ("Canapé", deco(SurfaceKind::Sofa, [0.0, 0.0, mid + 1.5], [2.0, 0.85, 0.9], [72, 82, 112])),
+            ("Bar", deco(SurfaceKind::Bar, [side, 0.0, mid], [3.0, 1.1, 0.6], [58, 44, 34])),
+            ("Lampadaire", deco(SurfaceKind::Lamp, [-side, 0.0, mid + 1.0], [0.45, 1.7, 0.45], [246, 226, 172])),
+        ]
+    }
+}
+
+impl Surface {
     /// Coins de la face avant (vers l'avant de la salle) : haut gauche, haut droit, bas droit, bas gauche.
     pub fn front(&self) -> [[f32; 3]; 4] {
         let [w, h, _] = self.size;
@@ -777,7 +1057,109 @@ impl Surface {
                 faces.push(Face3 { quad, color, output: output && k == 0, uv: full, edges: 0b1111 });
             }
         }
+        // Formes rondes (troncs, feuillages, pots…) : facettes sans contour.
+        for (quad, color) in self.curved() {
+            faces.push(Face3 { quad: quad.map(|p| self.world(p)), color, output: false, uv: full, edges: 0 });
+        }
         faces
+    }
+
+    /// Pierres du mur, en rangs décalés, de tailles et de teintes variées, sur un fond de joints.
+    fn stone_blocks(&self) -> Vec<Block> {
+        let [w, h, d] = self.size;
+        let (hw, hd) = (w / 2.0, d / 2.0);
+        let mut b = vec![([-hw + 0.01, 0.0, -hd * 0.6], [hw - 0.01, h - 0.01, hd], shade(self.color, 0.45), false)];
+        let mut y = 0.0;
+        let mut row = 0u32;
+        while y < h - 0.01 && b.len() < 900 {
+            let rh = (0.17 + 0.09 * hash01(self.id, row, 1)).min(h - y);
+            let mut x = -hw - 0.25 * hash01(self.id, row, 2) * if row % 2 == 0 { 1.0 } else { 0.0 };
+            let mut k = 0u32;
+            while x < hw - 0.01 {
+                let r = |salt: u32| hash01(self.id, row * 997 + k, salt);
+                let sw = 0.24 + 0.3 * r(3);
+                let (x0, x1) = (x.max(-hw), (x + sw).min(hw));
+                let gap = 0.012;
+                let out = 0.015 + 0.03 * r(4);
+                let tint = 0.72 + 0.42 * r(5);
+                let warm = (r(6) - 0.5) * 18.0;
+                let c = self.color;
+                let color = [
+                    (c[0] as f32 * tint + warm).clamp(0.0, 255.0) as u8,
+                    (c[1] as f32 * tint).clamp(0.0, 255.0) as u8,
+                    (c[2] as f32 * tint - warm).clamp(0.0, 255.0) as u8,
+                ];
+                if x1 - x0 > 0.03 {
+                    b.push(([x0 + gap, y + gap, -hd - out], [x1 - gap, y + rh - gap, hd * 0.5], color, false));
+                }
+                x += sw;
+                k += 1;
+            }
+            y += rh;
+            row += 1;
+        }
+        b
+    }
+
+    /// Facettes des formes rondes, en coordonnées locales (le bas de l'objet en y = 0).
+    fn curved(&self) -> Vec<([[f32; 3]; 4], [u8; 3])> {
+        let [w, h, d] = self.size;
+        let mut q = Vec::new();
+        let id = self.id;
+        match self.kind {
+            SurfaceKind::Tree => {
+                let bark = [96, 66, 42];
+                tube(&mut q, [0.0, 0.0, 0.0], [0.0, h * 0.5, 0.0], w * 0.07, w * 0.045, 10, bark);
+                // Branches qui partent du tronc vers le feuillage.
+                for k in 0..3 {
+                    let a = k as f32 * 2.1 + hash01(id, k, 9) * 0.6;
+                    tube(&mut q, [0.0, h * 0.38, 0.0], [a.sin() * w * 0.22, h * 0.58, a.cos() * d * 0.22], w * 0.03, w * 0.015, 6, bark);
+                }
+                let blobs = [([0.0, 0.66, 0.0], [0.46, 0.3, 0.46]), ([-0.2, 0.55, 0.12], [0.3, 0.2, 0.3]),
+                             ([0.22, 0.58, -0.1], [0.3, 0.21, 0.3]), ([0.05, 0.84, 0.05], [0.28, 0.16, 0.28])];
+                for (k, (c, r)) in blobs.iter().enumerate() {
+                    let col = shade(self.color, 0.85 + 0.3 * hash01(id, k as u32, 3));
+                    blob(&mut q, [c[0] * w, c[1] * h, c[2] * d], [r[0] * w, r[1] * h, r[2] * d], col, (id, k as u32, 0.18));
+                }
+            }
+            SurfaceKind::Pine => {
+                tube(&mut q, [0.0, 0.0, 0.0], [0.0, h * 0.2, 0.0], w * 0.06, w * 0.05, 8, [90, 62, 40]);
+                for (k, (y0, r, len)) in [(0.12f32, 0.5f32, 0.42f32), (0.38, 0.4, 0.36), (0.6, 0.29, 0.4)].iter().enumerate() {
+                    let col = shade(self.color, 0.85 + 0.12 * k as f32);
+                    tube(&mut q, [0.0, h * y0, 0.0], [0.0, h * (y0 + len), 0.0], w * r, 0.0, 14, col);
+                    disc(&mut q, [0.0, h * y0, 0.0], w * r, 14, shade(col, 0.6));
+                }
+            }
+            SurfaceKind::Plant => {
+                let pot_h = h * 0.32;
+                tube(&mut q, [0.0, 0.0, 0.0], [0.0, pot_h, 0.0], w * 0.3, w * 0.4, 14, [176, 96, 62]);
+                disc(&mut q, [0.0, pot_h * 0.94, 0.0], w * 0.38, 14, [60, 42, 30]);
+                // Feuilles en lames qui s'ouvrent vers le haut.
+                for k in 0..9 {
+                    let a = k as f32 * 2.4 + hash01(id, k, 1);
+                    let spread = 0.15 + 0.4 * hash01(id, k, 2);
+                    let tip = [a.sin() * w * spread, h * (0.75 + 0.25 * hash01(id, k, 3)), a.cos() * d * spread];
+                    tube(&mut q, [0.0, pot_h * 0.95, 0.0], tip, w * 0.06, 0.0, 5, shade(self.color, 0.8 + 0.4 * hash01(id, k, 4)));
+                }
+            }
+            SurfaceKind::Pillar => {
+                let k = (h * 0.06).clamp(0.05, 0.3);
+                tube(&mut q, [0.0, k, 0.0], [0.0, h - k, 0.0], w * 0.4, w * 0.36, 18, self.color);
+            }
+            SurfaceKind::Lamp => {
+                let metal = [60, 60, 66];
+                tube(&mut q, [0.0, 0.0, 0.0], [0.0, 0.03, 0.0], w * 0.4, w * 0.4, 16, metal);
+                disc(&mut q, [0.0, 0.03, 0.0], w * 0.4, 16, metal);
+                tube(&mut q, [0.0, 0.03, 0.0], [0.0, h * 0.82, 0.0], 0.015, 0.015, 6, metal);
+                tube(&mut q, [0.0, h * 0.72, 0.0], [0.0, h, 0.0], w * 0.5, w * 0.32, 16, self.color);
+                blob(&mut q, [0.0, h * 0.78, 0.0], [w * 0.1; 3], [255, 244, 210], (id, 0, 0.0));
+            }
+            SurfaceKind::Rock => {
+                blob(&mut q, [0.0, h * 0.45, 0.0], [w * 0.5, h * 0.55, d * 0.5], self.color, (id, 0, 0.3));
+            }
+            _ => {}
+        }
+        q
     }
 
     /// Panneaux en coordonnées locales : le centre devant, les bords derrière, en V.
@@ -945,6 +1327,101 @@ impl Surface {
         let (hw, hd) = (w / 2.0, d / 2.0);
         match self.kind {
             SurfaceKind::Screen | SurfaceKind::Panels | SurfaceKind::Sun => Vec::new(),
+            // Formes rondes : voir `curved`.
+            SurfaceKind::Tree | SurfaceKind::Pine | SurfaceKind::Plant | SurfaceKind::Lamp | SurfaceKind::Rock => Vec::new(),
+            SurfaceKind::Pillar => {
+                // Base et chapiteau carrés ; le fût rond est dans `curved`.
+                let k = (h * 0.06).clamp(0.05, 0.3);
+                vec![([-hw, 0.0, -hd], [hw, k, hd], self.color, false), ([-hw, h - k, -hd], [hw, h, hd], self.color, false)]
+            }
+            SurfaceKind::StoneWall => self.stone_blocks(),
+            SurfaceKind::Rug => {
+                let t = h.clamp(0.005, 0.05);
+                let dark = shade(self.color, 0.55);
+                let light = shade(self.color, 1.35);
+                let mut b = vec![
+                    ([-hw, 0.0, -hd], [hw, t, hd], dark, false),
+                    ([-hw + 0.12, t, -hd + 0.12], [hw - 0.12, t + 0.002, hd - 0.12], self.color, false),
+                    ([-w * 0.15, t + 0.002, -d * 0.15], [w * 0.15, t + 0.004, d * 0.15], light, false),
+                ];
+                // Franges aux deux bouts.
+                let n = ((d / 0.05) as usize).clamp(2, 200);
+                for i in 0..n {
+                    let z = -hd + d * (i as f32 + 0.5) / n as f32;
+                    for x in [-hw - 0.06, hw] {
+                        b.push(([x, 0.0, z - 0.006], [x + 0.06, 0.004, z + 0.006], [225, 215, 190], false));
+                    }
+                }
+                b
+            }
+            SurfaceKind::Table => {
+                let (t, leg, ins) = (0.04, 0.05, 0.06);
+                let mut b = vec![([-hw, h - t, -hd], [hw, h, hd], self.color, false)];
+                for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let (cx, cz) = (x * (hw - ins), z * (hd - ins));
+                    b.push(([cx - leg / 2.0, 0.0, cz - leg / 2.0], [cx + leg / 2.0, h - t, cz + leg / 2.0], shade(self.color, 0.8), false));
+                }
+                b
+            }
+            SurfaceKind::Chair => {
+                // Assise à mi-hauteur, dossier derrière (+z) : la chaise regarde vers l'avant.
+                let seat = (h * 0.5).min(0.47);
+                let (t, leg) = (0.04, 0.035);
+                let leg_c = shade(self.color, 0.8);
+                let mut b = vec![([-hw, seat - t, -hd], [hw, seat, hd], self.color, false)];
+                for (x, z) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let (cx, cz) = (x * (hw - leg), z * (hd - leg));
+                    let top = if z > 0.0 { h } else { seat - t };
+                    b.push(([cx - leg / 2.0, 0.0, cz - leg / 2.0], [cx + leg / 2.0, top, cz + leg / 2.0], leg_c, false));
+                }
+                b.push(([-hw + leg, h - (h - seat) * 0.45, hd - leg - 0.01], [hw - leg, h - 0.02, hd - leg + 0.01], self.color, false));
+                b
+            }
+            SurfaceKind::Sofa => {
+                let base = h * 0.2;
+                let seat = h * 0.5;
+                let (arm, back) = ((w * 0.09).clamp(0.1, 0.25), (d * 0.22).clamp(0.12, 0.3));
+                let cushion = shade(self.color, 1.15);
+                let mut b = vec![
+                    ([-hw, 0.0, -hd], [hw, base, hd], shade(self.color, 0.6), false),
+                    ([-hw, base, -hd], [hw, seat - 0.12, hd], self.color, false),
+                    ([-hw, base, hd - back], [hw, h, hd], self.color, false),
+                    ([-hw, base, -hd], [-hw + arm, seat + 0.18, hd], self.color, false),
+                    ([hw - arm, base, -hd], [hw, seat + 0.18, hd], self.color, false),
+                ];
+                // Coussins d'assise.
+                let n = if w > 1.6 { 3 } else { 2 };
+                let inner = w - 2.0 * arm;
+                for i in 0..n {
+                    let x0 = -hw + arm + inner * i as f32 / n as f32 + 0.01;
+                    let x1 = -hw + arm + inner * (i + 1) as f32 / n as f32 - 0.01;
+                    b.push(([x0, seat - 0.12, -hd + 0.02], [x1, seat, hd - back], cushion, false));
+                }
+                b
+            }
+            SurfaceKind::Bar => {
+                let top = 0.05;
+                let wood = [110, 75, 45];
+                vec![
+                    ([-hw, 0.0, -hd + 0.05], [hw, h - top, hd], self.color, false),
+                    ([-hw - 0.05, h - top, -hd - 0.08], [hw + 0.05, h, hd + 0.05], wood, false),
+                    ([-hw, 0.22, -hd - 0.12], [hw, 0.25, -hd - 0.09], [170, 170, 175], false),
+                    ([-hw, 0.0, -hd], [hw, 0.08, -hd + 0.05], shade(self.color, 0.6), false),
+                ]
+            }
+            SurfaceKind::Fence => {
+                let mut b = Vec::new();
+                let n = ((w / 1.0).ceil() as usize).max(1);
+                let post = 0.08;
+                for i in 0..=n {
+                    let x = -hw + w * i as f32 / n as f32;
+                    b.push(([x - post / 2.0, 0.0, -post / 2.0], [x + post / 2.0, h, post / 2.0], shade(self.color, 0.85), false));
+                }
+                for y in [h * 0.35, h * 0.8] {
+                    b.push(([-hw, y - 0.05, -post / 2.0 - 0.02], [hw, y + 0.05, -post / 2.0], self.color, false));
+                }
+                b
+            }
             SurfaceKind::Box | SurfaceKind::Stage => vec![([-hw, 0.0, -hd], [hw, h, hd], self.color, self.show_output)],
             SurfaceKind::Booth => {
                 let t = 0.04;

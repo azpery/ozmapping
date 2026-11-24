@@ -146,9 +146,54 @@ impl OzApp {
         }
     }
 
-    /// Taille (pixels) de la fenêtre d'une sortie.
-    pub(super) fn out_size(&self, k: usize) -> Vec2 {
+    /// Taille (pixels) de la fenêtre d'une sortie, c'est-à-dire de l'image du VP.
+    pub(super) fn phys_size(&self, k: usize) -> Vec2 {
         if k == 0 { self.output_size } else { self.outs.get(k).map_or(Vec2::new(1920.0, 1080.0), |o| o.size) }
+    }
+
+    /// Taille de l'image composée d'une sortie (aperçu, masques, déformations) : celle de sa
+    /// fenêtre, largeur et hauteur échangées quand le VP est tourné sur le côté.
+    pub(super) fn out_size(&self, k: usize) -> Vec2 {
+        let p = self.phys_size(k);
+        let l = self.project.outputs.get(k).map_or([p.x, p.y], |o| o.logical([p.x, p.y]));
+        Vec2::new(l[0], l[1])
+    }
+
+    /// Image d'une sortie dans `rect` (sa fenêtre) : telle quelle, ou tournée et retournée
+    /// comme le VP l'attend.
+    /// `slot` : image hors écran à utiliser (une par endroit où la sortie est montrée).
+    pub(super) fn paint_output(&mut self, ui: &egui::Ui, rect: Rect, k: usize, slot: usize) {
+        let Some(r) = self.renderer.clone() else { return };
+        let params = self.draw_params_for(k);
+        match self.project.outputs.get(k).filter(|o| o.oriented()) {
+            Some(o) => {
+                let phys = rect.size() * ui.ctx().pixels_per_point();
+                let corners = o.corners([phys.x, phys.y]);
+                let l = o.logical([phys.x, phys.y]);
+                let size = (l[0].round().clamp(1.0, 8192.0) as u32, l[1].round().clamp(1.0, 8192.0) as u32);
+                ui.painter().add(renderer::paint_oriented_callback(rect, r, params, slot, size, corners));
+            }
+            None => {
+                ui.painter().add(renderer::paint_callback(rect, r, params));
+            }
+        }
+    }
+
+    /// Mode édition dans la fenêtre d'une sortie : poignées des formes du calque choisi (sur
+    /// une sortie tournée ou retournée, elles ne tomberaient pas au bon endroit : on édite
+    /// alors sur l'aperçu, qui reste droit).
+    fn output_editor(&mut self, ui: &mut egui::Ui, rect: Rect, k: usize, salt: &str) {
+        if self.project.outputs.get(k).is_some_and(|o| o.oriented()) {
+            ui.painter().text(
+                rect.center_top() + Vec2::new(0.0, 24.0),
+                egui::Align2::CENTER_TOP,
+                "Sortie tournée ou retournée : les formes se règlent sur l'aperçu de la fenêtre principale",
+                egui::FontId::proportional(16.0),
+                WARN,
+            );
+        } else {
+            self.shape_editor(ui, rect, salt);
+        }
     }
 
     /// Une entrée d'état par sortie du projet.
@@ -189,7 +234,7 @@ impl OzApp {
             }
             if ui.small_button(ic::PLUS).on_hover_text("Nouvelle sortie : une autre fenêtre, sur un autre écran, avec ses propres calques").clicked() {
                 let k = self.project.outputs.len();
-                self.project.outputs.push(project::OutputDef { name: format!("Sortie {}", k + 1), screen: None });
+                self.project.outputs.push(project::OutputDef { name: format!("Sortie {}", k + 1), ..Default::default() });
                 self.sync_outputs();
                 self.outs[k].open = true;
                 // Un premier calque pour cette sortie.
@@ -205,21 +250,7 @@ impl OzApp {
             if k > 0 && k < self.outs.len() {
                 ui.separator();
                 ui.toggle_value(&mut self.outs[k].open, "Fenêtre").on_hover_text("Ouvrir / fermer la fenêtre de cette sortie");
-                let current = self.project.outputs[k].screen.clone();
-                let text = self.screens.iter().find(|s| Some(&s.key) == current.as_ref()).map_or("Écran…".to_owned(), |s| s.label.split("  ·").next().unwrap_or_default().to_owned());
-                let mut chosen = None;
-                egui::ComboBox::from_id_salt(("extra_screen", k)).selected_text(text).width(120.0).show_ui(ui, |ui| {
-                    for screen in &self.screens {
-                        if ui.selectable_label(Some(&screen.key) == current.as_ref(), &screen.label).clicked() {
-                            chosen = Some(screen.clone());
-                        }
-                    }
-                });
-                if let Some(screen) = chosen {
-                    self.project.outputs[k].screen = Some(screen.key.clone());
-                    self.outs[k].open = true;
-                    self.outs[k].mv = Some(OutputMove { screen, stage: 0, at: 0.0 });
-                }
+                self.extra_screen_menu(ui, k);
                 let mut fs = self.outs[k].fullscreen;
                 if ui.toggle_value(&mut fs, "Plein écran").changed() {
                     self.outs[k].open = true;
@@ -257,6 +288,25 @@ impl OzApp {
                 }
             }
             self.last_sel = self.sel();
+        }
+    }
+
+    /// Choix de l'écran d'une sortie 2 et suivantes.
+    pub(super) fn extra_screen_menu(&mut self, ui: &mut egui::Ui, k: usize) {
+        let current = self.project.outputs[k].screen.clone();
+        let text = self.screens.iter().find(|s| Some(&s.key) == current.as_ref()).map_or("Écran…".to_owned(), |s| s.label.split("  ·").next().unwrap_or_default().to_owned());
+        let mut chosen = None;
+        egui::ComboBox::from_id_salt(("extra_screen", k)).selected_text(text).width(120.0).show_ui(ui, |ui| {
+            for screen in &self.screens {
+                if ui.selectable_label(Some(&screen.key) == current.as_ref(), &screen.label).clicked() {
+                    chosen = Some(screen.clone());
+                }
+            }
+        });
+        if let Some(screen) = chosen {
+            self.project.outputs[k].screen = Some(screen.key.clone());
+            self.outs[k].open = true;
+            self.outs[k].mv = Some(OutputMove { screen, stage: 0, at: 0.0 });
         }
     }
 
@@ -314,18 +364,18 @@ impl OzApp {
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::BLACK)).show(ui, |ui| {
             let rect = ui.max_rect();
             self.outs[k].size = rect.size() * ctx.pixels_per_point();
-            if let Some(r) = self.renderer.clone() {
-                let params = self.draw_params_for(k);
-                ui.painter().add(renderer::paint_callback(rect, r, params));
-            }
+            self.paint_output(ui, rect, k, k);
+            self.sketch_capture(ui, Some(k));
             let bg = ui.interact(rect, ui.scope_id().with(("extra_bg", k)), Sense::click());
             if bg.double_clicked() && !self.edit_mapping {
                 let fs = !self.outs[k].fullscreen;
                 self.outs[k].fullscreen = fs;
                 ctx.send_viewport_cmd(ViewportCommand::Fullscreen(fs));
             }
-            if self.edit_mapping && self.project.layers[self.sel()].output == k {
-                self.shape_editor(ui, rect, &format!("output{k}"));
+            if self.corner_edit == Some(k) {
+                self.corner_handles(ui, rect, k);
+            } else if self.edit_mapping && self.project.layers[self.sel()].output == k {
+                self.output_editor(ui, rect, k, &format!("output{k}"));
             } else if self.outs[k].fullscreen {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
             }
@@ -350,16 +400,17 @@ impl OzApp {
             .show(ui, |ui| {
                 let rect = ui.max_rect();
                 self.output_size = rect.size() * ctx.pixels_per_point();
-                if let Some(r) = self.renderer.clone() {
-                    ui.painter().add(renderer::paint_callback(rect, r, self.draw_params()));
-                }
+                self.paint_output(ui, rect, 0, 0);
+                self.sketch_capture(ui, Some(0));
                 let bg = ui.interact(rect, ui.scope_id().with("output_bg"), Sense::click());
                 if bg.double_clicked() && !self.edit_mapping {
                     let fs = !self.output_fullscreen;
                     self.set_fullscreen(&ctx, fs);
                 }
-                if self.edit_mapping && self.project.layers[self.sel()].output == 0 {
-                    self.shape_editor(ui, rect, "output");
+                if self.corner_edit == Some(0) {
+                    self.corner_handles(ui, rect, 0);
+                } else if self.edit_mapping && self.project.layers[self.sel()].output == 0 {
+                    self.output_editor(ui, rect, 0, "output");
                 } else if self.output_fullscreen {
                     ctx.set_cursor_icon(egui::CursorIcon::None);
                 }

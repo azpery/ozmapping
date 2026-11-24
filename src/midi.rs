@@ -172,6 +172,35 @@ pub fn fx_param(fx: &mut Effects, k: usize) -> Option<&mut f32> {
     })
 }
 
+/// Ce que montre la sortie : tout, ou un seul genre de calque (onglet Live de l'iPad, pads).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShowMode {
+    #[default]
+    All,
+    /// Le dessin de l'iPad.
+    Drawing,
+    /// Le bassin de la chimie.
+    Chemistry,
+    /// Vidéos et photos.
+    Media,
+    /// Visuels générés.
+    Visual,
+}
+
+impl ShowMode {
+    pub const ALL: [ShowMode; 5] = [ShowMode::All, ShowMode::Drawing, ShowMode::Chemistry, ShowMode::Media, ShowMode::Visual];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ShowMode::All => "Tout",
+            ShowMode::Drawing => "Dessin",
+            ShowMode::Chemistry => "Chimie",
+            ShowMode::Media => "Médias",
+            ShowMode::Visual => "Visuel généré",
+        }
+    }
+}
+
 /// Commande du logiciel déclenchée par un pad, ou réglée par un potentiomètre.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub enum Action {
@@ -217,6 +246,25 @@ pub enum Action {
     LaserArm,
     LaserStop,
     LaserCue { index: usize },
+    /// Tempo divisé par deux / doublé.
+    TempoHalf,
+    TempoDouble,
+    /// Ce que suivent les LEDs (image de la sortie, couleur de la vidéo, couleur unie…).
+    LedSource { source: crate::leds::Source },
+    /// Enchaînement des scénarios LED au hasard (bascule).
+    LedChain,
+    /// Visuel généré sur le calque sélectionné (Off : l'enlève).
+    Visual { pattern: crate::generator::Pattern },
+    /// Montrer / cacher un calque.
+    LayerVisible { layer: usize },
+    /// Enchaînement des colonnes du tableau (bascule).
+    Chain,
+    /// Enregistrement vidéo de la sortie (bascule).
+    Record,
+    /// Mix auto du calque sélectionné (bascule).
+    MixAuto,
+    /// Réaction au rythme du calque sélectionné (bascule).
+    React,
     // --- Potentiomètres : valeurs continues.
     Master,
     /// Opacité d'un calque (aucun : le calque sélectionné).
@@ -226,8 +274,29 @@ pub enum Action {
     /// Durée des transitions entre presets.
     PresetFade,
     LedBrightness,
+    /// Vitesse des scénarios LED (×0,25 à ×4).
+    LedSpeed,
+    /// LEDs : flash sur les temps, luminosité qui suit le volume.
+    LedFlash,
+    LedFollow,
+    /// Teinte de la couleur unie des LEDs.
+    LedHue,
+    /// Durée de chaque scénario quand ils s'enchaînent.
+    LedChainSecs,
     /// Réglage d'effet (index dans `FX_PARAMS`) du calque sélectionné.
     Effect { param: usize },
+    /// Part du visuel généré par-dessus la vidéo, sur le calque sélectionné.
+    VisualMix,
+    /// Calque du dessin à distance : effets, visuel et mix retirés (le dessin tel qu'on le trace).
+    DrawingPlain,
+    /// Ce que montre la sortie (les calques des autres genres sont cachés).
+    Mode { mode: ShowMode },
+    /// Sortie (rang) où vont le dessin et la chimie de l'iPad, et que montre son aperçu.
+    IpadOutput { output: usize },
+    /// Montrer / cacher un groupe de calques (id).
+    GroupVisible { group: u32 },
+    /// Effet d'un groupe de calques (le même encore : arrêté).
+    GroupFx { group: u32, fx: crate::group_fx::GroupFx },
 }
 
 impl Action {
@@ -250,17 +319,29 @@ impl Action {
             Action::Bypass,
             Action::Grid,
             Action::Tap,
+            Action::TempoHalf,
+            Action::TempoDouble,
             Action::Pause,
             Action::Reverse,
             Action::AutoFx,
             Action::Shatter,
             Action::LedLive,
             Action::LedScenario { kind: ScenarioKind::HeartBeat },
+            Action::LedSource { source: crate::leds::Source::Video },
+            Action::LedChain,
+            Action::Chain,
+            Action::Record,
+            Action::MixAuto,
+            Action::React,
             Action::DmxToggle { fixture: 0 },
             Action::DmxHold { fixture: 0 },
             Action::LaserArm,
             Action::LaserStop,
             Action::LaserCue { index: 0 },
+            Action::Mode { mode: ShowMode::Drawing },
+            Action::IpadOutput { output: 0 },
+            Action::GroupVisible { group: 1 },
+            Action::GroupFx { group: 1, fx: crate::group_fx::GroupFx::Chase },
         ]
     }
 
@@ -272,8 +353,30 @@ impl Action {
             Action::Speed,
             Action::PresetFade,
             Action::LedBrightness,
+            Action::LedSpeed,
+            Action::LedFlash,
+            Action::LedFollow,
+            Action::LedHue,
+            Action::LedChainSecs,
             Action::Effect { param: 0 },
+            Action::VisualMix,
         ]
+    }
+
+    /// Commande de média ou de lecture : le calque du dessin à distance n'affiche pas de vidéo,
+    /// elle va donc au calque de contenu quand c'est lui qui est choisi. (Effets et visuels,
+    /// eux, vont au calque choisi, dessin compris.)
+    pub fn targets_content(&self) -> bool {
+        matches!(
+            self,
+            Action::LaunchMedia { .. }
+                | Action::NextMedia
+                | Action::PrevMedia
+                | Action::Pause
+                | Action::Reverse
+                | Action::MixAuto
+                | Action::Speed
+        )
     }
 
     /// Même commande, paramètres mis à part.
@@ -312,12 +415,33 @@ impl Action {
             Action::LaserArm => "Lasers : armer / désarmer",
             Action::LaserStop => "Lasers : STOP",
             Action::LaserCue { .. } => "Laser : réglage mémorisé",
+            Action::TempoHalf => "Tempo ÷2",
+            Action::TempoDouble => "Tempo ×2",
+            Action::LedSource { .. } => "LEDs : ce qu'elles suivent",
+            Action::LedChain => "LEDs : enchaîner les scénarios",
+            Action::LedSpeed => "Vitesse des scénarios LED",
+            Action::LedFlash => "LEDs : flash sur les temps",
+            Action::LedFollow => "LEDs : suivent le volume",
+            Action::LedHue => "LEDs : teinte de la couleur unie",
+            Action::LedChainSecs => "LEDs : durée de chaque scénario",
             Action::Master => "Luminosité générale",
             Action::Opacity { .. } => "Opacité d'un calque",
             Action::Speed => "Vitesse de lecture",
             Action::PresetFade => "Durée des transitions",
             Action::LedBrightness => "Luminosité des LEDs",
             Action::Effect { .. } => "Réglage d'effet",
+            Action::Visual { .. } => "Visuel généré",
+            Action::LayerVisible { .. } => "Montrer / cacher un calque",
+            Action::Chain => "Enchaîner les colonnes",
+            Action::Record => "Enregistrer la sortie",
+            Action::MixAuto => "Mix auto (calque)",
+            Action::React => "Réaction au rythme (calque)",
+            Action::VisualMix => "Part du visuel généré",
+            Action::DrawingPlain => "Dessin sans effet",
+            Action::Mode { .. } => "Mode de la sortie",
+            Action::IpadOutput { .. } => "Sortie de l'iPad",
+            Action::GroupVisible { .. } => "Montrer / cacher un groupe",
+            Action::GroupFx { .. } => "Effet de groupe",
         }
     }
 
@@ -336,6 +460,13 @@ impl Action {
             Action::DmxToggle { .. } => "DMX on/off".into(),
             Action::DmxHold { .. } => "DMX à fond".into(),
             Action::LaserCue { index } => format!("Laser {}", index + 1),
+            Action::LedSource { source } => format!("LEDs : {}", source.name().split(" (").next().unwrap_or("")),
+            Action::LedChain => "Enchaîner scénarios".into(),
+            Action::LedSpeed => "Vitesse scénarios".into(),
+            Action::LedFlash => "Flash temps".into(),
+            Action::LedFollow => "Suit volume".into(),
+            Action::LedHue => "Teinte LEDs".into(),
+            Action::LedChainSecs => "Durée scénario".into(),
             Action::Effect { param } => FX_PARAMS.get(*param).map_or("Effet", |p| p.0).to_owned(),
             other => other.title().to_owned(),
         }

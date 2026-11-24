@@ -10,6 +10,7 @@ impl OzApp {
         cell.name = match (&cell.preset, &cell.clip) {
             (Some(p), _) => p.clone(),
             (None, Some(c)) => c.file_stem().map_or_else(|| file_name(c), |s| s.to_string_lossy().into_owned()),
+            (None, None) if cfg.sketch => DRAWING_NAME.to_owned(),
             (None, None) if cfg.generator.pattern != Pattern::Off => cfg.generator.pattern.label().to_owned(),
             _ => format!("Case {}", k + 1),
         };
@@ -48,6 +49,7 @@ impl OzApp {
             speed: player.map(VideoPlayer::speed),
             reverse: player.map(VideoPlayer::is_reverse),
             paused: player.map(VideoPlayer::is_paused),
+            drawing: Some(cfg.sketch),
         }
     }
 
@@ -136,6 +138,8 @@ impl OzApp {
             cfg.react = r;
         }
         cfg.generator = cell.generator;
+        // Case du dessin de l'iPad : le calque le montre ; toute autre case le retire.
+        cfg.sketch = cell.drawing.unwrap_or(false);
         cfg.auto = cell.auto;
         cfg.fit = cell.fit;
         cfg.opacity = cell.opacity;
@@ -180,6 +184,10 @@ impl OzApp {
                 paint_pattern_swatch(&painter, rect, *p, palette);
                 p.label().to_owned()
             }
+            MediaDrag::Drawing => {
+                paint_drawing_swatch(&painter, rect);
+                DRAWING_NAME.to_owned()
+            }
         };
         painter.rect_stroke(rect.expand(3.0), 6.0, Stroke::new(1.5, WARN), egui::StrokeKind::Outside);
         painter.text(
@@ -198,6 +206,7 @@ impl OzApp {
         // Nom automatique d'une case : celui de son média (fichier ou motif).
         let auto_name = |c: &Cell| match &c.clip {
             Some(p) => stem(p),
+            None if c.drawing == Some(true) => DRAWING_NAME.to_owned(),
             None => c.generator.pattern.label().to_owned(),
         };
         let fit = self.project.layers[i].fit;
@@ -211,13 +220,20 @@ impl OzApp {
         match &media {
             MediaDrag::File(path) => {
                 cell.clip = Some(path.clone());
-                // Une vidéo remplace le visuel généré.
+                // Une vidéo remplace le visuel généré (ou le dessin).
                 cell.generator.pattern = Pattern::Off;
+                cell.drawing = Some(false);
             }
             MediaDrag::Pattern(p) => {
                 cell.clip = None;
                 cell.generator.pattern = *p;
                 cell.generator.mix = 1.0;
+                cell.drawing = Some(false);
+            }
+            MediaDrag::Drawing => {
+                cell.clip = None;
+                cell.generator.pattern = Pattern::Off;
+                cell.drawing = Some(true);
             }
         }
         if !renamed {
@@ -235,17 +251,27 @@ impl OzApp {
     pub(super) fn launch_any(&mut self, ctx: &egui::Context, i: usize, media: &MediaDrag) {
         match media {
             MediaDrag::File(path) => {
-                // Une vidéo envoyée remplace le visuel généré du calque.
+                // Une vidéo envoyée remplace le visuel généré (ou le dessin) du calque.
                 self.project.layers[i].generator.pattern = Pattern::Off;
+                self.project.layers[i].sketch = false;
                 self.launch_on(ctx, i, path);
             }
             MediaDrag::Pattern(p) => {
                 // Un visuel généré remplace la vidéo du calque, comme un autre média.
                 self.stop_layer(i);
                 self.project.layers[i].mix.enabled = false;
+                self.project.layers[i].sketch = false;
                 let g = &mut self.project.layers[i].generator;
                 g.pattern = *p;
                 g.mix = 1.0;
+            }
+            MediaDrag::Drawing => {
+                // Le dessin de l'iPad remplace ce que montrait le calque.
+                self.stop_layer(i);
+                let cfg = &mut self.project.layers[i];
+                cfg.mix.enabled = false;
+                cfg.generator.pattern = Pattern::Off;
+                cfg.sketch = true;
             }
         }
     }
@@ -291,6 +317,26 @@ pub(super) enum CellAction {
 pub(super) enum MediaDrag {
     File(PathBuf),
     Pattern(Pattern),
+    /// Le dessin de l'iPad (traits et photos posées dedans), en direct.
+    Drawing,
+}
+
+/// Nom d'une case qui montre le dessin de l'iPad.
+pub(super) const DRAWING_NAME: &str = "Dessin (iPad)";
+
+/// Vignette du dessin de l'iPad : un trait néon sur fond noir.
+pub(super) fn paint_drawing_swatch(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(rect, 3.0, Color32::from_rgb(8, 9, 14));
+    let p = |x: f32, y: f32| egui::pos2(rect.min.x + x * rect.width(), rect.min.y + y * rect.height());
+    let curve: Vec<egui::Pos2> = (0..=16)
+        .map(|k| {
+            let t = k as f32 / 16.0;
+            p(0.12 + 0.76 * t, 0.5 + 0.25 * (t * 9.0).sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(curve.clone(), Stroke::new(4.0, Color32::from_rgba_unmultiplied(46, 230, 255, 70))));
+    painter.add(egui::Shape::line(curve, Stroke::new(1.6, Color32::from_rgb(180, 250, 255))));
+    painter.circle_filled(p(0.78, 0.28), 3.0, Color32::from_rgb(255, 59, 107));
 }
 
 /// Vignette d'un visuel généré : dégradé de sa palette, décalé selon le motif (pour les distinguer).

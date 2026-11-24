@@ -75,7 +75,8 @@ impl OzApp {
 
     /// Taille de la vidéo : la hauteur choisie, aux proportions de la sortie (dimensions paires).
     pub(super) fn record_size(&self) -> (u32, u32) {
-        let aspect = (self.output_size.x / self.output_size.y.max(1.0)).clamp(0.2, 5.0);
+        let o = self.out_size(0);
+        let aspect = (o.x / o.y.max(1.0)).clamp(0.2, 5.0);
         let h = self.rec_height;
         (((h as f32 * aspect).round() as u32) & !1, h & !1)
     }

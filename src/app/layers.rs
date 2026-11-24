@@ -13,6 +13,8 @@ impl OzApp {
         let cfg = LayerConfig {
             name: format!("Calque {n}"),
             output,
+            // Ajouté au-dessus d'un calque groupé : dans le même groupe (les calques d'un groupe se suivent).
+            group: self.project.layers[self.sel()].group,
             ..LayerConfig::default()
         };
         // Nouveau calque juste au-dessus du calque sélectionné.
@@ -30,11 +32,124 @@ impl OzApp {
         self.layers.remove(i);
         self.selected = self.selected.min(self.project.layers.len() - 1);
         self.fx_hidden_alert = None;
+        self.group_pick.clear();
+        self.project.prune_groups();
+    }
+
+    /// Nouvel ordre des calques : `order[k]` = ancien rang du calque placé au rang `k`.
+    fn apply_order(&mut self, order: &[usize]) {
+        let mut cfgs: Vec<Option<LayerConfig>> = std::mem::take(&mut self.project.layers).into_iter().map(Some).collect();
+        let mut rts: Vec<Option<LayerRuntime>> = std::mem::take(&mut self.layers).into_iter().map(Some).collect();
+        self.project.layers = order.iter().filter_map(|&o| cfgs[o].take()).collect();
+        self.layers = order.iter().filter_map(|&o| rts[o].take()).collect();
+        self.selected = order.iter().position(|&o| o == self.selected).unwrap_or(0);
+        self.group_pick.clear();
+        self.fx_hidden_alert = None;
+    }
+
+    /// Déplace un bloc de calques (`items`, rangs) juste avant le calque de rang `at`.
+    fn move_layers(&mut self, items: &[usize], at: usize) {
+        let mut order: Vec<usize> = (0..self.project.layers.len()).collect();
+        crate::leds::move_block(&mut order, items, at);
+        self.apply_order(&order);
+    }
+
+    /// Groupe les calques cochés (et le calque choisi) : ils se suivent, à la place du plus haut.
+    pub(super) fn group_selected(&mut self) {
+        let mut items: Vec<usize> = self.group_pick.iter().copied().filter(|&i| i < self.project.layers.len()).collect();
+        if !items.contains(&self.selected) {
+            items.push(self.selected);
+        }
+        items.sort_unstable();
+        let id = self.project.next_group_id();
+        let n = self.project.groups.len() + 1;
+        self.project.groups.push(crate::project::LayerGroup { id, name: format!("Groupe {n}"), ..Default::default() });
+        for &i in &items {
+            self.project.layers[i].group = id;
+        }
+        let top = *items.last().unwrap();
+        self.move_layers(&items, top + 1);
+        self.project.prune_groups();
+        self.status = Some(format!("{} calque(s) groupé(s) : « Groupe {n} »", items.len()));
+    }
+
+    /// Met le calque `i` dans le groupe `id` (0 : le sort de son groupe), à côté des autres.
+    pub(super) fn set_layer_group(&mut self, i: usize, id: u32) {
+        let old = self.project.layers[i].group;
+        self.project.layers[i].group = id;
+        if id != 0 {
+            // Juste au-dessus du plus haut calque du groupe.
+            if let Some(&top) = self.project.group_members(id).iter().filter(|&&j| j != i).max() {
+                self.move_layers(&[i], top + 1);
+            }
+        } else if old != 0 {
+            // Sorti du groupe : posé juste au-dessus.
+            if let Some(&top) = self.project.group_members(old).iter().max() {
+                if top > i {
+                    self.move_layers(&[i], top + 1);
+                }
+            }
+        }
+        self.project.prune_groups();
+    }
+
+    /// Défait un groupe (ses calques restent à leur place).
+    pub(super) fn ungroup(&mut self, id: u32) {
+        for l in &mut self.project.layers {
+            if l.group == id {
+                l.group = 0;
+            }
+        }
+        self.project.prune_groups();
+    }
+
+    /// Monte ou descend tout un groupe, par-dessus le calque (ou le groupe) voisin.
+    pub(super) fn move_group(&mut self, id: u32, up: bool) {
+        let members = self.project.group_members(id);
+        let (Some(&lo), Some(&hi)) = (members.first(), members.last()) else { return };
+        let n = self.project.layers.len();
+        if up {
+            if hi + 1 >= n {
+                return;
+            }
+            // Voisin du dessus : un calque seul, ou tout son groupe.
+            let g = self.project.layers[hi + 1].group;
+            let end = if g != 0 { self.project.group_members(g).last().copied().unwrap_or(hi + 1) } else { hi + 1 };
+            self.move_layers(&members, end + 1);
+        } else {
+            if lo == 0 {
+                return;
+            }
+            let g = self.project.layers[lo - 1].group;
+            let start = if g != 0 { self.project.group_members(g).first().copied().unwrap_or(lo - 1) } else { lo - 1 };
+            self.move_layers(&members, start);
+        }
+    }
+
+    /// Joue, pour les calques du groupe seulement, leurs cases de la colonne `k`.
+    pub(super) fn play_group_column(&mut self, ctx: &egui::Context, id: u32, k: usize) {
+        for i in self.project.group_members(id) {
+            self.play_cell(ctx, i, k);
+        }
     }
 
     pub(super) fn move_layer(&mut self, i: usize, up: bool) {
         let j = if up { i + 1 } else { i.wrapping_sub(1) };
         if j >= self.project.layers.len() {
+            return;
+        }
+        let (gi, gj) = (self.project.layers[i].group, self.project.layers[j].group);
+        if gi != 0 && gj != gi {
+            // Au bord de son groupe : le calque en sort (il reste juste à côté).
+            self.project.layers[i].group = 0;
+            self.project.prune_groups();
+            return;
+        }
+        if gi == 0 && gj != 0 {
+            // Un calque seul passe par-dessus tout un groupe.
+            let members = self.project.group_members(gj);
+            let at = if up { members.last().map_or(j, |&m| m + 1) } else { members.first().copied().unwrap_or(j) };
+            self.move_layers(&[i], at);
             return;
         }
         self.project.layers.swap(i, j);
@@ -50,7 +165,9 @@ impl OzApp {
     /// Le calque `i` dessine-t-il quelque chose (vidéo, photo ou visuel généré) ?
     pub(super) fn has_content(&self, i: usize) -> bool {
         let rt = &self.layers[i];
-        rt.active().is_some() || rt.gen_shown.0 != Pattern::Off || rt.gen_from.0 != Pattern::Off
+        // Calque du dessin : le dessin remplace sa vidéo.
+        let picture = if self.project.layers[i].sketch { self.sketch.server.is_some() } else { rt.active().is_some() };
+        picture || rt.gen_shown.0 != Pattern::Off || rt.gen_from.0 != Pattern::Off
     }
 
     /// Pourquoi le calque `i` ne se voit pas à l'écran (None s'il est visible).
@@ -59,8 +176,14 @@ impl OzApp {
         if !cfg.visible {
             return Some("il est masqué".into());
         }
+        if let Some(g) = self.project.group_of(i).filter(|g| !g.visible) {
+            return Some(format!("son groupe « {} » est masqué", g.name));
+        }
         if cfg.opacity <= 0.0 {
             return Some("son opacité est à 0".into());
+        }
+        if self.project.layer_opacity(i) <= 0.0 {
+            return Some("l'opacité de son groupe est à 0".into());
         }
         if !self.has_content(i) {
             return Some("il n'a ni vidéo ni visuel".into());
@@ -77,8 +200,8 @@ impl OzApp {
         let front: Vec<(usize, Vec<surface::Point>)> = (i + 1..self.project.layers.len())
             .filter(|&j| {
                 let c = &self.project.layers[j];
-                c.visible
-                    && c.opacity >= 0.99
+                self.project.layer_visible(j)
+                    && self.project.layer_opacity(j) >= 0.99
                     && c.blend == BlendMode::Normal
                     && c.fit != Fit::Contain
                     && c.effects.shatter == Shatter::Off
@@ -141,6 +264,14 @@ impl OzApp {
                     self.add_layer();
                 }
             });
+            let picked = self.group_pick.len();
+            if ui
+                .button(with_icon(ic::FOLDER, &if picked > 0 { format!("Grouper ({})", picked + usize::from(!self.group_pick.contains(&self.selected))) } else { "Grouper".to_owned() }))
+                .on_hover_text("Groupe le calque sélectionné et les calques cochés (Cmd ou Maj + clic sur leur nom). Clic droit sur un calque : le mettre dans un groupe ou l'en sortir.")
+                .clicked()
+            {
+                self.group_selected();
+            }
             ui.label(
                 egui::RichText::new("Tab : calque suivant · en haut = au premier plan")
                     .small()
@@ -167,6 +298,9 @@ impl OzApp {
         let cell_size = Vec2::new(78.0, 30.0);
         let ctx = ui.ctx().clone();
         let mut cell_action: Option<CellAction> = None;
+        let mut group_action: Option<(u32, &str)> = None;
+        let mut group_col = 0usize;
+        let mut layer_group: Option<(usize, u32)> = None;
         // Les cases défilent horizontalement, toutes lignes ensemble ; les cartes des calques restent fixes.
         let offset = self.grid_offset;
         let mut new_offset = offset;
@@ -206,14 +340,106 @@ impl OzApp {
                 }
             });
             for i in (0..n).rev() {
+                // En-tête du groupe au-dessus de son calque le plus haut.
+                let gid = self.project.layers[i].group;
+                let gk = (gid != 0).then(|| self.project.groups.iter().position(|g| g.id == gid)).flatten();
+                if let Some(gk) = gk {
+                    let first = i + 1 == n || self.project.layers[i + 1].group != gid;
+                    if first {
+                        let members = self.project.group_members(gid);
+                        let filled: Vec<bool> = (0..columns)
+                            .map(|k| members.iter().any(|&m| self.project.layers[m].cells.get(k).is_some_and(Option::is_some)))
+                            .collect();
+                        let card_w = self.layer_card_w;
+                        let g = &mut self.project.groups[gk];
+                        ui.horizontal(|ui| {
+                            egui::Frame::new()
+                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                .corner_radius(6.0)
+                                .fill(theme::ACCENT_DIM.gamma_multiply(0.25))
+                                .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.45)))
+                                .show(ui, |ui| {
+                                    ui.set_min_width((card_w - 16.0).max(200.0));
+                                    ui.horizontal(|ui| {
+                                        let caret = if g.collapsed { ic::CARET_RIGHT } else { ic::CARET_DOWN };
+                                        if ui.add(egui::Button::new(caret).frame(false)).on_hover_text(if g.collapsed { "Déplier" } else { "Replier" }).clicked() {
+                                            g.collapsed = !g.collapsed;
+                                        }
+                                        let (eye, eye_color) = if g.visible { (ic::EYE, TEXT) } else { (ic::EYE_SLASH, TEXT_WEAK) };
+                                        if ui
+                                            .add(egui::Button::new(egui::RichText::new(eye).size(16.0).color(eye_color)).frame(false))
+                                            .on_hover_text(if g.visible { "Masquer tout le groupe" } else { "Afficher tout le groupe" })
+                                            .clicked()
+                                        {
+                                            g.visible = !g.visible;
+                                        }
+                                        ui.label(egui::RichText::new(ic::FOLDER).color(ACCENT));
+                                        ui.add(egui::TextEdit::singleline(&mut g.name).desired_width(110.0));
+                                        ui.label(egui::RichText::new(format!("{} calques", members.len())).small().color(TEXT_WEAK));
+                                        ui.label(egui::RichText::new(ic::DROP).color(TEXT_WEAK)).on_hover_text("Opacité du groupe");
+                                        ui.add(egui::Slider::new(&mut g.opacity, 0.0..=1.0).show_value(false))
+                                            .on_hover_text("Opacité du groupe (multiplie celle de chaque calque)");
+                                        if ui.add(theme::icon_button(ic::CARET_UP).small()).on_hover_text("Monter le groupe").clicked() {
+                                            group_action = Some((gid, "up"));
+                                        }
+                                        if ui.add(theme::icon_button(ic::CARET_DOWN).small()).on_hover_text("Descendre le groupe").clicked() {
+                                            group_action = Some((gid, "down"));
+                                        }
+                                        if ui.small_button("Dégrouper").on_hover_text("Les calques restent, sans groupe").clicked() {
+                                            group_action = Some((gid, "ungroup"));
+                                        }
+                                        let fx_on = g.fx.kind != crate::group_fx::GroupFx::Off;
+                                        let label = egui::RichText::new(with_icon(ic::SPARKLE, if fx_on { g.fx.kind.name() } else { "Effet" }))
+                                            .small()
+                                            .color(if fx_on { ACCENT } else { TEXT });
+                                        let open_id = egui::Id::unique(("group_fx_open", gid));
+                                        let open: bool = ui.data(|d| d.get_temp(open_id)).unwrap_or(false);
+                                        if ui.selectable_label(open, label).on_hover_text("Effet de groupe : les calques s'allument tour à tour, chacun de sa couleur").clicked() {
+                                            ui.data_mut(|d| d.insert_temp(open_id, !open));
+                                        }
+                                    });
+                                    let open_id = egui::Id::unique(("group_fx_open", gid));
+                                    if ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false) {
+                                        group_fx_ui(ui, &mut g.fx, gid);
+                                    }
+                                });
+                            // Jouer la colonne pour les calques du groupe seulement.
+                            let out = cells_scroll(10_000 + i).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    for (k, f) in filled.iter().enumerate() {
+                                        let resp = ui.add_enabled(
+                                            *f,
+                                            egui::Button::new(egui::RichText::new(ic::PLAY).small()).min_size(Vec2::new(cell_size.x, 18.0)),
+                                        );
+                                        if resp.on_hover_text("Jouer cette colonne pour les calques du groupe").clicked() {
+                                            group_action = Some((gid, "col"));
+                                            group_col = k;
+                                        }
+                                    }
+                                });
+                            });
+                            if (out.state.clamped_offset().x - offset).abs() > 0.5 {
+                                new_offset = out.state.clamped_offset().x;
+                            }
+                        });
+                    }
+                    if self.project.groups[gk].collapsed {
+                        continue;
+                    }
+                }
                 let selected = i == sel;
+                let picked = self.group_pick.contains(&i);
                 let clip = self.layers[i].active().map(|p| file_name(&p.path));
                 let cfg = &mut self.project.layers[i];
                 let frame = egui::Frame::new()
                     .inner_margin(egui::Margin::symmetric(8, 4))
                     .corner_radius(6.0)
                     .fill(if selected { theme::ACCENT_DIM.gamma_multiply(0.55) } else { CARD })
-                    .stroke(Stroke::new(1.0, if selected { ACCENT.gamma_multiply(0.7) } else { theme::BORDER }));
+                    .stroke(if picked {
+                        Stroke::new(2.0, WARN)
+                    } else {
+                        Stroke::new(1.0, if selected { ACCENT.gamma_multiply(0.7) } else { theme::BORDER })
+                    });
                 let row = ui.horizontal(|ui| {
                 let row = frame
                     .show(ui, |ui| {
@@ -248,6 +474,7 @@ impl OzApp {
                                     [100.0, 20.0],
                                     egui::Button::new(egui::RichText::new(cfg.name.as_str()).color(TEXT)).frame(false),
                                 )
+                                .on_hover_text("Clic : choisir · Cmd ou Maj + clic : cocher pour grouper")
                                 .clicked()
                             {
                                 action = Some((i, "select"));
@@ -299,6 +526,33 @@ impl OzApp {
                     })
                     .response;
                 self.layer_card_w = row.rect.width();
+                // Calque d'un groupe : un trait sur sa gauche.
+                if gid != 0 {
+                    let r = row.rect;
+                    ui.painter().line_segment(
+                        [egui::pos2(r.left() + 1.5, r.top() + 3.0), egui::pos2(r.left() + 1.5, r.bottom() - 3.0)],
+                        Stroke::new(3.0, ACCENT.gamma_multiply(0.6)),
+                    );
+                }
+                // Clic droit sur la carte : groupe du calque.
+                let groups: Vec<(u32, String)> = self.project.groups.iter().map(|g| (g.id, g.name.clone())).collect();
+                row.context_menu(|ui| {
+                    ui.label(egui::RichText::new("Groupe").small().color(TEXT_WEAK));
+                    for (id, name) in &groups {
+                        if *id != gid && ui.button(with_icon(ic::FOLDER, &format!("Mettre dans « {name} »"))).clicked() {
+                            layer_group = Some((i, *id));
+                            ui.close();
+                        }
+                    }
+                    if ui.button(with_icon(ic::PLUS, "Nouveau groupe avec ce calque")).clicked() {
+                        layer_group = Some((i, u32::MAX));
+                        ui.close();
+                    }
+                    if gid != 0 && ui.button("Sortir du groupe").clicked() {
+                        layer_group = Some((i, 0));
+                        ui.close();
+                    }
+                });
                 // Cases du tableau pour ce calque.
                 let out = cells_scroll(i).show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -401,7 +655,29 @@ impl OzApp {
             Some(CellAction::Drop(i, k, media)) => self.drop_media_in_cell(&ctx, i, k, media),
             None => {}
         }
+        let toggle_pick = ui.input(|inp| inp.modifiers.command || inp.modifiers.shift);
+        match group_action {
+            Some((id, "up")) => self.move_group(id, true),
+            Some((id, "down")) => self.move_group(id, false),
+            Some((id, "ungroup")) => self.ungroup(id),
+            Some((id, "col")) => self.play_group_column(&ctx, id, group_col),
+            _ => {}
+        }
+        match layer_group {
+            Some((i, u32::MAX)) => {
+                self.group_pick.clear();
+                self.selected = i;
+                self.group_selected();
+            }
+            Some((i, id)) => self.set_layer_group(i, id),
+            None => {}
+        }
         match action {
+            Some((i, "select")) if toggle_pick => {
+                if !self.group_pick.remove(&i) {
+                    self.group_pick.insert(i);
+                }
+            }
             Some((i, "select")) => self.selected = i,
             Some((i, "up")) => self.move_layer(i, true),
             Some((i, "down")) => self.move_layer(i, false),
@@ -510,4 +786,54 @@ impl OzApp {
             ui.label(egui::RichText::new(with_icon(ic::FILM_REEL, "Mix auto actif sur ce calque")).small().color(ACCENT));
         }
     }
+}
+
+/// Réglages de l'effet d'un groupe (sous son en-tête).
+fn group_fx_ui(ui: &mut egui::Ui, fx: &mut crate::group_fx::GroupEffect, gid: u32) {
+    use crate::group_fx::{GroupFx, GroupPalette};
+    ui.horizontal_wrapped(|ui| {
+        for k in GroupFx::ALL {
+            ui.selectable_value(&mut fx.kind, k, egui::RichText::new(k.name()).small());
+        }
+    });
+    if fx.kind == GroupFx::Off {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if fx.kind != GroupFx::Meter {
+            ui.label(egui::RichText::new("Vitesse").small().color(TEXT_WEAK));
+            let suffix = if fx.sync { " pas/temps" } else { " pas/s" };
+            ui.add(egui::DragValue::new(&mut fx.speed).range(0.05..=16.0).speed(0.02).max_decimals(2).suffix(suffix))
+                .on_hover_text("Nombre de calques qui passent par temps de musique (au tempo) ou par seconde");
+            ui.toggle_value(&mut fx.sync, egui::RichText::new(with_icon(ic::LIGHTNING, "Au tempo")).small())
+                .on_hover_text("Calé sur le tempo (tapé ou détecté), sinon à vitesse fixe");
+            for (v, l) in [(0.25, "¼"), (0.5, "½"), (1.0, "1"), (2.0, "2"), (4.0, "4")] {
+                if ui.small_button(l).on_hover_text("Pas par temps (ou par seconde)").clicked() {
+                    fx.speed = v;
+                }
+            }
+            ui.separator();
+            let dir = if fx.upward { "↑ vers le haut" } else { "↓ vers le bas" };
+            ui.toggle_value(&mut fx.upward, egui::RichText::new(dir).small())
+                .on_hover_text("Sens de passage dans la liste des calques");
+        } else {
+            ui.label(egui::RichText::new("Suit le volume du rythme (onglet Rythme : entrée audio)").small().color(TEXT_WEAK));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt(("group_palette", gid))
+            .selected_text(fx.palette.name())
+            .width(100.0)
+            .show_ui(ui, |ui| {
+                for p in GroupPalette::ALL {
+                    ui.selectable_value(&mut fx.palette, p, p.name());
+                }
+            });
+        ui.label(egui::RichText::new("Couleur").small().color(TEXT_WEAK));
+        ui.add(egui::Slider::new(&mut fx.tint, 0.0..=1.0).show_value(false)).on_hover_text("Force de la couleur posée sur chaque calque");
+        ui.label(egui::RichText::new("Traînée").small().color(TEXT_WEAK));
+        ui.add(egui::Slider::new(&mut fx.trail, 0.0..=1.0).show_value(false)).on_hover_text("Les calques qui s'éteignent le font plus ou moins lentement");
+        ui.label(egui::RichText::new("Éteints").small().color(TEXT_WEAK));
+        ui.add(egui::Slider::new(&mut fx.dim, 0.0..=1.0).show_value(false)).on_hover_text("Niveau des calques éteints (0 : noirs)");
+    });
 }

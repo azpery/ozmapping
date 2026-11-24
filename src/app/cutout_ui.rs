@@ -258,10 +258,56 @@ impl OzApp {
         }
     }
 
+    /// Objet photographié et détouré au stylet sur l'iPad : mappé sur le calque choisi, comme
+    /// depuis la fenêtre « Masque depuis une photo ». Photo prise sur un écran blanc : l'image
+    /// projetée y est cherchée pour caler le masque exactement sur l'objet.
+    pub(super) fn map_ipad_object(&mut self, ctx: &egui::Context, photo: &Path, mask: &Path, with_photo: bool, calibrate: bool) {
+        let layer = self.sel();
+        let result = (|| -> anyhow::Result<(Vec<Vec<surface::Point>>, bool, Option<[surface::Point; 4]>, bool)> {
+            let img = cutout::load_image(photo)?;
+            let m = image::open(mask)?.to_luma8();
+            let mut cut = Cutout::with_mask(&img, &m);
+            cut.smooth = 0.15;
+            let found = calibrate && {
+                cut.projection = cut.detect_projection();
+                cut.projection.is_some()
+            };
+            let o = self.out_size(self.project.layers[layer].output);
+            let aspect = (o.x / o.y.max(1.0)).clamp(0.2, 5.0);
+            let (rings, nonzero) = cut.rings(aspect)?;
+            Ok((rings, nonzero, cut.photo_corners()?, found))
+        })();
+        let _ = std::fs::remove_file(mask);
+        let name = self.project.layers[layer].name.clone();
+        let note = match result {
+            Ok((rings, nonzero, corners, found)) => {
+                if with_photo {
+                    self.map_object(ctx, layer, photo, corners, rings, nonzero);
+                } else {
+                    let _ = std::fs::remove_file(photo);
+                    self.apply_mask_rings(layer, rings, nonzero);
+                }
+                let how = if found {
+                    "calé sur l'image projetée"
+                } else if calibrate {
+                    "image projetée introuvable sur la photo : à placer à la main"
+                } else {
+                    "à placer sur la sortie"
+                };
+                format!("{} mappé sur « {name} » ({how})", if with_photo { "Objet" } else { "Masque" })
+            }
+            Err(e) => format!("Objet non mappé : {e:#}"),
+        };
+        self.status = Some(note.clone());
+        if let Some(server) = &self.sketch.server {
+            server.notice(note);
+        }
+    }
+
     /// Mapping d'un objet photographié : la photo joue sur le calque, son masque détouré calé
     /// dessus, et l'ensemble passe en mode placement (image et masque bougent ensemble).
     /// `corners` : coins de la photo sur la sortie quand elle est calée sur l'image projetée.
-    fn map_object(
+    pub(super) fn map_object(
         &mut self,
         ctx: &egui::Context,
         layer: usize,
@@ -288,6 +334,24 @@ impl OzApp {
             }
         }
         self.apply_mask_rings(layer, rings, nonzero);
+        // L'objet entre dans le tableau : photo, position et masque gardés dans la première case
+        // libre du calque (une colonne de plus s'il n'y en a pas), pour le rejouer d'un clic.
+        let free = (0..self.project.columns).find(|&k| self.project.layers[layer].cells.get(k).is_none_or(Option::is_none));
+        let k = match free {
+            Some(k) => Some(k),
+            None if self.project.columns < project::MAX_COLUMNS => {
+                self.project.columns += 1;
+                Some(self.project.columns - 1)
+            }
+            None => None,
+        };
+        if let Some(k) = k {
+            self.record_cell(layer, k);
+            let n = self.project.layers.iter().flat_map(|l| l.cells.iter().flatten()).filter(|c| c.name.starts_with("Objet ")).count();
+            if let Some(Some(c)) = self.project.layers[layer].cells.get_mut(k) {
+                c.name = format!("Objet {}", n + 1);
+            }
+        }
         self.right_tab = RightTab::Photo;
         self.edit_mapping = true;
         self.edit_both = true;

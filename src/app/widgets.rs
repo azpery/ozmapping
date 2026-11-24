@@ -28,6 +28,12 @@ pub(super) fn side_tab(ui: &mut egui::Ui, icon: &str, name: &str, selected: bool
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Petit titre d'une famille dans une liste rangée (presets, visuels).
+pub(super) fn family_title(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(3.0);
+    ui.label(egui::RichText::new(title.to_uppercase()).size(10.5).strong().color(TEXT_WEAK));
+}
+
 /// Jauge CPU : l'app avec ses décodeurs ffmpeg, sur fond de charge totale de la machine.
 pub(super) fn cpu_gauge(ui: &mut egui::Ui, stats: CpuStats) {
     // Couleur selon la charge de l'app ; la partie grise de la barre montre le reste de la machine.

@@ -3,7 +3,7 @@
 //! eframe (backend glow) partage un seul contexte GL entre toutes les fenêtres,
 //! donc les textures sont communes à l'aperçu et à la sortie projecteur.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -17,6 +17,7 @@ use crate::paint::{MAX_DROPS, PaintDraw};
 use crate::road::RoadDraw;
 use crate::surface::Fit;
 use crate::video::FrameSlot;
+use crate::project::{invert3, square_to_quad};
 
 /// Une source vidéo : clé de texture (uid du lecteur) + dernière frame partagée.
 #[derive(Clone)]
@@ -28,7 +29,12 @@ pub struct SourceRef {
 /// Un calque à composer : deux sources (fondu enchaîné), mapping, effets, fusion.
 #[derive(Clone)]
 pub struct LayerDraw {
+    /// Identifiant du calque, stable (sa place dans la liste d'une sortie ne l'est pas) : clé
+    /// de son visuel généré et de ses simulations.
+    pub id: u64,
     pub a: Option<SourceRef>,
+    /// La source A a de la transparence (alpha prémultiplié) : le dessin à distance.
+    pub src_alpha: bool,
     pub b: Option<SourceRef>,
     pub mix: f32,
     /// Maillage de la surface déformée : [x, y, u, v] par sommet (voir `Warp::mesh`).
@@ -79,6 +85,8 @@ pub struct GenDraw {
     pub road: RoadDraw,
     /// Visage qui parle : le personnage et son animation.
     pub face: crate::face::FaceDraw,
+    /// Chimie : gouttes de l'image, iPad penché ou secoué, pas de simulation.
+    pub chem: crate::chem::ChemDraw,
 }
 
 impl GenDraw {
@@ -89,6 +97,11 @@ impl GenDraw {
     /// Le visuel « Taches de peinture » est affiché (seul ou pendant un fondu).
     pub fn uses_paint(&self) -> bool {
         self.from == Pattern::Paint || self.to == Pattern::Paint
+    }
+
+    /// Le visuel « Chimie » est affiché (seul ou pendant un fondu).
+    pub fn uses_chem(&self) -> bool {
+        self.from == Pattern::Chemistry || self.to == Pattern::Chemistry
     }
 
     /// Le visuel « Visage qui parle » est affiché (seul ou pendant un fondu).
@@ -250,21 +263,44 @@ struct PaintSim {
     time: f32,
 }
 
+/// Genre d'une ressource, pour savoir quand elle a servi pour la dernière fois.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Res {
+    Video,
+    Mask,
+    Shape,
+    FacePhoto,
+    Gen,
+    Paint,
+    Face,
+}
+
 pub struct Renderer {
+    /// Dernière utilisation de chaque ressource (toutes sorties confondues), et dernier ménage.
+    seen: HashMap<(Res, u64), std::time::Instant>,
+    swept: std::time::Instant,
     program: glow::Program,
     /// Programme des visuels générés (même source, compilée avec GEN_PASS).
     gen_program: glow::Program,
-    gen_targets: HashMap<usize, GenTarget>,
+    /// Par calque (voir `LayerDraw::id`).
+    gen_targets: HashMap<u64, GenTarget>,
     /// Simulation des taches de peinture (programme, état par calque).
     paint_program: glow::Program,
-    paint_sims: HashMap<usize, PaintSim>,
+    paint_sims: HashMap<u64, PaintSim>,
     /// Tête du visuel « Visage qui parle », créée au premier usage (ou l'erreur qui l'a empêché).
     face: Option<FaceRenderer>,
     face_error: Option<String>,
+    /// Bassins du visuel « Chimie » (programmes créés au premier usage), ou l'erreur qui l'a empêché.
+    chem: Option<crate::chem_gpu::ChemRenderer>,
+    chem_error: Option<String>,
     /// Cible hors écran de l'enregistrement vidéo.
     capture_target: Option<GenTarget>,
     /// Cibles hors écran des images lues pour les LEDs et la scène 3D, une par sortie.
     led_targets: HashMap<usize, GenTarget>,
+    /// Image de chaque sortie tournée ou retournée, posée ensuite dans la fenêtre du VP.
+    output_targets: HashMap<usize, GenTarget>,
+    /// Programme qui pose une image (sortie orientée).
+    blit_program: glow::Program,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     black: glow::Texture,
@@ -272,6 +308,26 @@ pub struct Renderer {
     mask_textures: HashMap<u64, glow::Texture>,
     shape_textures: HashMap<u64, glow::Texture>,
 }
+
+/// Pose l'image d'une sortie dans la fenêtre du VP (tournée, retournée, en perspective) :
+/// chaque pixel de la fenêtre va chercher son point dans l'image (`u_inv` : fenêtre → image,
+/// coordonnées 0..1, y vers le bas), noir en dehors.
+const BLIT_SHADER: &str = r#"
+in vec2 v_pos;
+out vec4 o_color;
+uniform sampler2D u_tex;
+uniform mat3 u_inv;
+void main() {
+    vec3 q = u_inv * vec3(v_pos, 1.0);
+    vec2 uv = q.xy / q.z;
+    if (q.z <= 0.0 || any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+        o_color = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+    o_color = vec4(texture(u_tex, vec2(uv.x, 1.0 - uv.y)).rgb, 1.0);
+}
+"#;
+
 
 const VERTEX_SHADER: &str = r#"
 layout(location = 0) in vec2 a_pos;
@@ -497,6 +553,10 @@ out vec4 out_color;
 uniform sampler2D u_tex_a;
 uniform sampler2D u_tex_b;
 uniform int u_has_a;
+// Source A transparente (dessin à distance) : ce qui n'y est pas dessiné laisse voir les calques dessous.
+uniform int u_src_alpha;
+// Couverture de la source A vue par les lectures de l'image (la plus forte).
+float g_src_a = 0.0;
 uniform int u_has_b;
 uniform float u_mix;
 uniform vec2 u_res;
@@ -2009,6 +2069,7 @@ vec4 time_scene(vec3 pal[4], vec2 uv) {
 // La tête est un maillage dessiné à part dans une texture (voir face_mesh.rs) ; ici, on l'affiche
 // et on lui ajoute son halo.
 uniform sampler2D u_face_tex;
+uniform sampler2D u_chem_tex; // image du bassin « Chimie »
 uniform vec2 u_face_halo; // intensité du halo, 1 = aux couleurs de la palette
 
 vec4 face_scene(vec3 pal[4], vec2 uv) {
@@ -2034,6 +2095,7 @@ vec4 generate(int kind, vec3 pal[4], vec2 uv) {
     if (kind == 32) return road_scene(pal, uv);
     if (kind == 33) return time_scene(pal, uv);
     if (kind == 34) return face_scene(pal, uv);
+    if (kind == 35) return vec4(texture(u_chem_tex, uv).rgb, 1.0);
     vec2 p = (uv - 0.5) * vec2(u_gen_aspect, 1.0) * u_gen_scale;
     vec2 v = pattern(kind, p, u_gen_time);
     return vec4(palette(pal, v.x + u_gen_hue) * v.y, 1.0);
@@ -2099,12 +2161,21 @@ float in_frame(vec2 uv) {
 vec3 fetch(vec2 uv) {
     vec2 ua = fit_uv(uv, u_size_a);
     vec2 ub = fit_uv(uv, u_size_b);
-    vec3 a = u_has_a == 1 ? texture(u_tex_a, ua).rgb * in_frame(ua) : vec3(0.0);
+    vec3 a = vec3(0.0);
+    float aa = 0.0;
+    if (u_has_a == 1) {
+        vec4 ta = texture(u_tex_a, ua) * in_frame(ua);
+        a = ta.rgb;
+        aa = ta.a;
+        g_src_a = max(g_src_a, ta.a);
+    }
     vec3 b = u_has_b == 1 ? texture(u_tex_b, ub).rgb * in_frame(ub) : vec3(0.0);
     vec3 video = mix(a, b, u_mix);
     if (u_gen_on == 0) return video;
     // Visuel généré, calculé à part une fois par image (alpha = part de motif).
     vec4 g = texture(u_gen_tex, uv);
+    // Dessin à distance : il reste par-dessus le visuel généré de son calque.
+    if (u_src_alpha == 1) return a + g.rgb * u_gen_mix * (1.0 - aa);
     return mix(video, g.rgb + video * (1.0 - g.a), u_gen_mix);
 }
 
@@ -2724,6 +2795,12 @@ void main() {
     // Lumières de contour, ajoutées à l'image (seules, à l'extérieur du masque).
     col = (col * m + light) / max(shape_a, 1e-4);
 
+    if (u_src_alpha == 1) {
+        // Image à alpha prémultiplié : couverture du dessin (le visuel généré compte aussi).
+        float sa = max(g_src_a, u_gen_on == 1 ? u_gen_mix : 0.0);
+        col = col / max(sa, 1e-3);
+        coverage *= clamp(sa, 0.0, 1.0);
+    }
     col = clamp(col, 0.0, 1.0);
 
     // 6. Mire de calibration du mapping
@@ -2775,6 +2852,7 @@ impl Renderer {
             let program = Self::compile(gl, "#version 330\n", FRAGMENT_SHADER)?;
             let gen_program = Self::compile(gl, "#version 330\n#define GEN_PASS\n", FRAGMENT_SHADER)?;
             let paint_program = Self::compile(gl, "#version 330\n", PAINT_SIM_SHADER)?;
+            let blit_program = Self::compile(gl, "#version 330\n", BLIT_SHADER)?;
 
             let vao = gl.create_vertex_array()?;
             let vbo = gl.create_buffer()?;
@@ -2794,13 +2872,19 @@ impl Renderer {
             Ok(Self {
                 program,
                 gen_program,
+                seen: HashMap::new(),
+                swept: std::time::Instant::now(),
                 gen_targets: HashMap::new(),
                 paint_program,
                 paint_sims: HashMap::new(),
                 face: None,
                 face_error: None,
+                chem: None,
+                chem_error: None,
                 capture_target: None,
                 led_targets: HashMap::new(),
+                output_targets: HashMap::new(),
+                blit_program,
                 vao,
                 vbo,
                 black,
@@ -2840,6 +2924,14 @@ impl Renderer {
             gl.delete_program(self.program);
             gl.delete_program(self.gen_program);
             gl.delete_program(self.paint_program);
+            gl.delete_program(self.blit_program);
+            if let Some(mut chem) = self.chem.take() {
+                chem.destroy(gl);
+            }
+            for (_, t) in self.output_targets.drain() {
+                gl.delete_framebuffer(t.fbo);
+                gl.delete_texture(t.texture);
+            }
             if let Some(mut face) = self.face.take() {
                 face.destroy(gl);
             }
@@ -2981,31 +3073,66 @@ impl Renderer {
     }
 
     /// Libère les textures des lecteurs qui ne sont plus utilisés.
+    /// Libère ce qui ne sert plus. Chaque sortie a sa propre liste de calques : on ne peut
+    /// pas juger d'après une seule. On note donc quand chaque ressource a servi (toutes fenêtres
+    /// confondues) et on ne libère que celles oubliées depuis quelques secondes.
     fn collect_garbage(&mut self, gl: &glow::Context, p: &DrawParams) {
-        let alive: HashSet<u64> = p
-            .layers
-            .iter()
-            .flat_map(|l| [&l.a, &l.b])
-            .flatten()
-            .map(|s| s.key)
-            .collect();
+        const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+        let now = std::time::Instant::now();
+        for l in &p.layers {
+            for s in [&l.a, &l.b].into_iter().flatten() {
+                self.seen.insert((Res::Video, s.key), now);
+            }
+            if let Some(m) = &l.mask {
+                self.seen.insert((Res::Mask, m.key), now);
+            }
+            if let Some(s) = &l.shape {
+                self.seen.insert((Res::Shape, s.key), now);
+            }
+            if let Some(f) = &l.face_photo {
+                self.seen.insert((Res::FacePhoto, f.key), now);
+            }
+            let g = &l.generator;
+            if g.is_active() {
+                self.seen.insert((Res::Gen, l.id), now);
+            }
+            if g.uses_paint() {
+                self.seen.insert((Res::Paint, l.id), now);
+            }
+            if g.uses_face() {
+                self.seen.insert((Res::Face, l.id), now);
+            }
+        }
+        // Au plus une fois par seconde : le reste du temps, rien n'est oublié.
+        if now.duration_since(self.swept) < std::time::Duration::from_secs(1) {
+            return;
+        }
+        self.swept = now;
+        let seen = &self.seen;
+        let alive = |kind: Res, key: u64| seen.get(&(kind, key)).is_some_and(|t| now.duration_since(*t) < GRACE);
         self.textures.retain(|key, t| {
-            let keep = alive.contains(key);
+            let keep = alive(Res::Video, *key);
             if !keep {
                 unsafe { gl.delete_texture(t.texture) };
             }
             keep
         });
-        let masks: HashSet<u64> = p.layers.iter().filter_map(|l| l.mask.as_ref()).map(|m| m.key).collect();
         self.mask_textures.retain(|key, t| {
-            let keep = masks.contains(key);
+            let keep = alive(Res::Mask, *key);
             if !keep {
                 unsafe { gl.delete_texture(*t) };
             }
             keep
         });
-        self.gen_targets.retain(|k, t| {
-            let keep = p.layers.get(*k).is_some_and(|l| l.generator.is_active());
+        self.shape_textures.retain(|key, t| {
+            let keep = alive(Res::Shape, *key);
+            if !keep {
+                unsafe { gl.delete_texture(*t) };
+            }
+            keep
+        });
+        self.gen_targets.retain(|key, t| {
+            let keep = alive(Res::Gen, *key);
             if !keep {
                 unsafe {
                     gl.delete_framebuffer(t.fbo);
@@ -3014,26 +3141,21 @@ impl Renderer {
             }
             keep
         });
-        if let Some(face) = &mut self.face {
-            face.retain(gl, |k| p.layers.get(k).is_some_and(|l| l.generator.uses_face()));
-            let photos: HashSet<u64> = p.layers.iter().filter_map(|l| l.face_photo.as_ref()).map(|f| f.key).collect();
-            face.retain_photos(gl, |key| photos.contains(&key));
-        }
-        self.paint_sims.retain(|k, sim| {
-            let keep = p.layers.get(*k).is_some_and(|l| l.generator.uses_paint());
+        self.paint_sims.retain(|key, sim| {
+            let keep = alive(Res::Paint, *key);
             if !keep {
                 unsafe { Self::delete_paint_sim(gl, sim) };
             }
             keep
         });
-        let shapes: HashSet<u64> = p.layers.iter().filter_map(|l| l.shape.as_ref()).map(|s| s.key).collect();
-        self.shape_textures.retain(|key, t| {
-            let keep = shapes.contains(key);
-            if !keep {
-                unsafe { gl.delete_texture(*t) };
-            }
-            keep
-        });
+        if let Some(face) = &mut self.face {
+            face.retain(gl, |k| alive(Res::Face, k as u64));
+            face.retain_photos(gl, |key| alive(Res::FacePhoto, key));
+        }
+        if let Some(chem) = &mut self.chem {
+            unsafe { chem.forget_unused(gl) };
+        }
+        self.seen.retain(|_, t| now.duration_since(*t) < GRACE);
     }
 
     /// Visuels générés : chaque calque qui en a un le reçoit dans sa texture, une seule fois
@@ -3059,11 +3181,12 @@ impl Renderer {
                 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
             ];
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&full), glow::STREAM_DRAW);
-            for (k, layer) in p.layers.iter().enumerate() {
+            for layer in &p.layers {
                 let g = &layer.generator;
                 if !g.is_active() {
                     continue;
                 }
+                let k = layer.id;
                 // Les visuels 3D (lancer de rayons) sont calculés en plus basse définition.
                 // La route, dessinée au trait, garde une définition intermédiaire.
                 let uses = |f: fn(Pattern) -> bool| f(g.from) || f(g.to);
@@ -3089,7 +3212,16 @@ impl Renderer {
                 // Taches de peinture : une étape de simulation, dont le résultat est lu ensuite.
                 let paint = if g.uses_paint() { self.step_paint(gl, k, g) } else { None };
                 // Visage qui parle : la tête est dessinée dans sa propre texture, lue ensuite (unité 5).
-                let face = if g.uses_face() { self.render_face(gl, k, size, g, layer.face_photo.as_ref()) } else { None };
+                let face = if g.uses_face() { self.render_face(gl, k as usize, size, g, layer.face_photo.as_ref()) } else { None };
+                // Chimie : une étape du bassin (le quad plein écran est en place).
+                let chem = if g.uses_chem() {
+                    gl.bind_vertex_array(Some(self.vao));
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&full), glow::STREAM_DRAW);
+                    self.step_chem(gl, g)
+                } else {
+                    None
+                };
                 if g.uses_face() {
                     gl.bind_vertex_array(Some(self.vao));
                     gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
@@ -3107,6 +3239,12 @@ impl Renderer {
                         gl.uniform_1_i32(loc(name).as_ref(), unit as i32);
                     }
                     gl.uniform_2_f32(loc("u_paint_texel").as_ref(), 1.0 / size.0 as f32, 1.0 / size.1 as f32);
+                }
+                if g.uses_chem() {
+                    gl.active_texture(glow::TEXTURE6);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(chem.unwrap_or(self.black)));
+                    gl.uniform_1_i32(gl.get_uniform_location(self.gen_program, "u_chem_tex").as_ref(), 6);
+                    gl.active_texture(glow::TEXTURE0);
                 }
                 if g.uses_face() {
                     gl.active_texture(glow::TEXTURE5);
@@ -3134,6 +3272,21 @@ impl Renderer {
         }
     }
 
+    /// Une étape du bassin « Chimie » du calque `k` (programmes créés au premier usage).
+    unsafe fn step_chem(&mut self, gl: &glow::Context, g: &GenDraw) -> Option<glow::Texture> {
+        if self.chem.is_none() && self.chem_error.is_none() {
+            let compile = |header: &str| unsafe { Self::compile(gl, header, crate::chem_gpu::ChemRenderer::shader()) };
+            match crate::chem_gpu::ChemRenderer::new(compile) {
+                Ok(c) => self.chem = Some(c),
+                Err(e) => {
+                    eprintln!("chimie : {e}");
+                    self.chem_error = Some(e);
+                }
+            }
+        }
+        unsafe { self.chem.as_mut()?.step(gl, &g.chem, g.aspect) }
+    }
+
     /// Dessine la tête du visuel « Visage qui parle » du calque `k` (ressources créées au premier usage).
     unsafe fn render_face(
         &mut self,
@@ -3157,7 +3310,7 @@ impl Renderer {
     }
 
     /// Texture + framebuffer du visuel généré du calque `k`, (re)créés à la bonne taille.
-    unsafe fn gen_target(&mut self, gl: &glow::Context, k: usize, size: (u32, u32)) -> Option<&mut GenTarget> {
+    unsafe fn gen_target(&mut self, gl: &glow::Context, k: u64, size: (u32, u32)) -> Option<&mut GenTarget> {
         unsafe {
             if self.gen_targets.get(&k).is_some_and(|t| t.size != size) {
                 let t = self.gen_targets.remove(&k).unwrap();
@@ -3198,7 +3351,7 @@ impl Renderer {
     }
 
     /// Textures de simulation du calque `k` (remises à zéro si la taille change).
-    unsafe fn paint_sim(&mut self, gl: &glow::Context, k: usize, size: (u32, u32)) -> Option<&mut PaintSim> {
+    unsafe fn paint_sim(&mut self, gl: &glow::Context, k: u64, size: (u32, u32)) -> Option<&mut PaintSim> {
         unsafe {
             if self.paint_sims.get(&k).is_some_and(|s| s.size != size) {
                 let sim = self.paint_sims.remove(&k).unwrap();
@@ -3257,7 +3410,7 @@ impl Renderer {
     /// Avance la simulation de peinture du calque `k` d'une image (une seule fois par image,
     /// même si l'aperçu et la sortie la demandent). Renvoie les textures de l'état courant
     /// (peinture, eau) et leur taille.
-    unsafe fn step_paint(&mut self, gl: &glow::Context, k: usize, g: &GenDraw) -> Option<([glow::Texture; 2], (u32, u32))> {
+    unsafe fn step_paint(&mut self, gl: &glow::Context, k: u64, g: &GenDraw) -> Option<([glow::Texture; 2], (u32, u32))> {
         unsafe {
             // Définition de la simulation : le grain fin est ajouté au rendu.
             let h = 640u32;
@@ -3386,6 +3539,58 @@ impl Renderer {
         out
     }
 
+    /// Sortie tournée ou retournée : la composition est rendue hors écran à sa taille
+    /// (`size`, celle de l'aperçu), puis posée dans la fenêtre du VP, coins à `corners`
+    /// (haut-gauche, haut-droit, bas-droit, bas-gauche ; fractions de la fenêtre, y vers le bas).
+    pub fn paint_oriented(
+        &mut self,
+        gl: &glow::Context,
+        info: &egui::PaintCallbackInfo,
+        p: &DrawParams,
+        slot: usize,
+        size: (u32, u32),
+        corners: [[f32; 2]; 4],
+    ) {
+        let mut target = self.output_targets.remove(&slot);
+        let texture = self.render_offscreen(gl, &mut target, size, p, false).map(|(t, _)| t);
+        if let Some(t) = target {
+            self.output_targets.insert(slot, t);
+        }
+        let Some(texture) = texture else { return };
+        unsafe {
+            let vp = info.viewport_in_pixels();
+            let clip = info.clip_rect_in_pixels();
+            let left = vp.left_px.max(clip.left_px);
+            let bottom = vp.from_bottom_px.max(clip.from_bottom_px);
+            let right = (vp.left_px + vp.width_px).min(clip.left_px + clip.width_px);
+            let top = (vp.from_bottom_px + vp.height_px).min(clip.from_bottom_px + clip.height_px);
+            gl.enable(glow::SCISSOR_TEST);
+            gl.scissor(left, bottom, (right - left).max(0), (top - bottom).max(0));
+            gl.clear_color(0.0, 0.0, 0.0, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(self.blit_program));
+            gl.bind_vertex_array(Some(self.vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+            gl.uniform_1_i32(gl.get_uniform_location(self.blit_program, "u_tex").as_ref(), 0);
+            let inv = invert3(square_to_quad(corners));
+            let flat: Vec<f32> = inv.iter().flatten().copied().collect();
+            gl.uniform_matrix_3_f32_slice(gl.get_uniform_location(self.blit_program, "u_inv").as_ref(), true, &flat);
+            // Toute la fenêtre : le shader trouve le point de l'image sous chaque pixel.
+            let full: [f32; 24] = [
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, //
+                0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0,
+            ];
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, as_bytes(&full), glow::STREAM_DRAW);
+            gl.draw_arrays(glow::TRIANGLES, 0, 6);
+            gl.bind_texture(glow::TEXTURE_2D, None);
+            gl.bind_vertex_array(None);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+        }
+    }
+
     fn capture_into(
         &mut self,
         gl: &glow::Context,
@@ -3393,6 +3598,19 @@ impl Renderer {
         size: (u32, u32),
         p: &DrawParams,
     ) -> Option<Vec<u8>> {
+        self.render_offscreen(gl, target, size, p, true).and_then(|(_, pixels)| pixels)
+    }
+
+    /// Rend la composition dans `target` (créée ou refaite à la taille `size`) ; avec `read`,
+    /// lit aussi l'image (RGBA, lignes du bas vers le haut). L'état GL est rétabli ensuite.
+    fn render_offscreen(
+        &mut self,
+        gl: &glow::Context,
+        target: &mut Option<GenTarget>,
+        size: (u32, u32),
+        p: &DrawParams,
+        read: bool,
+    ) -> Option<(glow::Texture, Option<Vec<u8>>)> {
         self.collect_garbage(gl, p);
         unsafe {
             self.render_generators(gl, p);
@@ -3435,16 +3653,20 @@ impl Renderer {
             gl.scissor(0, 0, size.0 as i32, size.1 as i32);
             self.draw_scene(gl, (size.0 as f32, size.1 as f32), p);
 
-            let mut pixels = vec![0u8; size.0 as usize * size.1 as usize * 4];
-            gl.read_pixels(
-                0,
-                0,
-                size.0 as i32,
-                size.1 as i32,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelPackData::Slice(Some(&mut pixels)),
-            );
+            let pixels = read.then(|| {
+                let mut pixels = vec![0u8; size.0 as usize * size.1 as usize * 4];
+                gl.read_pixels(
+                    0,
+                    0,
+                    size.0 as i32,
+                    size.1 as i32,
+                    glow::RGBA,
+                    glow::UNSIGNED_BYTE,
+                    glow::PixelPackData::Slice(Some(&mut pixels)),
+                );
+                pixels
+            });
+            let texture = target.as_ref()?.texture;
 
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, prev_fbo);
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, prev_read);
@@ -3453,7 +3675,7 @@ impl Renderer {
             if !scissor {
                 gl.disable(glow::SCISSOR_TEST);
             }
-            Some(pixels)
+            Some((texture, pixels))
         }
     }
 
@@ -3478,8 +3700,8 @@ impl Renderer {
             gl.uniform_1_i32(loc("u_solid").as_ref(), 0);
             gl.uniform_2_f32(loc("u_res").as_ref(), res.0, res.1);
 
-            for (k, layer) in p.layers.iter().enumerate() {
-                self.paint_layer(gl, k, layer, p.time);
+            for layer in &p.layers {
+                self.paint_layer(gl, layer, p.time);
             }
 
             // Master / blackout : voile noir par-dessus la composition.
@@ -3513,7 +3735,7 @@ impl Renderer {
         }
     }
 
-    unsafe fn paint_layer(&mut self, gl: &glow::Context, k: usize, layer: &LayerDraw, time: f32) {
+    unsafe fn paint_layer(&mut self, gl: &glow::Context, layer: &LayerDraw, time: f32) {
         let a = layer.a.as_ref().and_then(|s| self.upload(gl, s));
         let b = layer.b.as_ref().and_then(|s| self.upload(gl, s));
         let mask = layer.mask.as_ref().and_then(|m| Some((m.invert, self.mask_texture(gl, m)?)));
@@ -3540,6 +3762,7 @@ impl Renderer {
             gl.active_texture(glow::TEXTURE0);
 
             i("u_has_a", a.is_some() as i32);
+            i("u_src_alpha", (layer.src_alpha && a.is_some()) as i32);
             i("u_has_b", b.is_some() as i32);
             // Tant que B n'a pas d'image on reste sur A ; sans A : fondu depuis le noir.
             f("u_mix", if b.is_some() { layer.mix } else { 0.0 });
@@ -3625,7 +3848,7 @@ impl Renderer {
 
             let g = &layer.generator;
             // Visuel généré : texture rendue à part (voir `render_generators`), unité 4.
-            let gen_tex = self.gen_targets.get(&k).filter(|_| gen_on).map(|t| t.texture);
+            let gen_tex = self.gen_targets.get(&layer.id).filter(|_| gen_on).map(|t| t.texture);
             i("u_gen_on", gen_tex.is_some() as i32);
             gl.active_texture(glow::TEXTURE4);
             gl.bind_texture(glow::TEXTURE_2D, Some(gen_tex.unwrap_or(self.black)));
@@ -3727,6 +3950,23 @@ pub fn paint_callback(rect: egui::Rect, renderer: Arc<Mutex<Renderer>>, params: 
     }
 }
 
+/// Callback d'une sortie tournée ou retournée (voir `Renderer::paint_oriented`).
+pub fn paint_oriented_callback(
+    rect: egui::Rect,
+    renderer: Arc<Mutex<Renderer>>,
+    params: DrawParams,
+    slot: usize,
+    size: (u32, u32),
+    corners: [[f32; 2]; 4],
+) -> egui::PaintCallback {
+    egui::PaintCallback {
+        rect,
+        callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
+            renderer.lock().unwrap().paint_oriented(painter.gl(), &info, &params, slot, size, corners);
+        })),
+    }
+}
+
 /// Callback qui, si une image est due, rend la sortie hors écran et l'ajoute à l'enregistrement.
 pub fn capture_callback(
     rect: egui::Rect,
@@ -3778,6 +4018,26 @@ fn as_bytes(v: &[f32]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn perspective_placement_round_trips() {
+        // Le pixel de la fenêtre où tombe un point de l'image revient à ce point.
+        let quad = [[0.2, 0.05], [0.85, 0.15], [0.95, 0.9], [0.1, 0.8]];
+        let m = square_to_quad(quad);
+        let inv = invert3(m);
+        let apply = |m: [[f32; 3]; 3], p: [f32; 2]| {
+            let v = [0, 1, 2].map(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2]);
+            [v[0] / v[2], v[1] / v[2]]
+        };
+        for (k, c) in [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]].into_iter().enumerate() {
+            let q = apply(m, c);
+            assert!((q[0] - quad[k][0]).abs() < 1e-4 && (q[1] - quad[k][1]).abs() < 1e-4, "coin {k} : {q:?}");
+        }
+        for p in [[0.3, 0.7], [0.5, 0.5], [0.9, 0.2]] {
+            let back = apply(inv, apply(m, p));
+            assert!((back[0] - p[0]).abs() < 1e-4 && (back[1] - p[1]).abs() < 1e-4);
+        }
+    }
 
     #[test]
     fn stopped_animations_return_to_neutral() {

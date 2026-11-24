@@ -1,0 +1,1438 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="OZ Mapping">
+<meta name="theme-color" content="#0b0d12">
+<title>OZ Mapping</title>
+<style>
+:root {
+  --bg: #0b0d12; --panel: #161a22; --panel2: #1f2430; --panel3: #2a3040; --text: #e8eaf0; --weak: #8a91a3;
+  --accent: #5ad19a; --accent-ink: #062014; --warn: #ff6b6b; --rec: #ff3b4f;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 15px -apple-system, system-ui, sans-serif; overflow: hidden;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; overscroll-behavior: none; }
+body { display: flex; flex-direction: row;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+
+/* Toile (ce qui sort vraiment) et panneau de réglages à côté ; en portrait, le panneau passe dessous. */
+#left { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#top { display: flex; align-items: center; gap: 8px; padding: 6px 10px; flex: none; }
+#status { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--weak); min-width: 0; flex: 1; }
+#status span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#dot { width: 9px; height: 9px; border-radius: 50%; background: var(--warn); flex: none; }
+#dot.on { background: var(--accent); }
+#stage { flex: 1; position: relative; min-height: 0; }
+canvas { position: absolute; touch-action: none; background: #000; border-radius: 6px; box-shadow: 0 0 0 1px #2a3040; }
+#panel { width: 390px; flex: none; background: var(--panel); border-left: 1px solid #252b38; display: flex; flex-direction: column; min-height: 0; }
+body.full #panel { display: none; }
+/* Barre rapide sur le bord de la toile : chaque bouton montre le réglage et ouvre un petit menu. */
+#quick { position: absolute; left: 6px; top: 50%; transform: translateY(-50%); display: flex; flex-direction: column;
+  gap: 6px; z-index: 5; max-height: 100%; overflow-y: auto; scrollbar-width: none; padding: 2px 0; }
+#quick::-webkit-scrollbar { display: none; }
+#quick button { width: 52px; min-width: 52px; height: 46px; padding: 0 2px; font-size: 11px; line-height: 1.1;
+  background: rgba(31,36,48,.94); border-radius: 12px; overflow: hidden; }
+#quick button.open { box-shadow: 0 0 0 2px var(--accent); }
+#quick .cdot { width: 24px; height: 24px; border-radius: 50%; margin: auto; box-shadow: inset 0 0 0 2px rgba(255,255,255,.25); }
+#quick .wdot { border-radius: 50%; background: var(--text); margin: auto; }
+#pop { position: absolute; left: 66px; z-index: 6; background: var(--panel); border: 1px solid #2a3040; border-radius: 14px;
+  padding: 8px; width: 300px; max-width: calc(100% - 76px); box-shadow: 0 10px 30px rgba(0,0,0,.5); display: none; }
+#pop.on { display: block; }
+#pop h4 { margin: 4px 0 6px; }
+body.wide #quick, body.wide #pop, body.chem #quick, body.chem #pop { display: none; }
+/* Détourage au stylet : la photo en plein écran, les outils dessous. */
+#cutEd { position: fixed; inset: 0; z-index: 50; background: #05060a; display: none; flex-direction: column;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+#cutEd.on { display: flex; }
+#cutStage { flex: 1; position: relative; min-height: 0; overflow: hidden; }
+#cutCv { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
+#cutBar { flex: none; background: var(--panel); border-top: 1px solid #252b38; padding: 8px 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#cutBar .sep { flex: 1; }
+#cutMsg { font-size: 13px; color: var(--accent); min-width: 0; }
+#cutSize { width: 110px; }
+@media (orientation: portrait) {
+  body { flex-direction: column; }
+  #panel { width: auto; height: 44%; border-left: 0; border-top: 1px solid #252b38; }
+}
+#tabs { display: flex; gap: 3px; padding: 6px; flex: none; }
+#tabs button { flex: 1; height: 38px; min-width: 0; padding: 0 4px; background: none; color: var(--weak); }
+#tabs button.on { background: var(--panel3); color: var(--text); font-weight: 600; }
+.page { display: none; flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 4px 10px 16px; }
+.page.on { display: block; }
+
+button { appearance: none; border: 0; background: var(--panel2); color: var(--text); border-radius: 9px;
+  min-width: 40px; height: 40px; padding: 0 10px; font: inherit; font-size: 14px; cursor: pointer; touch-action: manipulation; }
+button.on { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+button.danger { color: var(--warn); }
+button:disabled { opacity: .35; }
+input[type=range] { accent-color: var(--accent); }
+
+h4 { margin: 12px 0 6px; font-size: 11px; color: var(--weak); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+h4:first-child { margin-top: 4px; }
+.wrap { display: flex; flex-wrap: wrap; gap: 5px; }
+.wrap button { flex: 1 1 auto; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: 5px; }
+.grid button { height: 44px; font-size: 13px; line-height: 1.15; padding: 0 6px; }
+.swatch { flex: none !important; width: 36px; min-width: 36px; height: 36px; padding: 0; border-radius: 50%; box-shadow: inset 0 0 0 2px rgba(255,255,255,.15); }
+.swatch.on { box-shadow: 0 0 0 3px var(--panel), 0 0 0 5px var(--text); }
+input[type=color] { width: 36px; height: 36px; border: 0; padding: 0; background: none; border-radius: 50%; }
+.slot { flex: 1 1 34px !important; padding: 0; position: relative; }
+.slot.full::after { content: ""; position: absolute; top: 5px; right: 5px; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+#saveMode.on { background: var(--warn); color: #fff; }
+.slider { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.slider label { font-size: 13px; color: var(--weak); width: 108px; flex: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.slider input { flex: 1; min-width: 0; height: 30px; }
+button.big { height: 54px; font-size: 15px; font-weight: 600; }
+button.hot { background: var(--warn); color: #fff; }
+button.rec.on { background: var(--rec); color: #fff; }
+#tap { height: 64px; font-size: 19px; flex: 2 1 150px; }
+.layer { display: flex; align-items: center; gap: 5px; margin-bottom: 5px; }
+.layer .name { flex: 0 1 120px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: left; }
+.layer .eye { min-width: 38px; padding: 0; }
+.layer input { flex: 1; min-width: 0; }
+details summary { color: var(--weak); font-size: 13px; padding: 8px 0 0; cursor: pointer; }
+.hint { font-size: 12px; color: var(--weak); margin: 6px 0 0; line-height: 1.35; }
+.media { display: grid; grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 6px; }
+.media button { height: auto; padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.media img { width: 100%; aspect-ratio: 16/9; object-fit: cover; background: #000; display: block; pointer-events: none; }
+.media span { font-size: 11px; padding: 4px 5px; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 100%; pointer-events: none; }
+.media button.on { box-shadow: 0 0 0 3px var(--accent); background: var(--panel2); color: var(--text); }
+.msg { margin-top: 8px; font-size: 13px; color: var(--accent); min-height: 1em; }
+#stControls.off { opacity: .4; pointer-events: none; }
+/* Live : tout l'écran pour un maximum de boutons, rangés en colonnes. */
+body.wide #left { display: none; }
+body.wide #panel { width: auto; height: auto; flex: 1; border: 0; min-width: 0; }
+#panel, .page { min-width: 0; overflow-x: hidden; }
+.livegrid { display: flex; gap: 10px; align-items: flex-start; }
+.lcol { flex: 1 1 0; min-width: 0; }
+/* Longues listes (presets, visuels) : elles défilent dans leur carte, tout tient sur l'écran. */
+.grid .fam { grid-column: 1 / -1; margin: 6px 0 0; font-size: 10px; color: var(--weak); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+.grid .fam:first-child { margin-top: 0; }
+.grid.long { max-height: 52vh; overflow-y: auto; -webkit-overflow-scrolling: touch; padding-right: 2px; }
+.livegrid { width: 100%; overflow: hidden; }
+.card { break-inside: avoid; background: #11141b; border-radius: 12px; padding: 2px 10px 10px; margin-bottom: 10px; }
+.card h4 { margin-top: 8px; }
+#liveStatus { font-size: 12px; color: var(--weak); padding: 0 4px 6px; }
+</style>
+</head>
+<body>
+<div id="left">
+  <div id="top">
+    <div id="status"><div id="dot"></div><span id="msg">Connexion…</span></div>
+  </div>
+  <div id="stage"><canvas id="c"></canvas><div id="quick"></div><div id="pop"></div></div>
+</div>
+
+<div id="panel">
+  <div id="tabs">
+    <button data-tab="draw" class="on">Dessin</button><button data-tab="photos">Photos</button>
+    <button data-tab="chem">Chimie</button><button data-tab="live">Live</button><button data-tab="media">Médias</button>
+  </div>
+
+  <!-- ======================= Dessin -->
+  <div class="page on" id="p-draw">
+    <h4>Outil</h4><div class="wrap" data-k="tool">
+      <button data-v="free">Main levée</button><button data-v="line">Ligne</button><button data-v="rect">Rectangle</button>
+      <button data-v="circle">Cercle</button><button data-v="erase">Gomme</button></div>
+    <h4>Couleur</h4><div class="wrap" id="colors"></div>
+    <h4>Pinceau</h4><div class="wrap" data-k="brush">
+      <button data-v="line">Trait</button><button data-v="neon">Néon</button><button data-v="rainbow">Arc-en-ciel</button>
+      <button data-v="sparkle">Étincelles</button><button data-v="spray">Aérographe</button><button data-v="dots">Pointillés</button></div>
+    <div class="slider"><label>Épaisseur</label><input id="width" type="range" min="1" max="100" value="30"></div>
+    <h4>S'efface après</h4><div class="wrap" data-k="life">
+      <button data-v="0">Jamais</button><button data-v="1">1 s</button><button data-v="3">3 s</button>
+      <button data-v="8">8 s</button><button data-v="20">20 s</button></div>
+    <h4>En disparaissant</h4><div class="wrap" data-k="out">
+      <button data-v="fade">Fondu</button><button data-v="shrink">Rétrécit</button><button data-v="tail">Se rembobine</button>
+      <button data-v="rise">S'envole</button><button data-v="burst">Explose</button><button data-v="melt">Coule</button>
+      <button data-v="trail">Comète</button></div>
+    <h4>Animation</h4><div class="wrap" data-k="anim">
+      <button data-v="none">Fixe</button><button data-v="pulse">Au tempo</button><button data-v="blink">Clignote</button>
+      <button data-v="wave">Ondule</button><button data-v="spin">Tourne</button><button data-v="float">Flotte</button>
+      <button data-v="trace">Se dessine</button></div>
+    <h4>Symétrie</h4><div class="wrap" data-k="sym">
+      <button data-v="1">Aucune</button><button data-v="2">Miroir</button><button data-v="4">×4</button>
+      <button data-v="6">Kaléido 6</button><button data-v="8">Kaléido 8</button></div>
+    <h4>Mémoires</h4><div class="wrap" id="slots">
+      <button id="saveMode" title="Toucher ensuite une mémoire pour y garder le dessin">Garder</button></div>
+    <p class="hint">Toucher une mémoire la rappelle ; « Garder » puis une mémoire y range le dessin actuel.</p>
+    <h4>&nbsp;</h4><div class="wrap"><button id="undo">Annuler le dernier trait</button><button id="clear" class="danger">Tout effacer</button></div>
+    <h4>Sur l'iPad, montrer</h4><div class="wrap" data-k="show">
+      <button data-v="drawing">Le dessin seul</button><button data-v="screen">Toute la sortie</button></div>
+    <p class="hint">« Toute la sortie » montre aussi les vidéos, visuels et effets, mais demande plus de travail à l'ordinateur.</p>
+    <h4>Calque du dessin</h4><div class="wrap"><button data-a='"DrawingPlain"'>Dessin sans effet</button></div>
+    <p class="hint">Retire les effets et le visuel posés sur le calque du dessin. Dans Live, effets et visuels vont au calque choisi dans « Calques » : choisissez « Dessin » pour agir sur le dessin (le visuel passe alors derrière les traits).</p>
+  </div>
+
+  <!-- ======================= Photos du dessin -->
+  <div class="page" id="p-photos">
+    <h4>Ajouter une photo de l'iPad</h4>
+    <div class="wrap"><button class="big" id="stCut">Détourer au stylet</button><button class="big" id="stWhole">Photo entière</button></div>
+    <p class="hint">« Détourer au stylet » : la photo s'ouvre en grand avec le détourage automatique comme brouillon ; entourez, gommez, puis Valider.</p>
+    <div class="msg" id="stMsg"></div>
+    <p class="hint">Sur la toile : un doigt la déplace, deux doigts l'agrandissent et la tournent. On dessine par-dessus avec l'onglet Dessin.</p>
+    <div id="stControls" class="off">
+      <h4>Photo choisie</h4>
+      <div class="wrap"><button data-st="smaller">− Plus petite</button><button data-st="bigger">+ Plus grande</button>
+        <button data-st="left">⟲</button><button data-st="right">⟳</button><button data-st="flip">Retourner</button></div>
+      <h4>Animation</h4><div class="wrap" data-sk="anim">
+        <button data-v="none">Fixe</button><button data-v="pulse">Au tempo</button><button data-v="spin">Tourne</button>
+        <button data-v="float">Flotte</button><button data-v="wave">Danse</button><button data-v="blink">Clignote</button></div>
+      <h4>Contour lumineux</h4><div class="wrap" data-sk="outline">
+        <button data-v="">Aucun</button><button data-v="color">De la couleur choisie</button></div>
+      <h4>Symétrie</h4><div class="wrap" data-sk="sym">
+        <button data-v="1">Aucune</button><button data-v="2">Miroir</button><button data-v="4">×4</button>
+        <button data-v="6">Kaléido 6</button><button data-v="8">Kaléido 8</button></div>
+      <h4>&nbsp;</h4><div class="wrap"><button data-st="dup">Dupliquer</button><button data-st="del" class="danger">Supprimer</button></div>
+    </div>
+  </div>
+
+  <!-- ======================= Chimie -->
+  <div class="page" id="p-chem">
+    <h4>Verser</h4>
+    <div class="wrap chemIng" data-chem="ing">
+      <button data-v="water">Eau</button><button data-v="milk">Lait</button><button data-v="oil">Huile</button><button data-v="gasoline">Essence</button></div>
+    <h4>Couleurs</h4>
+    <div class="wrap chemIng" data-chem="ing">
+      <button data-v="ink">Encre</button><button data-v="coloring">Colorant</button></div>
+    <h4>Peintures</h4>
+    <div class="wrap chemIng" data-chem="ing">
+      <button data-v="acrylic">Acrylique</button><button data-v="watercolor">Aquarelle</button><button data-v="gouache">Gouache</button>
+      <button data-v="fluo">Fluo</button><button data-v="metallic">Métallisée</button><button data-v="marbling">Marbrure</button></div>
+    <h4>Réactifs</h4>
+    <div class="wrap chemIng" data-chem="ing">
+      <button data-v="soap">Savon</button><button data-v="alcohol">Alcool</button><button data-v="stir">Touiller</button></div>
+    <h4>Électricité</h4>
+    <div class="wrap chemIng" data-chem="ing"><button data-v="lightning">Foudre</button></div>
+    <div class="wrap" style="margin-top:5px"><button id="chemBoltBeat">Foudre sur le rythme</button></div>
+    <h4>Couleur</h4><div class="wrap" id="chemColors"></div>
+    <div class="slider"><label>Taille des gouttes</label><input id="chemSize" type="range" min="1" max="100" value="35"></div>
+    <div class="slider"><label>Se renouvelle</label><input id="chemRenew" type="range" min="0" max="100" value="0"></div>
+    <h4>Le bassin vibre avec</h4><div class="wrap" data-chem="listen">
+      <button data-v="app">Le son de l'ordinateur</button><button data-v="ipad">Le micro de l'iPad</button><button data-v="off">Rien</button></div>
+    <div class="slider"><label>Sensibilité</label><input id="chemSound" type="range" min="0" max="100" value="50"></div>
+    <p class="hint">À 0, rien ne s'efface. Plus haut, les vieilles couleurs, l'huile et l'essence s'estompent peu à peu : le bassin reste vivant au lieu de devenir boueux.
+      La surface vibre avec le son, comme un bassin posé sur un haut-parleur : celui de l'ordinateur (son Rythme), ou celui qu'entend l'iPad, pour suivre une autre musique que l'ordinateur.</p>
+    <h4>Fond du bassin</h4><div class="wrap" data-chem="base">
+      <button data-v="dark">Eau, dans le noir</button><button data-v="lit">Eau éclairée</button><button data-v="milk">Lait</button>
+      <button data-v="oil">Huile de lin</button><button data-v="bubble">Bulle de savon</button></div>
+    <p class="hint">Huile de lin : l'encre, le colorant et l'alcool y éclatent en doigts. Bulle de savon : soufflez dans le micro pour l'agiter.</p>
+    <h4>Souffler</h4>
+    <div class="wrap"><button class="big" id="chemMic">Souffler dans le micro</button></div>
+    <p class="hint" id="chemMicMsg"></p>
+    <h4>Pencher et secouer l'iPad</h4>
+    <div class="wrap"><button class="big" id="chemMotion">Activer</button><button class="big" id="chemShake">Secouer</button></div>
+    <p class="hint" id="chemMotionMsg"></p>
+    <div class="wrap" style="margin-top:6px"><button id="chemFlip">Le liquide part du mauvais côté : inverser</button></div>
+    <h4>&nbsp;</h4><div class="wrap"><button id="chemClear" class="danger">Tout vider</button></div>
+    <p class="hint">Toucher la toile verse l'ingrédient choisi ; glisser en verse une traînée. « Touiller » remue sans rien verser.
+      Essayez : de l'encre puis du savon ; du lait, quelques couleurs de colorant, puis une goutte de savon ; de l'huile colorée
+      puis penchez l'iPad ; de l'essence sur l'eau noire. La chimie s'affiche là où « Chimie (iPad) » est posée dans le tableau (sinon sur un calque vide).</p>
+  </div>
+
+  <!-- ======================= Live -->
+  <div class="page" id="p-live"><p class="hint">En attente d'OZ Mapping…</p></div>
+
+  <!-- ======================= Médias -->
+  <div class="page" id="p-media">
+    <h4>Médias de l'app</h4>
+    <div class="media" id="mediaGrid"></div>
+    <p class="hint">Toucher un média l'envoie sur le calque sélectionné (le dessin reste par-dessus).</p>
+    <h4>Photo de l'iPad sur le calque</h4>
+    <div class="wrap"><button class="big" id="upPlain">Envoyer une photo</button></div>
+    <p class="hint" id="upTarget"></p>
+    <div class="msg" id="upmsg"></div>
+  </div>
+</div>
+<input type="file" id="file" accept="image/*" hidden>
+
+<!-- ======================= Détourage au stylet -->
+<div id="cutEd">
+  <div id="cutStage"><canvas id="cutCv"></canvas></div>
+  <div id="cutBar">
+    <div class="row" data-ck="mode">
+      <button data-v="lasso+">Entourer</button><button data-v="lasso-">Retirer</button>
+      <button data-v="brush+">Pinceau</button><button data-v="brush-">Gomme</button></div>
+    <input id="cutSize" type="range" min="4" max="120" value="28" title="Taille du pinceau">
+    <button id="cutAuto">Auto</button><button id="cutInvert">Inverser</button>
+    <button id="cutUndo">↶</button><button id="cutClear">Vider</button>
+    <span id="cutMsg"></span><span class="sep"></span>
+    <button id="cutCancel" class="danger">Annuler</button><button id="cutOk" class="on">Valider</button>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ======================================================= connexion
+const dot = document.getElementById("dot"), msg = document.getElementById("msg");
+let ws = null, aspect = 16 / 9, preview = null, previews = 0, state = null, stateAt = 0;
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.binaryType = "blob";
+  ws.onopen = () => { dot.classList.add("on"); msg.textContent = "Connecté à OZ Mapping"; sendView(); chemSync(); };
+  ws.onclose = () => { dot.classList.remove("on"); msg.textContent = "Déconnecté, nouvelle tentative…"; setTimeout(connect, 1000); };
+  ws.onmessage = async (e) => {
+    if (typeof e.data !== "string") {
+      try {
+        const img = await createImageBitmap(e.data);
+        if (preview && preview.close) preview.close();
+        preview = img; previews++;
+      } catch (err) {}
+      return;
+    }
+    const m = JSON.parse(e.data);
+    if (m.t === "hello") { aspect = m.aspect; layout(); }
+    else if (m.t === "slots") showSlots(m.full);
+    else if (m.t === "stickers") showStickers(m.list);
+    else if (m.t === "notice") notice(m.text);
+    else if (m.t === "live") { state = m; stateAt = performance.now(); renderLive(); renderMedia(); }
+  };
+}
+function send(m) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); }
+// Message d'OZ Mapping (photo reçue, ajoutée, refusée) : sous les boutons d'envoi et en haut.
+function notice(text) {
+  for (const id of ["stMsg", "upmsg"]) { const el = document.getElementById(id); if (el) el.textContent = text; }
+  msg.textContent = text;
+  clearTimeout(notice.t);
+  notice.t = setTimeout(() => { msg.textContent = ws && ws.readyState === 1 ? "Connecté à OZ Mapping" : msg.textContent; }, 6000);
+}
+// Ce que montre la toile : le dessin seul (léger) ou toute la sortie (effets, visuels…).
+// Onglet Chimie : toujours toute la sortie (le bassin est un visuel de l'app).
+// Après avoir versé de la chimie : toute la sortie aussi en dessinant (le bassin est sous le dessin).
+let chemUsed = false;
+function sendView() { send({ t: "view", w: canvas.width, screen: tool.show === "screen" || tab === "chem" || chemUsed }); }
+
+// ======================================================= panneau
+let tab = "draw";
+for (const b of document.querySelectorAll("#tabs button")) b.onclick = () => {
+  tab = b.dataset.tab;
+  for (const x of document.querySelectorAll("#tabs button")) x.classList.toggle("on", x === b);
+  for (const p of document.querySelectorAll(".page")) p.classList.toggle("on", p.id === "p-" + tab);
+  document.body.classList.toggle("wide", tab === "live");
+  document.body.classList.toggle("chem", tab === "chem");
+  requestAnimationFrame(tab === "live" ? packLive : layout);
+  sendView();
+};
+
+
+// ======================================================= dessin : réglages
+const COLORS = ["#ffffff", "#ff3b6b", "#ff9f1c", "#ffe14d", "#4dff88", "#2ee6ff", "#4d7cff", "#b84dff"];
+const saved = (() => { try { return JSON.parse(localStorage.getItem("oz-dessin") || "{}"); } catch (e) { return {}; } })();
+const tool = Object.assign({ tool: "free", color: "#2ee6ff", brush: "neon", sym: "1", anim: "none", life: "0", out: "fade", width: 30, show: "drawing" }, saved);
+const save = () => { try { localStorage.setItem("oz-dessin", JSON.stringify(tool)); } catch (e) {} };
+const canvas = document.getElementById("c"), ctx = canvas.getContext("2d"), stage = document.getElementById("stage");
+
+const colors = document.getElementById("colors");
+for (const c of COLORS) {
+  const b = document.createElement("button");
+  b.className = "swatch"; b.style.background = c; b.dataset.c = c;
+  b.onclick = () => { tool.color = c; pick.value = c; refresh(); };
+  colors.appendChild(b);
+}
+const pick = document.createElement("input");
+pick.type = "color"; pick.value = tool.color;
+pick.oninput = () => { tool.color = pick.value; refresh(); };
+colors.appendChild(pick);
+for (const row of document.querySelectorAll("[data-k]"))
+  for (const b of row.children) b.onclick = () => {
+    tool[row.dataset.k] = b.dataset.v;
+    // Comète sans durée : une seconde de traînée.
+    if (row.dataset.k === "out" && b.dataset.v === "trail" && tool.life === "0") tool.life = "1";
+    refresh();
+    if (row.dataset.k === "show") sendView();
+  };
+const width = document.getElementById("width");
+width.value = tool.width;
+width.oninput = () => { tool.width = +width.value; refreshQuick(); save(); };
+function refresh() {
+  for (const b of colors.querySelectorAll(".swatch")) b.classList.toggle("on", b.dataset.c === tool.color);
+  for (const row of document.querySelectorAll("[data-k]"))
+    for (const b of row.children) b.classList.toggle("on", b.dataset.v === String(tool[row.dataset.k]));
+  refreshQuick();
+  save();
+}
+
+// ---------- barre rapide (toujours sur la toile) et ses petits menus
+const quick = document.getElementById("quick"), pop = document.getElementById("pop");
+const optionsOf = (k) => [...document.querySelectorAll(`#p-draw [data-k="${k}"] button`)].map((b) => [b.dataset.v, b.textContent]);
+const labelOf = (k) => (optionsOf(k).find(([v]) => v === String(tool[k])) || ["", ""])[1];
+const SHORT = { tool: { free: "Main", line: "Ligne", rect: "Rect.", circle: "Cercle", erase: "Gomme" },
+  sym: { 1: "Sym.", 2: "Miroir", 4: "×4", 6: "Kaléi. 6", 8: "Kaléi. 8" },
+  brush: { line: "Trait", neon: "Néon", rainbow: "Arc-en-<br>ciel", sparkle: "Étin-<br>celles", spray: "Aéro-<br>graphe", dots: "Poin-<br>tillés" },
+  anim: { none: "Fixe", pulse: "Au<br>tempo", blink: "Cli-<br>gnote", wave: "Ondule", spin: "Tourne", float: "Flotte", trace: "Se<br>dessine" } };
+const QUICK = [
+  ["panel", () => document.body.classList.contains("full") ? "◂<br>Panneau" : "Panneau<br>▸"],
+  ["color", () => `<div class="cdot" style="background:${tool.color}"></div>`],
+  ["brush", () => SHORT.brush[tool.brush] || labelOf("brush")],
+  ["width", () => { const d = 4 + tool.width / 100 * 22; return `<div class="wdot" style="width:${d}px;height:${d}px;background:${tool.color}"></div>`; }],
+  ["tool", () => SHORT.tool[tool.tool] || "Outil"],
+  ["life", () => tool.life === "0" ? "Reste" : `Efface<br>${tool.life} s`],
+  ["anim", () => SHORT.anim[tool.anim] || labelOf("anim")],
+  ["sym", () => SHORT.sym[tool.sym]],
+  ["undo", () => "↶<br>Annuler"],
+];
+let popKey = null;
+for (const [k] of QUICK) {
+  const b = document.createElement("button");
+  b.dataset.q = k;
+  b.onclick = (e) => {
+    e.stopPropagation();
+    if (k === "panel") { document.body.classList.toggle("full"); closePop(); refreshQuick(); requestAnimationFrame(layout); return; }
+    if (k === "undo") { send({ t: "undo" }); return; }
+    if (popKey === k) { closePop(); return; }
+    openPop(k, b);
+  };
+  quick.appendChild(b);
+}
+function refreshQuick() {
+  for (const [k, label] of QUICK) {
+    const b = quick.querySelector(`[data-q="${k}"]`);
+    if (b) { b.innerHTML = label(); b.classList.toggle("open", k === popKey); }
+  }
+}
+function closePop() { popKey = null; pop.classList.remove("on"); refreshQuick(); }
+function optionRow(k) {
+  return `<div class="wrap">${optionsOf(k).map(([v, l]) =>
+    `<button data-pk="${k}" data-v="${v}" class="${String(tool[k]) === v ? "on" : ""}">${l}</button>`).join("")}</div>`;
+}
+function openPop(k, anchor) {
+  popKey = k;
+  let h = "";
+  if (k === "color") h = `<div class="wrap">${COLORS.map((c) =>
+    `<button class="swatch ${c === tool.color ? "on" : ""}" style="background:${c}" data-pc="${c}"></button>`).join("")}</div>`;
+  else if (k === "width") h = `<h4>Épaisseur</h4><input id="popWidth" type="range" min="1" max="100" value="${tool.width}" style="width:100%">`;
+  else if (k === "life") h = `<h4>S'efface après</h4>${optionRow("life")}<h4>En disparaissant</h4>${optionRow("out")}`;
+  else h = optionRow(k);
+  pop.innerHTML = h;
+  pop.classList.add("on");
+  const sr = stage.getBoundingClientRect(), ar = anchor.getBoundingClientRect();
+  pop.style.top = Math.max(4, Math.min(ar.top - sr.top, sr.height - pop.offsetHeight - 4)) + "px";
+  refreshQuick();
+}
+pop.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.pc) { tool.color = b.dataset.pc; pick.value = b.dataset.pc; }
+  else if (b.dataset.pk) {
+    tool[b.dataset.pk] = b.dataset.v;
+    if (b.dataset.pk === "out" && b.dataset.v === "trail" && tool.life === "0") tool.life = "1";
+  }
+  refresh();
+  // Un choix fait, le menu se referme (sauf celui de la disparition, qui a deux rangées).
+  if (popKey === "life") openPop("life", quick.querySelector('[data-q="life"]')); else closePop();
+});
+pop.addEventListener("input", (e) => {
+  if (e.target.id === "popWidth") { tool.width = +e.target.value; width.value = tool.width; refreshQuick(); save(); }
+});
+document.addEventListener("pointerdown", (e) => { if (popKey && !pop.contains(e.target) && !quick.contains(e.target)) closePop(); });
+refresh();
+document.getElementById("undo").onclick = () => send({ t: "undo" });
+document.getElementById("clear").onclick = () => { if (confirm("Effacer tout le dessin (traits et photos) ?")) send({ t: "clear" }); };
+
+// Mémoires.
+const slotsRow = document.getElementById("slots"), saveMode = document.getElementById("saveMode");
+let slotFull = [];
+saveMode.onclick = () => saveMode.classList.toggle("on");
+for (let i = 0; i < 8; i++) {
+  const b = document.createElement("button");
+  b.className = "slot"; b.textContent = i + 1;
+  b.onclick = () => {
+    if (saveMode.classList.contains("on")) {
+      if (!slotFull[i] || confirm(`Remplacer la mémoire ${i + 1} par le dessin actuel ?`)) send({ t: "save", slot: i });
+      saveMode.classList.remove("on");
+    } else if (slotFull[i]) send({ t: "recall", slot: i });
+  };
+  slotsRow.insertBefore(b, saveMode);
+}
+function showSlots(full) {
+  slotFull = full;
+  slotsRow.querySelectorAll(".slot").forEach((b, i) => { b.classList.toggle("full", !!full[i]); });
+}
+
+// ======================================================= toile
+let box = { x: 0, y: 0, w: 1, h: 1 };
+function layout() {
+  const r = stage.getBoundingClientRect(), pad = 8, bar = 64;
+  if (r.width < 10 || r.height < 10) return;
+  let w = r.width - bar - pad * 2, h = w / aspect;
+  if (h > r.height - pad * 2) { h = r.height - pad * 2; w = h * aspect; }
+  box = { x: bar + (r.width - bar - w) / 2, y: (r.height - h) / 2, w, h };
+  const dpr = window.devicePixelRatio || 1;
+  Object.assign(canvas.style, { left: box.x + "px", top: box.y + "px", width: w + "px", height: h + "px" });
+  canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+  sendView();
+}
+addEventListener("resize", layout);
+
+let nextId = 1, penSeen = false;
+const live = new Map();     // pointerId -> trait en cours
+const outbox = new Map();   // id -> points pas encore envoyés
+let eraser = null;          // gomme : position et rayon
+
+const pos = (e) => {
+  const r = canvas.getBoundingClientRect();
+  const p = e.pointerType === "pen" ? (e.pressure || 0.5) : (e.pointerType === "touch" ? 0.5 : (e.pressure || 0.5));
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height, Math.min(1, Math.max(0, p))];
+};
+const strokeWidth = () => 0.002 + Math.pow(tool.width / 100, 1.6) * 0.09;
+const eraserSize = () => 0.015 + tool.width / 100 * 0.08;
+const settings = () => ({ color: tool.color, w: strokeWidth(), brush: tool.brush, anim: tool.anim, sym: +tool.sym,
+  life: +tool.life, out: tool.out });
+
+// Forme (ligne, rectangle, cercle) : points du contour, en coordonnées 0..1.
+function shapePoints(kind, a, b) {
+  const W = box.w, H = box.h, pts = [];
+  const lerp = (p, q, k) => [p[0] + (q[0] - p[0]) * k, p[1] + (q[1] - p[1]) * k, 0.5];
+  if (kind === "line") { for (let k = 0; k <= 40; k++) pts.push(lerp(a, b, k / 40)); }
+  else if (kind === "rect") {
+    const c = [[a[0], a[1]], [b[0], a[1]], [b[0], b[1]], [a[0], b[1]], [a[0], a[1]]];
+    for (let s = 0; s < 4; s++) for (let k = 0; k < 20; k++) pts.push(lerp(c[s], c[s + 1], k / 20));
+    pts.push([a[0], a[1], 0.5]);
+  } else {
+    // Cercle : du centre (premier appui) jusqu'au doigt.
+    const r = Math.hypot((b[0] - a[0]) * W, (b[1] - a[1]) * H);
+    for (let k = 0; k <= 96; k++) {
+      const t = k / 96 * Math.PI * 2;
+      pts.push([a[0] + Math.cos(t) * r / W, a[1] + Math.sin(t) * r / H, 0.5]);
+    }
+  }
+  return pts;
+}
+
+// ---------- photos du dessin : choix, déplacement à un doigt, taille et rotation à deux.
+let stickers = [], selSt = null;
+const fingers = new Map();  // pointerId -> [x, y] (0..1) des doigts posés sur une photo
+let grab = null;            // geste en cours : photo de départ et doigts de départ
+let stDirty = false;
+const photoMode = () => tab === "photos";
+function showStickers(list) {
+  const prev = new Map(stickers.map((s) => [s.id, s]));
+  // Pendant un geste, la photo manipulée garde sa position locale.
+  stickers = list.map((s) => (grab && s.id === grab.id && prev.get(s.id)) ? Object.assign(s, pick4(prev.get(s.id))) : s);
+  if (pendingSelect && list.length > pendingSelect.count) { selSt = list[list.length - 1].id; pendingSelect = null; }
+  if (!stickers.find((s) => s.id === selSt)) selSt = null;
+  refreshSticker();
+}
+const pick4 = (s) => ({ x: s.x, y: s.y, s: s.s, r: s.r });
+function stickerAt(p) {
+  const W = box.w, H = box.h;
+  for (let i = stickers.length - 1; i >= 0; i--) {
+    const s = stickers[i];
+    const dx = (p[0] - s.x) * W, dy = (p[1] - s.y) * H, a = -s.r * Math.PI / 180;
+    const lx = dx * Math.cos(a) - dy * Math.sin(a), ly = dx * Math.sin(a) + dy * Math.cos(a);
+    if (Math.abs(lx) <= s.s * H * s.ar / 2 && Math.abs(ly) <= s.s * H / 2) return s;
+  }
+  return null;
+}
+function startGrab() {
+  const s = stickers.find((x) => x.id === selSt);
+  if (!s || !fingers.size) { grab = null; return; }
+  grab = { id: s.id, from: pick4(s), pts: [...fingers.values()].map((p) => p.slice()) };
+}
+function moveGrab() {
+  const s = stickers.find((x) => x.id === (grab && grab.id));
+  if (!s) return;
+  const now = [...fingers.values()], W = box.w, H = box.h;
+  const c0 = centroid(grab.pts), c1 = centroid(now);
+  s.x = grab.from.x + (c1[0] - c0[0]);
+  s.y = grab.from.y + (c1[1] - c0[1]);
+  if (grab.pts.length >= 2 && now.length >= 2) {
+    const v0 = [(grab.pts[1][0] - grab.pts[0][0]) * W, (grab.pts[1][1] - grab.pts[0][1]) * H];
+    const v1 = [(now[1][0] - now[0][0]) * W, (now[1][1] - now[0][1]) * H];
+    s.s = Math.min(3, Math.max(0.03, grab.from.s * Math.hypot(...v1) / Math.max(1, Math.hypot(...v0))));
+    s.r = grab.from.r + (Math.atan2(v1[1], v1[0]) - Math.atan2(v0[1], v0[0])) * 180 / Math.PI;
+  }
+  stDirty = true;
+}
+const centroid = (pts) => [pts.reduce((a, p) => a + p[0], 0) / pts.length, pts.reduce((a, p) => a + p[1], 0) / pts.length];
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (e.pointerType === "pen") penSeen = true;
+  e.preventDefault();
+  canvas.setPointerCapture(e.pointerId);
+  if (tab === "chem") { chemDown(e); return; }
+  const p = pos(e);
+  // Onglet Photos : toucher une photo la saisit (un second doigt la tourne et l'agrandit) ;
+  // toucher ailleurs dessine, comme dans l'onglet Dessin.
+  if (photoMode()) {
+    const s = fingers.size ? null : stickerAt(p);
+    if (fingers.size || s) {
+      if (s) { selSt = s.id; refreshSticker(); }
+      fingers.set(e.pointerId, p);
+      startGrab();
+      return;
+    }
+  }
+  if (penSeen && e.pointerType === "touch") return;
+  if (tool.tool === "erase") {
+    eraser = { x: p[0], y: p[1], r: eraserSize(), pid: e.pointerId, dirty: true };
+    return;
+  }
+  const s = { id: nextId++, pts: [p], color: tool.brush === "rainbow" ? "#ffffff" : tool.color, w: strokeWidth(),
+              end: 0, kind: tool.tool, start: p, cur: p };
+  live.set(e.pointerId, s);
+  if (s.kind === "free") send(Object.assign({ t: "down", id: s.id, x: p[0], y: p[1], p: p[2] }, settings()));
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (chemPointers.has(e.pointerId)) { chemMove(e); return; }
+  if (fingers.has(e.pointerId)) { fingers.set(e.pointerId, pos(e)); moveGrab(); return; }
+  if (eraser && eraser.pid === e.pointerId) {
+    const p = pos(e); eraser.x = p[0]; eraser.y = p[1]; eraser.dirty = true; return;
+  }
+  const s = live.get(e.pointerId);
+  if (!s || s.end) return;
+  e.preventDefault();
+  if (s.kind !== "free") { s.cur = pos(e); return; }
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  const r = canvas.getBoundingClientRect();
+  for (const ev of events.length ? events : [e]) {
+    const p = pos(ev), last = s.pts[s.pts.length - 1];
+    if (Math.hypot((p[0] - last[0]) * r.width, (p[1] - last[1]) * r.height) < 1.5) continue;
+    s.pts.push(p);
+    if (!outbox.has(s.id)) outbox.set(s.id, []);
+    outbox.get(s.id).push(p.map((v) => Math.round(v * 10000) / 10000));
+  }
+});
+function finish(e) {
+  if (chemPointers.has(e.pointerId)) { chemPointers.delete(e.pointerId); return; }
+  if (fingers.has(e.pointerId)) {
+    fingers.delete(e.pointerId);
+    if (fingers.size) startGrab(); else { flush(); grab = null; }
+    return;
+  }
+  if (eraser && eraser.pid === e.pointerId) { eraser = null; return; }
+  const s = live.get(e.pointerId);
+  if (!s || s.end) return;
+  if (s.kind !== "free") {
+    // Forme : envoyée d'un coup au lâcher.
+    const pts = shapePoints(s.kind, s.start, s.cur);
+    s.pts = pts;
+    send(Object.assign({ t: "down", id: s.id, x: pts[0][0], y: pts[0][1], p: 0.5 }, settings()));
+    for (let i = 1; i < pts.length; i += 60) send({ t: "move", id: s.id, pts: pts.slice(i, i + 60) });
+  }
+  flush();
+  send({ t: "up", id: s.id });
+  s.end = performance.now(); s.seen = previews;
+}
+canvas.addEventListener("pointerup", finish);
+canvas.addEventListener("pointercancel", finish);
+document.addEventListener("touchmove", (e) => { if (e.target === canvas) e.preventDefault(); }, { passive: false });
+document.addEventListener("gesturestart", (e) => e.preventDefault());
+
+function flush() {
+  for (const [id, pts] of outbox) if (pts.length) send({ t: "move", id, pts });
+  outbox.clear();
+  if (eraser && eraser.dirty) { send({ t: "erase", x: eraser.x, y: eraser.y, r: eraser.r }); eraser.dirty = false; }
+  if (stDirty) {
+    const s = stickers.find((x) => x.id === selSt);
+    if (s) send({ t: "stmove", id: s.id, x: s.x, y: s.y, s: s.s, r: s.r });
+    stDirty = false;
+  }
+}
+
+// Réglages de la photo choisie.
+const stControls = document.getElementById("stControls");
+function refreshSticker() {
+  const s = stickers.find((x) => x.id === selSt);
+  stControls.classList.toggle("off", !s);
+  for (const row of document.querySelectorAll("[data-sk]"))
+    for (const b of row.children) {
+      const k = row.dataset.sk;
+      const v = !s ? null : k === "outline" ? (s.outline ? "color" : "") : String(s[k]);
+      b.classList.toggle("on", v === b.dataset.v);
+    }
+}
+for (const row of document.querySelectorAll("[data-sk]"))
+  for (const b of row.children) b.onclick = () => {
+    const s = stickers.find((x) => x.id === selSt);
+    if (!s) return;
+    const k = row.dataset.sk, v = b.dataset.v;
+    const m = { t: "stset", id: s.id };
+    if (k === "anim") m.anim = v;
+    if (k === "sym") m.sym = +v;
+    if (k === "outline") m.outline = v ? tool.color : "";
+    send(m);
+  };
+for (const b of document.querySelectorAll("[data-st]")) b.onclick = () => {
+  const s = stickers.find((x) => x.id === selSt);
+  if (!s) return;
+  const what = b.dataset.st;
+  if (what === "del") { send({ t: "stdel", id: s.id }); return; }
+  if (what === "dup") { send({ t: "stdup", id: s.id }); return; }
+  if (what === "flip") { send({ t: "stset", id: s.id, flip: !s.flip }); return; }
+  if (what === "bigger") s.s = Math.min(3, s.s * 1.15);
+  if (what === "smaller") s.s = Math.max(0.03, s.s / 1.15);
+  if (what === "left") s.r -= 15;
+  if (what === "right") s.r += 15;
+  stDirty = true;
+};
+
+// ======================================================= affichage de la toile
+// L'image de la sortie (ce qui est vraiment projeté), et par-dessus ce qu'on fait (sans attendre le réseau).
+function frame() {
+  requestAnimationFrame(frame);
+  flush();
+  pulseTap();
+  const W = canvas.width, H = canvas.height, now = performance.now();
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, W, H);
+  ctx.imageSmoothingQuality = "high";
+  if (preview) ctx.drawImage(preview, 0, 0, W, H);
+  // Axes de symétrie.
+  const sym = photoMode() ? 1 : +tool.sym;
+  if (sym > 1) {
+    ctx.save(); ctx.strokeStyle = "rgba(255,255,255,.14)"; ctx.lineWidth = 1; ctx.setLineDash([6, 8]);
+    const angles = sym === 2 ? [Math.PI / 2] : sym === 4 ? [0, Math.PI / 2] : [...Array(sym).keys()].map((k) => Math.PI * k / sym);
+    for (const a of angles) {
+      const L = W + H;
+      ctx.beginPath(); ctx.moveTo(W / 2 - Math.cos(a) * L, H / 2 - Math.sin(a) * L);
+      ctx.lineTo(W / 2 + Math.cos(a) * L, H / 2 + Math.sin(a) * L); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // Cadre de la photo choisie.
+  if (photoMode()) {
+    for (const s of stickers) {
+      ctx.save();
+      ctx.translate(s.x * W, s.y * H); ctx.rotate(s.r * Math.PI / 180);
+      const h = s.s * H, w = h * s.ar;
+      ctx.strokeStyle = s.id === selSt ? "#5ad19a" : "rgba(255,255,255,.35)";
+      ctx.lineWidth = s.id === selSt ? 3 : 1.5; ctx.setLineDash([10, 8]);
+      ctx.strokeRect(-w / 2, -h / 2, w, h);
+      ctx.restore();
+    }
+  }
+  ctx.lineCap = "round"; ctx.lineJoin = "round";
+  for (const [pid, s] of live) {
+    // Gardé après le lever du stylet, le temps que l'aperçu le montre (deux images reçues depuis).
+    if (s.end && (previews - s.seen >= 3 || now - s.end > 1500)) { live.delete(pid); continue; }
+    ctx.globalAlpha = 0.8;
+    ctx.strokeStyle = s.color; ctx.fillStyle = s.color;
+    const pts = !s.end && s.kind !== "free" ? shapePoints(s.kind, s.start, s.cur) : s.pts;
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1], b = pts[i];
+      ctx.lineWidth = Math.max(1, s.w * H * (0.35 + 1.3 * b[2]));
+      ctx.beginPath(); ctx.moveTo(a[0] * W, a[1] * H); ctx.lineTo(b[0] * W, b[1] * H); ctx.stroke();
+    }
+    if (pts.length === 1) {
+      const a = pts[0];
+      ctx.beginPath(); ctx.arc(a[0] * W, a[1] * H, Math.max(1, s.w * H * (0.35 + 1.3 * a[2]) / 2), 0, Math.PI * 2); ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
+  if (eraser) {
+    ctx.strokeStyle = "rgba(255,255,255,.8)"; ctx.lineWidth = 2; ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.arc(eraser.x * W, eraser.y * H, eraser.r * H, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+  }
+}
+
+// ======================================================= Live
+// Commandes : les mêmes que celles d'un contrôleur MIDI (voir midi.rs).
+const A = {
+  col: (c) => ({ PlayColumn: { column: c } }), layer: (l) => ({ SelectLayer: { layer: l } }),
+  vis: (l) => ({ LayerVisible: { layer: l } }), opacity: (l) => ({ Opacity: { layer: l } }),
+  preset: (n) => ({ Preset: { name: n } }), media: (i) => ({ LaunchMedia: { index: i } }),
+  visual: (p) => ({ Visual: { pattern: p } }), fx: (k) => ({ Effect: { param: k } }),
+  scen: (k) => ({ LedScenario: { kind: k } }), hold: (id) => ({ DmxHold: { fixture: id } }),
+  tog: (id) => ({ DmxToggle: { fixture: id } }), cue: (i) => ({ LaserCue: { index: i } }),
+  mode: (m) => ({ Mode: { mode: m } }), out: (k) => ({ IpadOutput: { output: k } }),
+  gvis: (g) => ({ GroupVisible: { group: g } }),
+};
+const liveEl = document.getElementById("p-live");
+let liveSig = "";
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const act = (a, label, extra = "") => `<button data-a="${esc(JSON.stringify(a))}" ${extra}>${esc(label)}</button>`;
+// Liste rangée par familles (déjà dans l'ordre) : un petit titre au début de chaque famille.
+const families = (items, button) => items.map((it, k) =>
+  (k === 0 || items[k - 1].family !== it.family ? `<div class="fam">${esc(it.family)}</div>` : "") + button(it)).join("");
+const slider = (a, label, key) =>
+  `<div class="slider"><label>${esc(label)}</label><input type="range" min="0" max="1000" data-v="${esc(JSON.stringify(a))}" data-s="${key}"></div>`;
+
+function renderLive() {
+  const s = state;
+  if (!s) return;
+  // Structure refaite seulement si les listes changent ; sinon on met juste à jour les états.
+  const sig = JSON.stringify([s.layers.map((l) => l.name), s.columns.map((c) => c.name + c.filled), s.presets,
+    s.visuals.length, s.fx.map((f) => f.name), s.leds.has, s.leds.scenarios.length, s.dmx.map((d) => d.id + d.name),
+    s.lasers.has, s.lasers.cues, s.sel, s.content, s.outputs, s.kinds, (s.groups || []).map((g) => g.id + g.name), s.layers.map((l) => l.group)]);
+  if (sig !== liveSig) { liveSig = sig; buildLive(s); }
+  updateLive(s);
+}
+
+function buildLive(s) {
+  // Effets et visuels : le calque choisi (le dessin compris). Médias et lecture : le calque de
+  // contenu (celui du dessin n'affiche pas de vidéo).
+  const named = (i) => s.layers[i] ? (s.layers[i].sketch ? "✏ " : "") + s.layers[i].name : "";
+  const L = named(s.sel), C = named(s.content);
+  const open = [...liveEl.querySelectorAll("details")].map((d) => d.open);
+  let h = "";
+  // Ce que montre la sortie : tout, ou un seul genre de calque (dessin et chimie : créés s'il le faut).
+  const kinds = s.kinds || [];
+  const MODES = [["All", "Tout"], ["Drawing", "Dessin"], ["Chemistry", "Chimie"], ["Media", "Médias"], ["Visual", "Visuel généré"]];
+  h += `<h4>Sortie : ce qu'on voit</h4><div class="grid">${MODES.map(([m, l]) =>
+    act(A.mode(m), l, `data-mode="${m}" ${m === "All" || m === "Drawing" || m === "Chemistry" || kinds.includes(m) ? "" : "disabled"}`)).join("")}</div>`;
+  if ((s.outputs || []).length > 1) h += `<div class="fam" style="margin-top:8px">L'iPad projette sur</div><div class="grid">${s.outputs.map((o, k) =>
+    act(A.out(k), o || `Sortie ${k + 1}`, `data-out="${k}"`)).join("")}</div>`;
+  h += `<h4>Scène</h4><div class="wrap">
+    ${act("Blackout", "BLACKOUT", 'class="big" data-on="blackout"')}
+    ${act("BlackoutHold", "Noir tenu", 'class="big" data-hold')}</div>
+    <div class="wrap" style="margin-top:5px">
+    ${act("White", "Blanc", 'data-on="white"')}${act("Bypass", "Sans effets", 'data-on="bypass"')}
+    ${act("Grid", "Mire", 'data-on="grid"')}${act("Record", "● REC", 'class="rec" data-on="recording"')}</div>
+    ${slider("Master", "Luminosité", "master")}`;
+  h += `<h4>Tempo</h4><div class="wrap">${act("Tap", "TAP", 'id="tap"')}${act("TempoHalf", "÷2")}${act("TempoDouble", "×2")}</div>`;
+  // Du premier plan vers le fond ; un groupe en tête de ses calques.
+  const groupHead = (i) => {
+    const l = s.layers[i], g = l.group && (s.groups || []).find((x) => x.id === l.group);
+    if (!g || (i + 1 < s.layers.length && s.layers[i + 1].group === l.group)) return "";
+    return `<div class="fam" style="display:flex;align-items:center;gap:6px;margin:8px 0 4px">📁 ${esc(g.name)}
+      ${act(A.gvis(g.id), "👁 groupe", `data-gvis="${g.id}" style="height:30px"`)}</div>`;
+  };
+  h += `<h4>Calques</h4>${s.layers.map((l, i) => [l, i]).reverse().map(([l, i]) => groupHead(i) + `<div class="layer"${l.group ? ' style="border-left:3px solid var(--accent);padding-left:5px"' : ""}>
+    ${act(A.layer(i), (l.sketch ? "✏ " : "") + l.name, `class="name" data-layer="${i}"`)}
+    ${act(A.vis(i), "👁", `class="eye" data-vis="${i}"`)}
+    <input type="range" min="0" max="1000" data-v="${esc(JSON.stringify(A.opacity(i)))}" data-s="op${i}"></div>`).join("")}`;
+  h += `<h4>Tableau</h4><div class="grid">${s.columns.map((c, k) =>
+    act(A.col(k), c.name, `data-col="${k}" ${c.filled ? "" : "disabled"}`)).join("")}</div>
+    <div class="wrap" style="margin-top:5px">${act("Chain", "Enchaîner les colonnes", 'data-on="chain"')}</div>`;
+  h += `<h4>Effets · ${esc(L)}</h4><div class="wrap">${act("RandomEffect", "Au hasard")}${act("AutoFx", "AUTO", 'data-on="auto"')}
+    ${act("Shatter", "Casser !")}${act("ClearEffects", "Sans effet")}${act("React", "Suit le rythme", 'data-on="react"')}</div>
+    <details ${open[0] ? "open" : ""}><summary>Réglages des effets</summary>${s.fx.map((f, k) => slider(A.fx(k), f.name, "fx" + k)).join("")}</details>`;
+  h += `<h4>Presets d'effets · ${esc(L)}</h4><div class="grid long">${families(s.presets, (p) => act(A.preset(p.name), p.name, `data-preset="${esc(p.name)}"`))}</div>`;
+  h += `<h4>Lecture · ${esc(C)}</h4><div class="wrap">
+    ${act("PrevMedia", "◀ Média")}${act("NextMedia", "Média ▶")}${act("Pause", "Pause", 'data-on="paused"')}
+    ${act("Reverse", "À l'envers", 'data-on="reverse"')}${act("MixAuto", "Mix auto", 'data-on="mix"')}</div>
+    ${slider("Speed", "Vitesse", "speed")}`;
+  h += `<h4>Visuels générés · ${esc(L)}</h4><div class="grid long">
+    ${act(A.visual("Off"), "Aucun", 'data-visual="Off"')}${families(s.visuals, (v) => act(A.visual(v.id), v.name, `data-visual="${v.id}"`))}</div>
+    ${slider("VisualMix", "Part du visuel", "vmix")}`;
+  if (s.leds.has) h += `<h4>LEDs</h4><div class="wrap">
+    ${act("LedLive", "Envoi aux LEDs", 'data-on="ledlive"')}${act("LedChain", "Enchaîner", 'data-on="ledchain"')}</div>
+    <div class="grid" style="margin-top:5px">${s.leds.scenarios.map((k) => act(A.scen(k.id), k.name, `data-scen="${k.id}"`)).join("")}</div>
+    ${slider("LedBrightness", "Luminosité", "ledb")}`;
+  if (s.dmx.length) h += `<h4>DMX</h4><div class="grid">${s.dmx.map((d) =>
+    d.kind === "Smoke" || d.kind === "Bubble"
+      ? act(A.hold(d.id), d.name + " (tenir)", 'class="big" data-hold')
+      : act(A.tog(d.id), d.name, `data-dmx="${d.id}"`)).join("")}</div>`;
+  if (s.lasers.has) h += `<h4>Lasers</h4><div class="wrap">
+    ${act("LaserArm", "Armer", 'data-on="armed"')}${act("LaserStop", "STOP", 'class="hot"')}</div>
+    <div class="grid" style="margin-top:5px">${s.lasers.cues.map((c, i) => act(A.cue(i), c || `Réglage ${i + 1}`)).join("")}</div>`;
+  // Chaque partie dans sa carte : en plein écran, les cartes se rangent en colonnes.
+  liveEl.innerHTML = `<div id="liveStatus">${esc(msg.textContent)}</div><div class="livegrid">` +
+    h.split("<h4>").filter((x) => x.trim()).map((x) => `<div class="card"><h4>${x}</div>`).join("") + "</div>";
+  packLive();
+}
+
+// Cartes rangées toujours au même endroit : la scène à gauche, les effets au milieu, le contenu
+// (lecture, visuels, lumières) à droite. Écran plus étroit : deux colonnes, puis une seule.
+const LIVE_GROUP = { "Sortie": 0, "Scène": 0, "Tempo": 0, "Calques": 0, "Tableau": 0, "Effets": 1, "Presets": 1 };
+function packLive() {
+  const grid = liveEl.querySelector(".livegrid");
+  if (!grid || !liveEl.clientWidth) return;
+  const cards = [...grid.querySelectorAll(".card")];
+  const n = Math.min(3, Math.max(1, Math.floor((liveEl.clientWidth - 20) / 300)));
+  grid.innerHTML = "";
+  const cols = Array.from({ length: n }, () => grid.appendChild(Object.assign(document.createElement("div"), { className: "lcol" })));
+  const place = [[0, 0, 0], [0, 1, 0], [0, 1, 2]][n - 1];
+  for (const g of [0, 1, 2])
+    for (const card of cards) {
+      const title = card.querySelector("h4").textContent.trim().split(/[ ·]/)[0];
+      if ((LIVE_GROUP[title] ?? 2) === g) cols[place[g]].appendChild(card);
+    }
+}
+addEventListener("resize", () => { if (tab === "live") packLive(); });
+
+// Curseur qu'on touche : pas remis à jour par l'état reçu pendant un instant.
+const busy = new Map();
+function setSlider(key, v) {
+  const el = liveEl.querySelector(`[data-s="${key}"]`);
+  if (el && !(performance.now() - (busy.get(el) || 0) < 800)) el.value = Math.round(v * 1000);
+}
+function updateLive(s) {
+  const on = { blackout: s.blackout, white: s.white, bypass: s.bypass, grid: s.grid, recording: s.recording, chain: s.chain,
+    auto: s.auto, react: s.react, paused: s.paused, reverse: s.reverse, mix: s.mix, ledlive: s.leds.live,
+    ledchain: s.leds.chain, armed: s.lasers.armed };
+  for (const b of liveEl.querySelectorAll("[data-on]")) b.classList.toggle("on", !!on[b.dataset.on]);
+  const blk = liveEl.querySelector('[data-on="blackout"]');
+  if (blk) blk.classList.toggle("hot", s.blackout);
+  for (const b of liveEl.querySelectorAll("[data-gvis]")) b.classList.toggle("on", !!((s.groups || []).find((g) => g.id === +b.dataset.gvis) || {}).visible);
+  for (const b of liveEl.querySelectorAll("[data-mode]")) b.classList.toggle("on", b.dataset.mode === s.mode);
+  for (const b of liveEl.querySelectorAll("[data-out]")) b.classList.toggle("on", +b.dataset.out === s.output);
+  for (const b of liveEl.querySelectorAll("[data-col]")) b.classList.toggle("on", s.columns[+b.dataset.col].active);
+  for (const b of liveEl.querySelectorAll("[data-layer]")) b.classList.toggle("on", +b.dataset.layer === s.sel);
+  for (const b of liveEl.querySelectorAll("[data-vis]")) b.style.opacity = s.layers[+b.dataset.vis].visible ? 1 : 0.35;
+  for (const b of liveEl.querySelectorAll("[data-preset]")) b.classList.toggle("on", b.dataset.preset === s.preset);
+  for (const b of liveEl.querySelectorAll("[data-visual]")) b.classList.toggle("on", b.dataset.visual === (s.visual || "Off"));
+  for (const b of liveEl.querySelectorAll("[data-scen]")) b.classList.toggle("on", b.dataset.scen === s.leds.scenario);
+  for (const b of liveEl.querySelectorAll("[data-dmx]")) b.classList.toggle("on", !!(s.dmx.find((d) => d.id === +b.dataset.dmx) || {}).on);
+  setSlider("master", s.master);
+  s.layers.forEach((l, i) => setSlider("op" + i, l.opacity));
+  s.fx.forEach((f, k) => setSlider("fx" + k, f.v));
+  setSlider("speed", (Math.log(s.speed) / Math.log(4) + 1) / 2);
+  setSlider("vmix", s.visual_mix);
+  setSlider("ledb", s.leds.brightness);
+  const tap = document.getElementById("tap");
+  if (tap) tap.textContent = `TAP · ${Math.round(s.bpm)} BPM`;
+  const st = document.getElementById("liveStatus");
+  if (st) st.textContent = msg.textContent;
+}
+// Le bouton Tap bat au tempo d'OZ Mapping.
+function pulseTap() {
+  const tap = document.getElementById("tap");
+  if (!tap || !state || tab !== "live") return;
+  const ph = (state.phase + (performance.now() - stateAt) / 1000 * state.bpm / 60) % 1;
+  const k = Math.exp(-ph * 60 / state.bpm * 7);
+  tap.style.background = `rgb(${31 + k * 59 | 0},${36 + k * 173 | 0},${48 + k * 106 | 0})`;
+  tap.style.color = k > 0.5 ? "#062014" : "";
+}
+
+// Boutons : appui (et relâchement pour ceux qu'on tient).
+document.addEventListener("pointerdown", (e) => {
+  const b = e.target.closest("button[data-a]");
+  if (!b || b.disabled) return;
+  const a = JSON.parse(b.dataset.a);
+  send({ t: "act", a, on: true });
+  if (b.hasAttribute("data-hold")) {
+    b.classList.add("on");
+    const up = () => {
+      send({ t: "act", a, on: false }); b.classList.remove("on");
+      removeEventListener("pointerup", up); removeEventListener("pointercancel", up);
+    };
+    addEventListener("pointerup", up); addEventListener("pointercancel", up);
+  }
+});
+// Curseurs : la valeur part au fil du geste.
+document.addEventListener("input", (e) => {
+  const el = e.target;
+  if (!el.dataset || !el.dataset.v) return;
+  busy.set(el, performance.now());
+  send({ t: "val", a: JSON.parse(el.dataset.v), v: el.value / 1000 });
+});
+
+// ======================================================= Médias
+const mediaGrid = document.getElementById("mediaGrid");
+let mediaSig = "";
+function renderMedia() {
+  const s = state;
+  const sig = JSON.stringify(s.media.map((m) => m.name));
+  if (sig !== mediaSig) {
+    mediaSig = sig;
+    mediaGrid.innerHTML = s.media.length ? s.media.map((m, i) =>
+      `<button data-a="${esc(JSON.stringify(A.media(i)))}" data-media="${i}"><img loading="lazy" src="/thumb/${i}?n=${encodeURIComponent(m.name)}" alt=""><span>${esc(m.name)}</span></button>`).join("")
+      : `<p class="hint">Aucun média dans l'app pour l'instant.</p>`;
+  }
+  for (const b of mediaGrid.querySelectorAll("[data-media]")) b.classList.toggle("on", +b.dataset.media === s.playing);
+  const l = s.layers[s.sel];
+  document.getElementById("upTarget").textContent = l ? `Elle arrive sur le calque sélectionné : « ${l.name} ».` : "";
+}
+
+// ======================================================= envoi de photos
+// Réduite à 2048 px et convertie en JPEG ici (les photos HEIC de l'iPad passent aussi).
+const file = document.getElementById("file");
+let upload = null, pendingSelect = null;
+function pickPhoto(query, out, doneText) {
+  upload = { query, out, doneText };
+  file.click();
+}
+document.getElementById("upPlain").onclick = () => pickPhoto("to=layer", document.getElementById("upmsg"), "Envoyée sur le calque ✓");
+document.getElementById("stCut").onclick = () => { pickPhoto("to=drawing&cut=0", document.getElementById("stMsg"), ""); upload.edit = true; };
+document.getElementById("stWhole").onclick = () => pickPhoto("to=drawing&cut=0", document.getElementById("stMsg"), "Elle arrive sur la toile");
+file.onchange = async () => {
+  const f = file.files[0], up = upload;
+  file.value = "";
+  if (!f || !up) return;
+  if (up.edit && await openCutEditor(f)) return;
+  up.out.textContent = "Préparation de la photo…";
+  // Réduite en JPEG ici si le navigateur sait la lire ; sinon le fichier d'origine part tel quel
+  // (HEIC…) et OZ Mapping la convertit.
+  let body = null, query = up.query;
+  try {
+    let img = null;
+    try { img = await createImageBitmap(f); } catch (e1) {
+      img = await new Promise((ok, ko) => { const i = new Image(); i.onload = () => ok(i); i.onerror = ko; i.src = URL.createObjectURL(f); });
+    }
+    const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+    const k = Math.min(1, 2048 / Math.max(iw, ih));
+    const c = document.createElement("canvas");
+    c.width = Math.max(1, Math.round(iw * k)); c.height = Math.max(1, Math.round(ih * k));
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    body = await new Promise((r) => c.toBlob(r, "image/jpeg", 0.9));
+  } catch (e2) { body = null; }
+  if (!body) {
+    body = f;
+    const ext = (f.name.split(".").pop() || (f.type.split("/")[1] || "jpg")).toLowerCase();
+    query += `&ext=${encodeURIComponent(ext)}`;
+  }
+  try {
+    up.out.textContent = `Envoi (${Math.round(body.size / 1024)} Ko)…`;
+    if (query.startsWith("to=drawing")) pendingSelect = { count: stickers.length };
+    const res = await fetch(`/upload?${query}`, { method: "POST", body });
+    if (!res.ok) up.out.textContent = "Échec de l'envoi : " + (await res.text());
+  } catch (err) {
+    up.out.textContent = "Échec de l'envoi : " + err;
+  }
+};
+
+// ======================================================= détourage au stylet
+// Le masque est une image de même taille que la photo : opaque = gardé. On le trace au stylet
+// (entourer, pinceau, gomme), à partir du détourage automatique d'OZ Mapping si on veut.
+const cutEd = document.getElementById("cutEd"), cutCv = document.getElementById("cutCv"), cutCtx = cutCv.getContext("2d");
+const cutMsg = document.getElementById("cutMsg"), cutSize = document.getElementById("cutSize");
+const cut = { photo: null, mask: null, mctx: null, comp: null, w: 0, h: 0, view: { s: 1, x: 0, y: 0 }, mode: "lasso+",
+  path: null, undo: [], touched: false, pen: false, touches: new Map(), pinch: null, cursor: null, dirty: true, jpeg: null };
+const mkCanvas = (w, h) => Object.assign(document.createElement("canvas"), { width: w, height: h });
+
+async function readImage(f) {
+  try { return await createImageBitmap(f); } catch (e) {
+    return await new Promise((ok, ko) => { const i = new Image(); i.onload = () => ok(i); i.onerror = ko; i.src = URL.createObjectURL(f); });
+  }
+}
+
+// Ouvre l'éditeur ; faux si la photo est illisible ici (elle part alors au détourage automatique).
+async function openCutEditor(f) {
+  let img;
+  try { img = await readImage(f); } catch (e) { return false; }
+  const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+  const k = Math.min(1, 1600 / Math.max(iw, ih));
+  cut.w = Math.max(1, Math.round(iw * k)); cut.h = Math.max(1, Math.round(ih * k));
+  cut.photo = mkCanvas(cut.w, cut.h);
+  cut.photo.getContext("2d").drawImage(img, 0, 0, cut.w, cut.h);
+  cut.mask = mkCanvas(cut.w, cut.h); cut.mctx = cut.mask.getContext("2d");
+  cut.comp = mkCanvas(cut.w, cut.h);
+  cut.undo = []; cut.touched = false; cut.path = null; cut.pen = penSeen;
+  cutEd.classList.add("on");
+  cutFit(); cutMode(cut.mode); cutComp();
+  cutMsg.textContent = "Détourage automatique… vous pouvez déjà entourer le sujet au stylet";
+  cut.jpeg = await new Promise((r) => cut.photo.toBlob(r, "image/jpeg", 0.9));
+  cutAuto(false);
+  return true;
+}
+
+// Masque automatique d'OZ Mapping (blanc = sujet) ; `force` : remplace aussi un masque déjà retouché.
+async function cutAuto(force) {
+  try {
+    const res = await fetch("/cutout", { method: "POST", body: cut.jpeg });
+    if (!res.ok) throw new Error(await res.text());
+    const bmp = await createImageBitmap(await res.blob());
+    if (!cutEd.classList.contains("on") || (cut.touched && !force)) { cutMsg.textContent = ""; return; }
+    if (force) cutPush();
+    const t = mkCanvas(cut.w, cut.h), tc = t.getContext("2d");
+    tc.drawImage(bmp, 0, 0, cut.w, cut.h);
+    const d = tc.getImageData(0, 0, cut.w, cut.h), px = d.data;
+    for (let i = 0; i < px.length; i += 4) { px[i + 3] = px[i]; px[i] = px[i + 1] = px[i + 2] = 255; }
+    cut.mctx.clearRect(0, 0, cut.w, cut.h);
+    cut.mctx.putImageData(d, 0, 0);
+    cutComp();
+    cutMsg.textContent = "Retouchez au stylet : Entourer / Retirer, Pinceau / Gomme. Deux doigts : zoom.";
+  } catch (e) {
+    cutMsg.textContent = "Pas de détourage automatique : entourez le sujet au stylet";
+  }
+}
+
+function cutFit() {
+  const r = cutCv.getBoundingClientRect();
+  const s = Math.min(r.width / cut.w, r.height / cut.h) * 0.94;
+  cut.view = { s, x: (r.width - cut.w * s) / 2, y: (r.height - cut.h * s) / 2 };
+  cut.dirty = true;
+}
+function cutComp() {
+  const c = cut.comp.getContext("2d");
+  c.globalCompositeOperation = "source-over";
+  c.clearRect(0, 0, cut.w, cut.h);
+  c.drawImage(cut.photo, 0, 0);
+  c.globalCompositeOperation = "destination-in";
+  c.drawImage(cut.mask, 0, 0);
+  c.globalCompositeOperation = "source-over";
+  cut.dirty = true;
+}
+function cutPush() {
+  const copy = mkCanvas(cut.w, cut.h);
+  copy.getContext("2d").drawImage(cut.mask, 0, 0);
+  cut.undo.push(copy);
+  if (cut.undo.length > 12) cut.undo.shift();
+}
+function cutMode(m) {
+  cut.mode = m;
+  for (const b of document.querySelectorAll('[data-ck="mode"] button')) b.classList.toggle("on", b.dataset.v === m);
+}
+for (const b of document.querySelectorAll('[data-ck="mode"] button')) b.onclick = () => cutMode(b.dataset.v);
+document.getElementById("cutUndo").onclick = () => {
+  const prev = cut.undo.pop();
+  if (!prev) return;
+  cut.mctx.clearRect(0, 0, cut.w, cut.h); cut.mctx.drawImage(prev, 0, 0); cutComp();
+};
+document.getElementById("cutClear").onclick = () => { cutPush(); cut.mctx.clearRect(0, 0, cut.w, cut.h); cut.touched = true; cutComp(); };
+document.getElementById("cutInvert").onclick = () => {
+  cutPush();
+  cut.mctx.globalCompositeOperation = "xor"; cut.mctx.fillStyle = "#fff"; cut.mctx.fillRect(0, 0, cut.w, cut.h);
+  cut.mctx.globalCompositeOperation = "source-over"; cut.touched = true; cutComp();
+};
+document.getElementById("cutAuto").onclick = () => { cutMsg.textContent = "Détourage automatique…"; cutAuto(true); };
+document.getElementById("cutCancel").onclick = () => { cutEd.classList.remove("on"); };
+document.getElementById("cutOk").onclick = async () => {
+  // La photo, transparente hors du masque, part dans le dessin (PNG : la transparence est gardée).
+  const out = mkCanvas(cut.w, cut.h), oc = out.getContext("2d");
+  oc.drawImage(cut.comp, 0, 0);
+  const blob = await new Promise((r) => out.toBlob(r, "image/png"));
+  cutEd.classList.remove("on");
+  const msgEl = document.getElementById("stMsg");
+  msgEl.textContent = `Envoi (${Math.round(blob.size / 1024)} Ko)…`;
+  pendingSelect = { count: stickers.length };
+  try {
+    const res = await fetch("/upload?to=drawing&cut=0&ext=png", { method: "POST", body: blob });
+    if (!res.ok) msgEl.textContent = "Échec de l'envoi : " + (await res.text());
+  } catch (e) { msgEl.textContent = "Échec de l'envoi : " + e; }
+};
+
+// Gestes : le stylet trace ; les doigts déplacent et zooment (sans stylet : un doigt trace, deux zooment).
+const cutPt = (e) => { const r = cutCv.getBoundingClientRect(); return [(e.clientX - r.left - cut.view.x) / cut.view.s, (e.clientY - r.top - cut.view.y) / cut.view.s]; };
+const scr = (e) => { const r = cutCv.getBoundingClientRect(); return [e.clientX - r.left, e.clientY - r.top]; };
+function startPinch() {
+  const t = [...cut.touches.values()];
+  cut.pinch = { v: { ...cut.view }, t: t.map((p) => p.slice()) };
+}
+function stamp(p, pressure) {
+  const r = (+cutSize.value / cut.view.s / 2) * (cut.pen ? 0.4 + 1.2 * pressure : 1);
+  cut.mctx.globalCompositeOperation = cut.mode === "brush+" ? "source-over" : "destination-out";
+  cut.mctx.fillStyle = "#fff";
+  cut.mctx.beginPath(); cut.mctx.arc(p[0], p[1], Math.max(0.5, r), 0, Math.PI * 2); cut.mctx.fill();
+  cut.mctx.globalCompositeOperation = "source-over";
+}
+cutCv.addEventListener("pointerdown", (e) => {
+  e.preventDefault();
+  cutCv.setPointerCapture(e.pointerId);
+  if (e.pointerType === "pen") cut.pen = true;
+  const finger = e.pointerType === "touch" && (cut.pen || cut.touches.size > 0 || cut.path);
+  if (finger) {
+    if (cut.path && !cut.pen) { cut.path = null; const prev = cut.undo.pop(); if (prev) { cut.mctx.clearRect(0, 0, cut.w, cut.h); cut.mctx.drawImage(prev, 0, 0); cutComp(); } }
+    cut.touches.set(e.pointerId, scr(e));
+    startPinch();
+    return;
+  }
+  if (e.pointerType === "touch") cut.touches.set(e.pointerId, scr(e));
+  cutPush();
+  const p = cutPt(e);
+  cut.path = { id: e.pointerId, pts: [p] };
+  if (cut.mode.startsWith("brush")) { stamp(p, e.pressure || 0.5); cutComp(); }
+});
+cutCv.addEventListener("pointermove", (e) => {
+  cut.cursor = cutPt(e); cut.dirty = true;
+  if (cut.touches.has(e.pointerId) && !(cut.path && cut.path.id === e.pointerId)) {
+    cut.touches.set(e.pointerId, scr(e));
+    const now = [...cut.touches.values()], z = cut.pinch;
+    if (!z || now.length !== z.t.length) { startPinch(); return; }
+    const mid = (a) => [a.reduce((s, p) => s + p[0], 0) / a.length, a.reduce((s, p) => s + p[1], 0) / a.length];
+    const m0 = mid(z.t), m1 = mid(now);
+    let s = z.v.s;
+    if (now.length >= 2) s = z.v.s * Math.hypot(now[1][0] - now[0][0], now[1][1] - now[0][1]) / Math.max(1, Math.hypot(z.t[1][0] - z.t[0][0], z.t[1][1] - z.t[0][1]));
+    s = Math.min(20, Math.max(0.05, s));
+    const ip = [(m0[0] - z.v.x) / z.v.s, (m0[1] - z.v.y) / z.v.s];
+    cut.view = { s, x: m1[0] - ip[0] * s, y: m1[1] - ip[1] * s };
+    return;
+  }
+  if (!cut.path || cut.path.id !== e.pointerId) return;
+  const events = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const ev of events.length ? events : [e]) {
+    const p = cutPt(ev), last = cut.path.pts[cut.path.pts.length - 1];
+    if (cut.mode.startsWith("brush")) {
+      // Tampons rapprochés le long du geste.
+      const step = Math.max(0.5, +cutSize.value / cut.view.s / 6), d = Math.hypot(p[0] - last[0], p[1] - last[1]);
+      for (let k = 1; k <= Math.ceil(d / step); k++) stamp([last[0] + (p[0] - last[0]) * k / Math.ceil(d / step), last[1] + (p[1] - last[1]) * k / Math.ceil(d / step)], ev.pressure || 0.5);
+    }
+    cut.path.pts.push(p);
+  }
+  if (cut.mode.startsWith("brush")) cutComp(); else cut.dirty = true;
+});
+function cutUp(e) {
+  if (cut.touches.has(e.pointerId)) { cut.touches.delete(e.pointerId); cut.pinch = null; if (cut.touches.size) startPinch(); }
+  if (!cut.path || cut.path.id !== e.pointerId) return;
+  const pts = cut.path.pts;
+  cut.path = null;
+  if (cut.mode.startsWith("lasso")) {
+    if (pts.length < 3) { cut.undo.pop(); return; }
+    cut.mctx.globalCompositeOperation = cut.mode === "lasso+" ? "source-over" : "destination-out";
+    cut.mctx.fillStyle = "#fff";
+    cut.mctx.beginPath(); cut.mctx.moveTo(pts[0][0], pts[0][1]);
+    for (const p of pts.slice(1)) cut.mctx.lineTo(p[0], p[1]);
+    cut.mctx.closePath(); cut.mctx.fill();
+    cut.mctx.globalCompositeOperation = "source-over";
+  }
+  cut.touched = true;
+  cutComp();
+}
+cutCv.addEventListener("pointerup", cutUp);
+cutCv.addEventListener("pointercancel", cutUp);
+cutCv.addEventListener("pointerleave", () => { cut.cursor = null; cut.dirty = true; });
+
+// Affichage : la photo en sombre, la partie gardée en clair, le tracé en cours.
+function cutFrame() {
+  requestAnimationFrame(cutFrame);
+  if (!cutEd.classList.contains("on")) return;
+  const r = cutCv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  const W = Math.round(r.width * dpr), H = Math.round(r.height * dpr);
+  if (cutCv.width !== W || cutCv.height !== H) { cutCv.width = W; cutCv.height = H; cut.dirty = true; }
+  const c = cutCtx, v = cut.view;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.fillStyle = "#05060a"; c.fillRect(0, 0, W, H);
+  c.setTransform(dpr * v.s, 0, 0, dpr * v.s, dpr * v.x, dpr * v.y);
+  c.imageSmoothingQuality = "high";
+  c.globalAlpha = 0.28; c.drawImage(cut.photo, 0, 0);
+  c.globalAlpha = 1; c.drawImage(cut.comp, 0, 0);
+  c.strokeStyle = "rgba(255,255,255,.25)"; c.lineWidth = 1 / v.s; c.strokeRect(0, 0, cut.w, cut.h);
+  if (cut.path && cut.mode.startsWith("lasso") && cut.path.pts.length > 1) {
+    c.strokeStyle = cut.mode === "lasso+" ? "#5ad19a" : "#ff6b6b"; c.lineWidth = 2.5 / v.s;
+    c.beginPath(); c.moveTo(cut.path.pts[0][0], cut.path.pts[0][1]);
+    for (const p of cut.path.pts) c.lineTo(p[0], p[1]);
+    c.stroke();
+  }
+  if (cut.cursor && cut.mode.startsWith("brush")) {
+    c.strokeStyle = "rgba(255,255,255,.8)"; c.lineWidth = 1.5 / v.s;
+    c.beginPath(); c.arc(cut.cursor[0], cut.cursor[1], +cutSize.value / v.s / 2, 0, Math.PI * 2); c.stroke();
+  }
+}
+addEventListener("resize", () => { if (cutEd.classList.contains("on")) cutFit(); });
+requestAnimationFrame(cutFrame);
+
+connect();
+layout();
+requestAnimationFrame(frame);
+
+// ======================================================= chimie
+// Bassin de liquides : on verse au doigt (ou au stylet), on touille, on penche et on secoue
+// l'iPad. Tout est simulé par OZ Mapping ; la toile montre la sortie.
+const chem = Object.assign({ listen: "app", ing: "ink", base: "dark", color: "#2ee6ff", size: 35, flip: false },
+  (() => { try { return JSON.parse(localStorage.getItem("oz-chimie") || "{}"); } catch (e) { return {}; } })());
+const chemSave = () => { try { localStorage.setItem("oz-chimie", JSON.stringify(chem)); } catch (e) {} };
+const chemPointers = new Map(); // pointerId -> dernier point, instant, point du dernier versement
+const CHEM_COLORS = ["#ff2d55", "#ff9f0a", "#ffd60a", "#30d158", "#2ee6ff", "#0a84ff", "#bf5af2", "#ffffff"];
+const chemColors = document.getElementById("chemColors");
+for (const c of CHEM_COLORS) {
+  const b = document.createElement("button");
+  b.className = "swatch"; b.style.background = c; b.dataset.c = c;
+  b.onclick = () => { chem.color = c; chemPick.value = c; chemRefresh(); };
+  chemColors.appendChild(b);
+}
+const chemPick = document.createElement("input");
+chemPick.type = "color"; chemPick.value = chem.color;
+chemPick.oninput = () => { chem.color = chemPick.value; chemRefresh(); };
+chemColors.appendChild(chemPick);
+// Fond et renouvellement : renvoyés à chaque connexion (l'app a pu redémarrer).
+const chemRenew = document.getElementById("chemRenew");
+chemRenew.value = chem.renew || 0;
+chemRenew.oninput = () => { chem.renew = +chemRenew.value; chemSave(); send({ t: "chem", op: "renew", rate: chem.renew / 100 }); };
+const chemSound = document.getElementById("chemSound");
+chemSound.value = chem.sound ?? 50;
+chemSound.oninput = () => { chem.sound = +chemSound.value; chemSave(); send({ t: "chem", op: "sound", amount: chem.sound / 100 }); };
+function chemSync() {
+  send({ t: "chem", op: "sound", amount: (chem.sound ?? 50) / 100 });
+  send({ t: "chem", op: "listen", from: chem.listen || "app" });
+  send({ t: "chem", op: "base", base: chem.base });
+  send({ t: "chem", op: "renew", rate: (chem.renew || 0) / 100 });
+  send({ t: "chem", op: "boltbeat", on: !!chem.boltBeat });
+}
+document.getElementById("chemBoltBeat").onclick = () => {
+  chem.boltBeat = !chem.boltBeat; chemRefresh();
+  send({ t: "chem", op: "boltbeat", on: chem.boltBeat });
+};
+
+// ---------- souffle dans le micro (niveau sonore, page sécurisée seulement)
+const micMsg = document.getElementById("chemMicMsg");
+let mic = null;
+document.getElementById("chemMic").onclick = async () => {
+  if (nativeApp) {
+    // Dans l'app iPad : c'est elle qui écoute le micro (seul le niveau du souffle arrive ici).
+    if (micNative) {
+      nativeApp.postMessage({ cmd: "mic", on: false });
+      micNative = false;
+      document.getElementById("chemMic").classList.remove("on");
+      micMsg.textContent = "";
+    } else nativeApp.postMessage({ cmd: "mic", on: true });
+    return;
+  }
+  if (chem.blowOn) { chem.blowOn = false; chemSave(); micNeed(); chemMicRefresh(); return; }
+  chem.blowOn = true; chemSave();
+  await micNeed();
+  chemMicRefresh();
+};
+// Le bassin écoute l'iPad : le navigateur n'ouvre le micro qu'après un toucher.
+addEventListener("pointerdown", () => { if (chem.listen === "ipad" && !mic) micNeed(); });
+// Micro ouvert tant que le souffle ou le son du bassin en a besoin.
+async function micNeed() {
+  const need = chem.blowOn || chem.listen === "ipad";
+  if (!need) {
+    if (mic) { mic.stream.getTracks().forEach((t) => t.stop()); mic.ac.close(); mic = null; }
+    return;
+  }
+  if (mic) return;
+  if (!window.isSecureContext || !navigator.mediaDevices) {
+    micMsg.textContent = "Le micro demande l'adresse en https (celle du QR code)."; return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    const ac = new (window.AudioContext || window.webkitAudioContext)();
+    const an = ac.createAnalyser(); an.fftSize = 1024;
+    ac.createMediaStreamSource(stream).connect(an);
+    mic = { stream, ac, an, buf: new Float32Array(an.fftSize), freq: new Uint8Array(an.frequencyBinCount), level: 0, sent: 0,
+            peaks: [0.02, 0.05, 0.02] };
+  } catch (err) { micMsg.textContent = "Micro refusé : " + err.message; chem.blowOn = false; }
+}
+function chemMicRefresh() {
+  const on = !!mic && !!chem.blowOn;
+  document.getElementById("chemMic").classList.toggle("on", on);
+  micMsg.textContent = on ? "Soufflez vers le micro : la bulle (ou le bassin) s'agite." : "";
+}
+setInterval(() => {
+  if (!mic) return;
+  mic.an.getFloatTimeDomainData(mic.buf);
+  let sum = 0;
+  for (const v of mic.buf) sum += v * v;
+  const rms = Math.sqrt(sum / mic.buf.length);
+  // Un souffle : un bruit fort et continu ; la voix et les bruits de salle restent sous le seuil.
+  const level = Math.min(1, Math.max(0, (rms - 0.03) * 9));
+  mic.level = Math.max(level, mic.level * 0.8);
+  if (chem.blowOn && tab === "chem" && mic.level > 0.03) send({ t: "chem", op: "blow", amount: +mic.level.toFixed(3) });
+  // Son pour le bassin : niveau, basses (< ~170 Hz), aigus (> ~3 kHz), rapportés à des plafonds
+  // qui suivent le volume.
+  if (chem.listen === "ipad") {
+    mic.an.getByteFrequencyData(mic.freq);
+    const hz = mic.ac.sampleRate / mic.an.fftSize, f = mic.freq;
+    const band = (lo, hi) => { let s = 0, n = 0; for (let i = Math.max(1, Math.floor(lo / hz)); i <= Math.min(f.length - 1, Math.ceil(hi / hz)); i++) { s += f[i]; n++; } return n ? s / n / 255 : 0; };
+    const raw = [rms, band(20, 170), band(3000, 12000)];
+    const floor = [0.02, 0.05, 0.02];
+    const out = raw.map((v, i) => {
+      mic.peaks[i] = Math.max(v, mic.peaks[i] * 0.996, floor[i]);
+      return +Math.min(1, Math.max(0, v / mic.peaks[i] * 1.15 - 0.15)).toFixed(3);
+    });
+    send({ t: "chem", op: "hear", level: out[0], bass: out[1], high: out[2] });
+  }
+}, 40);
+const chemSize = document.getElementById("chemSize");
+chemSize.value = chem.size;
+chemSize.oninput = () => { chem.size = +chemSize.value; chemSave(); };
+for (const row of document.querySelectorAll("[data-chem]"))
+  for (const b of row.children) b.onclick = () => {
+    chem[row.dataset.chem] = b.dataset.v;
+    if (row.dataset.chem === "base") send({ t: "chem", op: "base", base: b.dataset.v });
+    if (row.dataset.chem === "listen") { send({ t: "chem", op: "listen", from: b.dataset.v }); micNeed(); }
+    chemRefresh();
+  };
+function chemRefresh() {
+  for (const row of document.querySelectorAll("[data-chem]"))
+    for (const b of row.children) b.classList.toggle("on", b.dataset.v === chem[row.dataset.chem]);
+  for (const b of chemColors.querySelectorAll(".swatch")) b.classList.toggle("on", b.dataset.c === chem.color);
+  document.getElementById("chemFlip").classList.toggle("on", chem.flip);
+  document.getElementById("chemBoltBeat").classList.toggle("on", !!chem.boltBeat);
+  chemSave();
+}
+chemRefresh();
+document.getElementById("chemClear").onclick = () => { send({ t: "chem", op: "clear" }); if (chemUsed) { chemUsed = false; sendView(); } };
+document.getElementById("chemShake").onclick = () => send({ t: "chem", op: "shake", amount: 1 });
+document.getElementById("chemFlip").onclick = () => { chem.flip = !chem.flip; chemRefresh(); };
+
+// Taille d'une goutte (part de la hauteur de l'image) ; le stylet appuyé verse plus.
+const chemRadius = (p) => (0.012 + Math.pow(chem.size / 100, 1.5) * 0.16) * (0.6 + 0.8 * p);
+function chemPour(p, dx, dy, ing) {
+  if (!chemUsed) { chemUsed = true; sendView(); }
+  send({ t: "chem", op: "drop", ing: ing || chem.ing, x: +p[0].toFixed(4), y: +p[1].toFixed(4), size: +chemRadius(p[2]).toFixed(4),
+    color: chem.color, dx: +dx.toFixed(3), dy: +dy.toFixed(3) });
+}
+function chemDown(e) {
+  const p = pos(e);
+  chemPointers.set(e.pointerId, { p, t: performance.now(), poured: p, sent: 0 });
+  if (chem.ing !== "stir") chemPour(p, 0, 0);
+}
+function chemMove(e) {
+  const s = chemPointers.get(e.pointerId), p = pos(e), now = performance.now();
+  const dt = Math.max(1, now - s.t) / 1000;
+  // Mouvement du doigt en hauteurs d'image par seconde (y vers le bas).
+  const dx = (p[0] - s.p[0]) * aspect / dt, dy = (p[1] - s.p[1]) / dt;
+  s.p = p; s.t = now;
+  if (now - s.sent < 25) return;
+  s.sent = now;
+  const k = 0.5;
+  if (chem.ing === "stir") { chemPour(p, dx * k, dy * k, "stir"); return; }
+  // Traînée : une goutte chaque fois que le doigt a avancé d'un demi-rayon.
+  const far = Math.hypot((p[0] - s.poured[0]) * aspect, p[1] - s.poured[1]);
+  if (far >= chemRadius(p[2]) * 0.5) { chemPour(p, dx * 0.25, dy * 0.25); s.poured = p; }
+  else chemPour(p, dx * k, dy * k, "stir");
+}
+
+// ---------- iPad penché et secoué (page en https seulement, ou dans l'app iPad)
+const motionMsg = document.getElementById("chemMotionMsg");
+let motion = { on: false, sent: 0, shake: 0, last: null };
+// Dans l'app iPad d'OZ Mapping : c'est elle qui lit les capteurs et nous les donne.
+const nativeApp = window.ozNativeApp && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.ozApp;
+window.ozMotion = (gx, gy, shake) => {
+  if (chem.flip) { gx = -gx; gy = -gy; }
+  const now = performance.now();
+  if (now - motion.sent < 60 || tab !== "chem") return;
+  motion.sent = now;
+  send({ t: "chem", op: "motion", gx, gy, shake });
+};
+window.ozBlow = (level) => { if (tab === "chem") send({ t: "chem", op: "blow", amount: level }); };
+window.ozSensor = (what, ok) => {
+  if (what === "motion") {
+    motion.on = ok;
+    document.getElementById("chemMotion").classList.toggle("on", ok);
+    motionMsg.textContent = ok ? "Penchez l'iPad pour faire couler, secouez pour agiter." : "Capteurs de mouvement indisponibles.";
+  } else {
+    micNative = ok;
+    document.getElementById("chemMic").classList.toggle("on", ok);
+    document.getElementById("chemMicMsg").textContent = ok ? "Soufflez vers le micro : la bulle (ou le bassin) s'agite." : "Micro refusé (Réglages › OZ Mapping › Micro).";
+  }
+};
+let micNative = false;
+function motionHint() {
+  if (nativeApp) { motionMsg.textContent = motion.on ? "Penchez l'iPad pour faire couler, secouez pour agiter." : "Touchez « Activer »."; return true; }
+  if (!window.isSecureContext) {
+    motionMsg.textContent = "Pour pencher et secouer, ouvrez l'adresse en https (celle du QR code) : Safari ne donne les capteurs qu'aux pages sécurisées.";
+    return false;
+  }
+  motionMsg.textContent = motion.on ? "Penchez l'iPad pour faire couler, secouez pour agiter." : "Touchez « Activer », puis autorisez l'accès aux mouvements.";
+  return true;
+}
+motionHint();
+document.getElementById("chemMotion").onclick = async () => {
+  if (nativeApp) { nativeApp.postMessage({ cmd: "motion", on: true }); return; }
+  if (!motionHint()) return;
+  try {
+    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+      const r = await DeviceMotionEvent.requestPermission();
+      if (r !== "granted") { motionMsg.textContent = "Accès aux mouvements refusé (Réglages › Safari › Mouvement et orientation)."; return; }
+    }
+    if (!motion.on) addEventListener("devicemotion", onMotion);
+    motion.on = true;
+    document.getElementById("chemMotion").classList.add("on");
+    motionHint();
+  } catch (err) { motionMsg.textContent = "Capteurs indisponibles : " + err; }
+};
+function onMotion(e) {
+  const g = e.accelerationIncludingGravity;
+  if (!g || g.x == null) return;
+  // Repère de l'appareil (x à droite, y vers le haut en portrait) → écran (y vers le bas),
+  // selon l'orientation de l'écran.
+  const ang = ((screen.orientation && screen.orientation.angle) ?? window.orientation ?? 0) * Math.PI / 180;
+  const c = Math.cos(ang), s = Math.sin(ang);
+  let gx = (g.x * c + g.y * s) / 9.81, gy = -(-g.x * s + g.y * c) / 9.81;
+  if (chem.flip) { gx = -gx; gy = -gy; }
+  // Secousses : l'accélération sans la gravité (ou, à défaut, la variation de la mesure).
+  const a = e.acceleration;
+  let jolt = 0;
+  if (a && a.x != null) jolt = Math.hypot(a.x, a.y, a.z) / 14;
+  else if (motion.last) jolt = Math.hypot(g.x - motion.last.x, g.y - motion.last.y, g.z - motion.last.z) / 10;
+  motion.last = { x: g.x, y: g.y, z: g.z };
+  motion.shake = Math.max(motion.shake * 0.85, Math.min(1, Math.max(0, jolt - 0.08)));
+  const now = performance.now();
+  if (now - motion.sent < 60 || tab !== "chem") return;
+  motion.sent = now;
+  send({ t: "chem", op: "motion", gx: +gx.toFixed(3), gy: +gy.toFixed(3), shake: +motion.shake.toFixed(3) });
+}
+</script>
+</body>
+</html>

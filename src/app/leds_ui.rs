@@ -258,6 +258,23 @@ enum Item {
 const FLASH_SECS: f64 = 2.5;
 
 impl OzApp {
+    /// LEDs de la scène recalculées si la scène a changé (et choix d'objets disparus retirés).
+    pub(super) fn refresh_led_cache(&mut self) {
+        if self.led.cache_of.as_ref() != Some(&self.project.leds) {
+            self.led.leds = self.project.leds.leds();
+            self.led.cache_of = Some(self.project.leds.clone());
+            if self.led.selected.is_some_and(|s| s >= self.project.leds.fixtures.len()) {
+                self.led.selected = None;
+            }
+            if self.led.selected_surface.is_some_and(|s| s >= self.project.leds.surfaces.len()) {
+                self.led.selected_surface = None;
+            }
+            if self.led.selected_dmx.is_some_and(|s| s >= self.project.leds.dmx.len()) {
+                self.led.selected_dmx = None;
+            }
+        }
+    }
+
     /// LEDs utiles en ce moment (l'image de la sortie doit alors être lue pour elles).
     /// Sorties dont il faut lire l'image, et à quelle largeur : celle que suivent les LEDs, et
     /// celles affichées sur les écrans de la scène 3D (plus fines).
@@ -344,19 +361,7 @@ impl OzApp {
             self.led.infos.insert(id, info.summary());
         }
 
-        if self.led.cache_of.as_ref() != Some(&self.project.leds) {
-            self.led.leds = self.project.leds.leds();
-            self.led.cache_of = Some(self.project.leds.clone());
-            if self.led.selected.is_some_and(|s| s >= self.project.leds.fixtures.len()) {
-                self.led.selected = None;
-            }
-            if self.led.selected_surface.is_some_and(|s| s >= self.project.leds.surfaces.len()) {
-                self.led.selected_surface = None;
-            }
-            if self.led.selected_dmx.is_some_and(|s| s >= self.project.leds.dmx.len()) {
-                self.led.selected_dmx = None;
-            }
-        }
+        self.refresh_led_cache();
         let now = self.clock();
         if self.led.flash.is_some_and(|(_, t)| now - t > FLASH_SECS) {
             self.led.flash = None;
@@ -1016,9 +1021,12 @@ impl OzApp {
         }
 
         // Infos de la LED survolée.
-        if let (Some((i, _)), Some(h)) = (hovered_led, hover) {
-            let l = &self.led.leds[i];
-            let f = &self.project.leds.fixtures[l.fixture];
+        // (Liste des LEDs d'une image en retard sur la scène — un bandeau vient d'être supprimé,
+        // depuis l'iPad par exemple : pas d'infos plutôt qu'un plantage.)
+        if let (Some((i, _)), Some(h)) = (hovered_led, hover)
+            && let Some(l) = self.led.leds.get(i)
+            && let Some(f) = self.project.leds.fixtures.get(l.fixture)
+        {
             let ctrl = l.controller.and_then(|c| self.project.leds.controllers.get(c));
             let addr = ctrl.map_or("non branchée".to_owned(), |c| format!("{} · adresse {}", c.name, l.address));
             let c = self.led.colors.get(i).copied().unwrap_or_default();
@@ -3183,134 +3191,7 @@ impl OzApp {
                 .color(TEXT_WEAK),
         );
         ui.horizontal_wrapped(|ui| {
-            let room = setup.room;
-            let presets: [(&str, leds::Surface); 12] = [
-                ("Écran", leds::Surface { pos: [0.0, 0.8, (room[1] - 0.3).max(0.5)], ..leds::Surface::default() }),
-                (
-                    "Boîte",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Box,
-                        pos: [0.0, 0.0, room[1] * 0.5],
-                        size: [1.0, 1.0, 1.0],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Mur",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Box,
-                        pos: [0.0, 0.0, room[1]],
-                        size: [room[0], 3.0, 0.15],
-                        color: [120, 124, 132],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Scène",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Stage,
-                        pos: [0.0, 0.0, (room[1] - 2.3).max(2.0)],
-                        size: [(room[0] - 1.0).clamp(1.0, 8.0), 0.8, 4.0],
-                        color: [48, 48, 56],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Public",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Crowd,
-                        pos: [0.0, 0.0, (room[1] * 0.3).max(1.5)],
-                        size: [(room[0] - 1.5).clamp(1.0, 6.0), 1.75, (room[1] * 0.35).clamp(1.0, 5.0)],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Chips",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Panels,
-                        pos: [0.0, 0.5, (room[1] - 1.0).max(1.0)],
-                        size: [5.5, 2.6, 0.5],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Vidéoprojecteur",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Projector,
-                        // À l'avant de la salle, tourné vers le fond.
-                        pos: [0.0, 1.4, 0.6],
-                        rot: [180.0, 0.0, 0.0],
-                        size: [0.4, 0.16, 0.32],
-                        color: [210, 210, 214],
-                        show_output: true,
-                        throw: 1.5,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Soleil",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Sun,
-                        pos: [0.0, 0.6, (room[1] - 1.1).max(1.0)],
-                        size: [1.3, 1.3, 0.02],
-                        color: [242, 200, 30],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Caisson de basses",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Sub,
-                        pos: [-(room[0] * 0.5 - 0.6).max(0.5), 0.0, (room[1] - 1.5).max(1.0)],
-                        size: [0.6, 0.7, 0.75],
-                        color: [28, 28, 32],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Enceinte d'aigus",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Top,
-                        pos: [-(room[0] * 0.5 - 0.6).max(0.5), 0.0, (room[1] - 2.0).max(1.0)],
-                        size: [0.4, 0.6, 0.35],
-                        color: [28, 28, 32],
-                        show_output: false,
-                        stand: 1.4,
-                        ..leds::Surface::default()
-                    },
-                ),
-                (
-                    "Pont",
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Truss,
-                        pos: [0.0, 0.0, (room[1] - 1.2).max(1.0)],
-                        size: [(room[0] - 0.6).clamp(1.0, 12.0), 3.0, 0.3],
-                        color: [170, 172, 178],
-                        show_output: false,
-                        ..leds::Surface::default()
-                    },
-                ),
-                ("Cabine DJ", {
-                    // Posée au milieu de la scène s'il y en a une.
-                    let stage = setup.surfaces.iter().find(|s| s.kind == leds::SurfaceKind::Stage);
-                    let (y, z) = stage.map_or((0.0, room[1] * 0.6), |st| (st.top(), st.pos[2] - 0.4));
-                    leds::Surface {
-                        kind: leds::SurfaceKind::Booth,
-                        pos: [stage.map_or(0.0, |st| st.pos[0]), y, z],
-                        size: [1.8, 1.05, 0.7],
-                        color: [30, 30, 34],
-                        show_output: true,
-                        ..leds::Surface::default()
-                    }
-                }),
-            ];
+            let presets = leds::Surface::presets(setup);
             for (name, mut s) in presets {
                 if ui.button(with_icon(ic::PLUS, name)).clicked() {
                     // Au point d'ajout, s'il est posé.
@@ -4785,19 +4666,67 @@ fn hide_covered_leds(items: &mut [(f32, Item)]) {
     if tiles.is_empty() {
         return;
     }
-    let cell = |v: f32| (v / CELL).floor() as i32;
-    let mut bins: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-    for (k, (pts, _)) in tiles.iter().enumerate() {
-        let r = Rect::from_points(pts);
-        for cx in cell(r.min.x)..=cell(r.max.x) {
-            for cy in cell(r.min.y)..=cell(r.max.y) {
-                bins.entry((cx, cy)).or_default().push(k);
+    // Grille de cases à plat sur la zone des LEDs (seules elles sont testées), au plus 128 × 128
+    // cases, rangée d'un seul tenant : rien à allouer case par case à chaque image.
+    let mut lo = egui::pos2(f32::MAX, f32::MAX);
+    let mut hi = egui::pos2(f32::MIN, f32::MIN);
+    for (_, it) in items.iter() {
+        let p = match it {
+            Item::Led { p, .. } => *p,
+            Item::Wire { a, b, .. } => egui::pos2((a.x + b.x) * 0.5, (a.y + b.y) * 0.5),
+            _ => continue,
+        };
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    if lo.x > hi.x || lo.y > hi.y {
+        return;
+    }
+    let size = CELL.max((hi.x - lo.x).max(hi.y - lo.y) / 128.0);
+    let gw = ((hi.x - lo.x) / size) as usize + 1;
+    let gh = ((hi.y - lo.y) / size) as usize + 1;
+    let span = |r: Rect| -> Option<(usize, usize, usize, usize)> {
+        if r.max.x < lo.x || r.max.y < lo.y || r.min.x > hi.x || r.min.y > hi.y {
+            return None;
+        }
+        let c = |v: f32, o: f32, n: usize| (((v - o) / size).max(0.0) as usize).min(n - 1);
+        Some((c(r.min.x, lo.x, gw), c(r.min.y, lo.y, gh), c(r.max.x, lo.x, gw), c(r.max.y, lo.y, gh)))
+    };
+    let spans: Vec<Option<(usize, usize, usize, usize)>> = tiles.iter().map(|(pts, _)| span(Rect::from_points(pts))).collect();
+    // Comptage, puis rangement (tableau d'index par case, comme une matrice creuse).
+    let mut start = vec![0u32; gw * gh + 1];
+    for (x0, y0, x1, y1) in spans.iter().flatten() {
+        for cy in *y0..=*y1 {
+            for cx in *x0..=*x1 {
+                start[cy * gw + cx + 1] += 1;
+            }
+        }
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut fill = start.clone();
+    let mut list = vec![0u32; start[gw * gh] as usize];
+    for (k, sp) in spans.iter().enumerate() {
+        let Some((x0, y0, x1, y1)) = sp else { continue };
+        for cy in *y0..=*y1 {
+            for cx in *x0..=*x1 {
+                let c = cy * gw + cx;
+                list[fill[c] as usize] = k as u32;
+                fill[c] += 1;
             }
         }
     }
     let covered = |p: egui::Pos2, z: f32, margin: f32| {
-        bins.get(&(cell(p.x), cell(p.y)))
-            .is_some_and(|ks| ks.iter().any(|&k| depth_at(&tiles[k].0, &tiles[k].1, p).is_some_and(|d| d < z - margin)))
+        let (x, y) = ((p.x - lo.x) / size, (p.y - lo.y) / size);
+        if x < 0.0 || y < 0.0 || x as usize >= gw || y as usize >= gh {
+            return false;
+        }
+        let c = y as usize * gw + x as usize;
+        list[start[c] as usize..start[c + 1] as usize].iter().any(|&k| {
+            let (pts, zs) = &tiles[k as usize];
+            depth_at(pts, zs, p).is_some_and(|d| d < z - margin)
+        })
     };
     for (z, it) in items.iter_mut() {
         match it {
